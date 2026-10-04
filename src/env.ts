@@ -161,9 +161,58 @@ function autoLoadedDotEnv(): Map<string, Set<string>> {
 }
 
 /**
- * process.env for a child process: without the Open Cloud API key variables, without any variable that would switch
- * Claude Code to API billing (isApiBillingVar), without anything Bun auto-loaded from a `.env` file, and (for Claude)
- * without parent-session variables. `extra` is added last (the deploy gets the Open Cloud API key this way).
+ * The only variables a Claude run (and every command it starts) receives: what the OS, git, Bun and Claude Code need
+ * to run and find the dev's claude.ai login. An allowlist, not a denylist, so a secret under an unexpected name never
+ * reaches a process that game data can steer (security audit C1/H2). Compared case-insensitively (Windows).
+ */
+const CLAUDE_ENV_ALLOW = new Set([
+	"PATH",
+	"PATHEXT",
+	"SYSTEMROOT",
+	"SYSTEMDRIVE",
+	"WINDIR",
+	"COMSPEC",
+	"TEMP",
+	"TMP",
+	"TMPDIR",
+	"HOME",
+	"USERPROFILE",
+	"HOMEDRIVE",
+	"HOMEPATH",
+	"APPDATA",
+	"LOCALAPPDATA",
+	"PROGRAMDATA",
+	"PROGRAMFILES",
+	"PROGRAMFILES(X86)",
+	"PROGRAMW6432",
+	"COMMONPROGRAMFILES",
+	"COMMONPROGRAMFILES(X86)",
+	"COMMONPROGRAMW6432",
+	"USERNAME",
+	"USERDOMAIN",
+	"COMPUTERNAME",
+	"OS",
+	"PROCESSOR_ARCHITECTURE",
+	"PROCESSOR_IDENTIFIER",
+	"NUMBER_OF_PROCESSORS",
+	"LANG",
+	"LC_ALL",
+	"TERM",
+	"SHELL",
+	"XDG_CONFIG_HOME",
+	"XDG_DATA_HOME",
+	"XDG_CACHE_HOME",
+	"CLAUDE_CONFIG_DIR",
+	"CLAUDE_CODE_GIT_BASH_PATH",
+	"BUN_INSTALL",
+]);
+
+/**
+ * process.env for a child process.
+ * - Claude (`forClaude`): only CLAUDE_ENV_ALLOW, minus anything Bun auto-loaded from a `.env` file.
+ * - Others (git, the tunnel, the deploy): everything except the Open Cloud API key variables, any variable that would
+ *   switch Claude Code to API billing (isApiBillingVar) and anything Bun auto-loaded from a `.env` file.
+ * `extra` is added last (the deploy gets the Open Cloud API key this way).
  */
 export function childEnv(options: { forClaude?: boolean; extra?: Record<string, string> } = {}): Record<string, string> {
 	const env: Record<string, string> = {};
@@ -171,6 +220,8 @@ export function childEnv(options: { forClaude?: boolean; extra?: Record<string, 
 	const fromFiles = autoLoadedDotEnv();
 	for (const [key, value] of Object.entries(process.env)) {
 		if (value === undefined) continue;
+		// TT_FAKE_*: the test suite's fake claude is configured through these (no secrets use the prefix).
+		if (options.forClaude && !CLAUDE_ENV_ALLOW.has(key.toUpperCase()) && !key.startsWith("TT_FAKE_")) continue;
 		if (drop.has(key) || drop.has(key.toUpperCase()) || isApiBillingVar(key)) continue;
 		if (fromFiles.get(key)?.has(value)) continue;
 		env[key] = value;

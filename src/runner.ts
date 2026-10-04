@@ -18,7 +18,7 @@
  * Defense in depth around prompt injection from game data:
  *   - the attached context is JSON-escaped inside <untrusted-game-context> and the system prompt says it is data;
  *     attached screenshots are game images, and any text in them is data too;
- *   - tools: Read/Edit/Write/Glob/Grep plus `bun run build*`, `typetorch build*`, `typetorch test*` only; no network
+ *   - tools: Read/Edit/Write/Glob/Grep plus the exact commands `bun run build`, `typetorch build`, `typetorch test` only; no network
  *     tools, no other shell; `--restricted` confines file tools to the worktree and ignores user/project settings;
  *     anything not allowed is denied without asking (`--permission-mode dontAsk`);
  *   - edits to build/tool configuration (package.json, lockfiles, tsconfig, project files, scripts, hooks, .typetorch
@@ -38,7 +38,9 @@ import { oneLine } from "./log";
 import type { RunContext, RunOutcome, Runner } from "./prompts";
 import { forEachLine, killTree } from "./proc";
 
-export const ALLOWED_TOOLS = ["Read", "Edit", "Write", "Glob", "Grep", "Bash(bun run build*)", "Bash(typetorch build*)", "Bash(typetorch test*)"];
+// Exact commands only: a wildcard such as `bun run build*` also matched `bun run build-x.ts`, which runs any file Claude
+// just wrote, outside every file-tool restriction (security audit C1).
+export const ALLOWED_TOOLS = ["Read", "Edit", "Write", "Glob", "Grep", "Bash(bun run build)", "Bash(typetorch build)", "Bash(typetorch test)"];
 /** The game tools (MCP), allowed only when the run has the MCP server. */
 export const GAME_TOOL_RULES = GAME_TOOLS.map(fullToolName);
 
@@ -102,7 +104,7 @@ export function systemPrompt(gitBranch: string, workBranch: string, ttBranch: st
 		"- If the developer asks for a change, make it by editing files in this worktree. Keep it small and focused.",
 		"  If they only ask a question, answer it and change nothing.",
 		"- Do not commit, push, deploy or run git; the dev server commits and deploys after you finish.",
-		"- The only shell commands you may run are `bun run build...`, `typetorch build...` and `typetorch test...`.",
+		"- The only shell commands you may run are exactly `bun run build`, `typetorch build` and `typetorch test` (no arguments).",
 		"- Do not edit build or tool configuration (package.json, lockfiles, tsconfig*.json, *.project.json, typetorch.json,",
 		"  bunfig.toml, scripts/, .github/, .claude/, .typetorch/, CLAUDE.md, .env files). Such edits are blocked and stop",
 		"  the deploy.",
