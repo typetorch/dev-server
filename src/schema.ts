@@ -12,8 +12,8 @@ function onlyKeys(value: Record<string, unknown>, allowed: readonly string[]): b
 
 export const LIMITS = {
 	tokenBodyBytes: 1024,
-	/** Room for two attached log texts (64 KB each, JSON-escaped). */
-	promptBodyBytes: 320 * 1024,
+	/** Room for three attached log texts (about 64 KB each, JSON-escaped): My logs, Server logs, Player logs. */
+	promptBodyBytes: 480 * 1024,
 	promptChars: 4000,
 	contextPathChars: 1024,
 	contextErrors: 50,
@@ -66,7 +66,12 @@ export interface PromptLogs {
 	client?: string;
 	/** The game server's log history. */
 	server?: string;
+	/** Another player's client log history ("Player logs"), with that player's username. */
+	player?: { name: string; text: string };
 }
+
+/** Roblox usernames: 3–20 letters, digits and one underscore; a little slack, nothing else. */
+export const PLAYER_NAME_PATTERN = /^[A-Za-z0-9_]{1,40}$/;
 
 export interface PromptContext {
 	path?: string;
@@ -129,15 +134,22 @@ export function parsePromptRequest(raw: unknown): PromptRequest | undefined {
 	}
 	if (context.logs !== undefined) {
 		const logs = context.logs;
-		if (!isPlainObject(logs) || !onlyKeys(logs, ["client", "server"])) return undefined;
+		if (!isPlainObject(logs) || !onlyKeys(logs, ["client", "server", "player"])) return undefined;
 		const parsed: PromptLogs = {};
+		const logText = (text: unknown) => typeof text === "string" && text.length <= LIMITS.contextLogChars && !text.includes("\u0000");
 		for (const realm of ["client", "server"] as const) {
 			const text = logs[realm];
 			if (text === undefined) continue;
-			if (typeof text !== "string" || text.length > LIMITS.contextLogChars || text.includes("\u0000")) return undefined;
-			parsed[realm] = text;
+			if (!logText(text)) return undefined;
+			parsed[realm] = text as string;
 		}
-		if (parsed.client !== undefined || parsed.server !== undefined) out.logs = parsed;
+		if (logs.player !== undefined) {
+			const player = logs.player;
+			if (!isPlainObject(player) || !onlyKeys(player, ["name", "text"])) return undefined;
+			if (typeof player.name !== "string" || !PLAYER_NAME_PATTERN.test(player.name) || !logText(player.text)) return undefined;
+			parsed.player = { name: player.name, text: player.text as string };
+		}
+		if (parsed.client !== undefined || parsed.server !== undefined || parsed.player !== undefined) out.logs = parsed;
 	}
 	request.context = out;
 	return request;
@@ -154,10 +166,74 @@ export function parseAttachmentRequest(raw: unknown): AttachmentRequest | undefi
 	return { width: width as number, height: height as number, format, compression, data };
 }
 
+/** A crop rectangle in normalized image coordinates (0..1 from the top left). */
+export interface Crop {
+	x: number;
+	y: number;
+	w: number;
+	h: number;
+}
+
+/** `{x, y, w, h}`: numbers in 0..1, w and h > 0, inside the image (1e-6 slack); undefined when malformed. */
+export function parseCrop(raw: unknown): Crop | undefined {
+	if (!isPlainObject(raw) || !onlyKeys(raw, ["x", "y", "w", "h"])) return undefined;
+	const values = [raw.x, raw.y, raw.w, raw.h];
+	if (!values.every((value) => typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 1)) return undefined;
+	const [x, y, w, h] = values as number[];
+	if (w <= 0 || h <= 0 || x + w > 1 + 1e-6 || y + h > 1 + 1e-6) return undefined;
+	return { x, y, w, h };
+}
+
+export interface CaptureRequest {
+	/** Unix ms on the dev's PC clock (the client's capture time). */
+	captureTime: number;
+	/** Capture.LocalId, if the client had one (only its digits and underscores are ever used). */
+	localId?: string;
+	/** game.PlaceId; 0 = any place. */
+	placeId?: number;
+	/** The part of the screenshot the dev selected (applied before downscaling). */
+	crop?: Crop;
+}
+
+/** `{captureTime: unix ms, localId?: string ≤128, placeId?: number, crop?: Crop}`, nothing else. */
+export function parseCaptureRequest(raw: unknown): CaptureRequest | undefined {
+	if (!isPlainObject(raw) || !onlyKeys(raw, ["captureTime", "localId", "placeId", "crop"])) return undefined;
+	const { captureTime, localId, placeId } = raw;
+	// 2001-09-09 .. 2286-11-20 in ms: a real clock reading, not seconds or garbage.
+	if (typeof captureTime !== "number" || !Number.isSafeInteger(captureTime) || captureTime < 1e12 || captureTime >= 1e13) return undefined;
+	const request: CaptureRequest = { captureTime };
+	if (localId !== undefined) {
+		if (typeof localId !== "string" || !/^[A-Za-z0-9._:/{}-]{1,128}$/.test(localId)) return undefined;
+		request.localId = localId;
+	}
+	if (placeId !== undefined) {
+		if (typeof placeId !== "number" || !Number.isSafeInteger(placeId) || placeId < 0) return undefined;
+		request.placeId = placeId;
+	}
+	if (raw.crop !== undefined) {
+		const crop = parseCrop(raw.crop);
+		if (!crop) return undefined;
+		request.crop = crop;
+	}
+	return request;
+}
+
+/** `{assetId: positive integer, crop?: Crop}`, nothing else. */
+export function parseAssetRequest(raw: unknown): { assetId: number; crop?: Crop } | undefined {
+	if (!isPlainObject(raw) || !onlyKeys(raw, ["assetId", "crop"])) return undefined;
+	const { assetId } = raw;
+	if (typeof assetId !== "number" || !Number.isSafeInteger(assetId) || assetId <= 0) return undefined;
+	if (raw.crop === undefined) return { assetId };
+	const crop = parseCrop(raw.crop);
+	return crop ? { assetId, crop } : undefined;
+}
+
 export const NONCE_PATTERN = /^[A-Za-z0-9._:{}-]{8,128}$/;
 export const PROMPT_ID_PATTERN = /^[A-Za-z0-9_-]{22}$/;
 /** ?since=<n> on GET /v1/prompts/:id. */
 export const SINCE_PATTERN = /^\d{1,7}$/;
+/** ?chunk=<n> on GET /v1/images/:id. */
+export const CHUNK_PATTERN = /^\d{1,4}$/;
 
 /** `{decision: "deploy" | "discard"}` for POST /v1/prompts/:id/deploy, nothing else. */
 export function parseDeployDecision(raw: unknown): "deploy" | "discard" | undefined {

@@ -17,7 +17,9 @@ runs in one of two modes:
   discarded after 15 minutes.
 
 The Claude tab is a chat: follow-ups continue the same Claude Code session (also across a mode switch), replies stream
-in, and you can attach screenshots, your client's log history and the server's log history.
+in, and you can attach screenshots (cropped if you like), your client's log history, another player's client log
+history and the server's log history. Claude can show you images from the worktree (`![caption](path)` in its reply),
+and its `screenshot` tool sees what you see.
 
 **remote-claude only runs on your Claude subscription; API keys are refused.** It checks `claude auth status` at
 startup (a claude.ai login is required), strips every `ANTHROPIC_*` / Bedrock / Vertex / Foundry variable from the
@@ -42,9 +44,14 @@ dev's Roblox client ─► game server (dev channel; checks dev + allowlist + ra
 - `cloudflared` (installed automatically with winget on Windows when missing; macOS `brew install cloudflared`)
 - A TypeTorch game repo (`typetorch.json`) and an Open Cloud API key that can publish MessagingService messages
   (`TYPETORCH_API_KEY`, `OPENCLOUD_API_KEY` or `ROBLOX_API_KEY`, in the environment or a `.env`). It is used to tell
-  game servers where the session is.
+  game servers where the session is. When you play on another PC, screenshots come as CaptureService uploads, and the
+  same key downloads them (Open Cloud asset delivery; untested live, the key may need `legacy-asset:manage`).
+- Optional: `ffmpeg` on PATH (or `TT_FFMPEG`) for JPEG, WebP, GIF, BMP and 16-bit or interlaced PNG images. Plain
+  8-bit PNGs (Roblox screenshots) are decoded without it.
 
-There is nothing to set up in Roblox: no secrets, no settings.
+There is nothing to set up in Roblox: no secrets, no settings. For images Claude shows in the chat (EditableImage),
+the experience needs its **Allow Mesh / Image APIs** setting on (Creator Hub, or Studio Game Settings → Security), and
+its owner must be 13+ and ID-verified. Without them the chat shows one dim line instead of the image.
 
 ## Usage
 ```sh
@@ -119,18 +126,19 @@ The Quick Tunnel URL is public, so the server authenticates everything itself:
 | Access token | HS256 JWT (jose), 5 minutes, bound to one user, one game server (`job`), this session (`aud`, `sid`) and this branch, with scopes. Signed with a 256-bit key generated in memory per session (never written or logged); Ctrl+C or `rotate` kills every token |
 | Verification | `algorithms: ["HS256"]` only (so `alg: none` and algorithm confusion fail), issuer, audience, `clockTolerance: 30`, `maxTokenAge: "5m"`, required claims; then **at use time**: `sid`, user still allowed and not revoked, `ver` current, `X-TT-Job` = `job`, branch, scope, prompt ownership |
 | Replay | Every POST (create, cancel, deploy, attachments) needs a unique `X-TT-Nonce` and an `X-TT-Timestamp` within ±300 s |
-| Limits | Headers ≤ 2 KB (Cloudflare's own `cf-*`/`x-forwarded-*` excluded; ≤ 8 KB in all), prompt body ≤ 320 KB (room for two ~64 KB log attachments; token body ≤ 1 KB, attachment body ≤ 3 MB), strict JSON schemas (unknown fields rejected), ≤ 6 tokens per user per minute (checked before a refresh token rotates, so a `429` never strands the game with a dead token), one Claude run at a time, a queue of 5, one code run or pending proposal at a time, `--max-prompts` |
+| Limits | Headers ≤ 2 KB (Cloudflare's own `cf-*`/`x-forwarded-*` excluded; ≤ 8 KB in all), prompt body ≤ 480 KB (room for three ~64 KB log attachments; token body ≤ 1 KB, attachment body ≤ 3 MB, capture and asset requests ≤ 1 KB), strict JSON schemas (unknown fields rejected), ≤ 6 tokens per user per minute (checked before a refresh token rotates, so a `429` never strands the game with a dead token), one Claude run at a time, a queue of 5, one code run or pending proposal at a time, `--max-prompts` |
 | Responses | `Cache-Control: no-store`; errors are bare status codes with no body. The terminal logs `sub`, the first 8 characters of `jti` and the decision, never a token, code or key |
 | Modes | **Live** runs get `--tools Read,Glob,Grep` and every game tool; **code** runs get `Read,Edit,Write,Glob,Grep` plus exactly `Bash(bun run build)`, and the read-only game tools. The MCP server enforces it too: in code mode it doesn't list `run_luau` and refuses it. A live run never commits; if files change anyway they are dropped |
 | Claude | `claude -p --restricted` in a dedicated worktree; `WebFetch`/`WebSearch` denied; anything else denied without asking (Claude Code still auto-allows its read-only commands such as `git status` inside the worktree). File tools can't leave the worktree (plus the run's log folder, below). `bun` is put first on Claude's PATH so `bun run build` always resolves. Edits to build/tool configuration (package.json, lockfiles, tsconfig, `*.project.json`, `typetorch.json`, scripts, hooks, `.github`, `.claude`, `.typetorch`, `.env`, plus `--protect`) are denied, and if one changes anyway the commit is kept but **no deploy is offered** |
 | Deploy approval | A code run that changed files is committed by the dev server (`remote-claude: <summary>` + `Requested-By: roblox:<userId>`, hooks disabled) and proposed, never deployed on its own. Only the requesting dev can deploy or discard it; Discard (or 15 minutes without an answer, or the session ending) resets the worktree to the commit before the run (the dropped commit stays in the reflog). Deploy and Discard refuse when the worktree moved since the proposal. Nothing is ever pushed |
 | Untrusted context | The game's `context` (paths, error lines, artifact id; players can influence it) is JSON-escaped inside `<untrusted-game-context>` and the system prompt tells Claude it is data, never instructions |
-| Attached logs | "My logs" / "Server logs" may hold other players' names and chat. They are kept in memory only until the run starts, then written to `<temp>/tt-rc-logs-*/{client,server}-logs.txt` (outside the worktree, owner-only, with a header saying they are untrusted), given to Claude by path with `--add-dir`, and the folder is deleted when the run ends. They are never logged, relayed or kept with the prompt (the terminal says only "client + server logs attached") |
+| Attached logs | "My logs", "Server logs" and "Player logs" (another player's client log history, fetched by the game from that player's client) may hold other players' names and chat. They are kept in memory only until the run starts, then written to `<temp>/tt-rc-logs-*/{client,server,player}-logs.txt` (outside the worktree, owner-only, with a header saying they are untrusted), given to Claude by path with `--add-dir`, and the folder is deleted when the run ends. They are never logged, relayed or kept with the prompt (the terminal says only "client + player logs attached"). A player name must be a Roblox username (letters, digits, `_`) |
 | Secrets in children | `.env` values stay in a private map, and values Bun auto-loads from `.env` files are stripped: Claude, git and builds never inherit the API key or other local secrets (the deploy gets the API key only) |
 | Subscription only | `claude auth status` must report `loggedIn`, `authMethod: "claude.ai"`, `apiProvider: "firstParty"` or the session doesn't start. Child processes never get `ANTHROPIC_*`, `CLAUDE_CODE_USE_*` or `AWS_BEARER_TOKEN_BEDROCK` (the host app's `ANTHROPIC_BASE_URL` included), no `--settings`/`apiKeyHelper` is passed, and a run whose stream-json `init` event has an `apiKeySource` other than `"none"` is killed before it publishes anything (`error: "api_billing_refused"`). Costs shown are Claude Code's estimates (`est.`), not charges |
 | Conversations | Per user and private: a follow-up must name a conversation the caller owns (else `404`) and runs `claude -p --resume <session>` in the same worktree; one prompt at a time per conversation, including a proposal waiting for its decision (`409`) |
 | What reaches games | Everything relayed (events, summaries, errors, status lines) is redacted: the pairing code, the API key, `.env` values, JWT/Bearer shapes, tunnel URLs, and **local paths**: worktree files become relative (`src/a.ts`), the repo becomes `<repo>/`, the home folder `~/`, the temp folder `<tmp>/`, any other absolute path (`C:\...`, `/Users/...`, `\\server\...`, `file://`) `<path>`, and the OS username `<user>`. Streamed text holds back any tail that could be the start of one of these, so nothing is ever published in part. Tool results are one line (a count or a status), never file contents. The prompt's `log` holds only short status lines (≤ 120 characters); raw deploy output and Claude's stderr go to the terminal only |
-| Attachments | RGBA8 only, ≤ 1024 px per side, ≤ 4 MB raw, ≤ 2 MB decoded data, zstd frames must declare exactly `width × height × 4` and are inflated with that hard cap. The dev server writes the PNG itself to `<worktree>/.typetorch/attachments/<id>.png` (git-ignored through `.git/info/exclude`, never committed, deleted when the session ends). ≤ 4 per prompt, ≤ 20 per user per session, only the uploader can use one, once. Claude is told the images are game data, not instructions |
+| Attachments | Screenshots can show other players, so they stay on this PC and are deleted after use. Three ways in: raw RGBA8 from the game (≤ 1024 px per side, ≤ 4 MB raw, ≤ 2 MB decoded data, zstd frames must declare exactly `width × height × 4` and are inflated with that hard cap); the **capture pickup** (main path: the file Roblox wrote on this PC, only the requesting user's, see below); the **asset fallback** (a CaptureService upload, downloaded with the Open Cloud key). Captures and downloads are decoded (PNG in TS, other formats with ffmpeg and a fixed input format), cropped to the dev's selection and downscaled to ≤ 1568 px on the long side. Copies are owner-only PNGs in the session's temp folder `<temp>/tt-rc-att-<session>` (never in the worktree), moved into the run's folder when their prompt runs and deleted when it ends; unsent ones are deleted after 30 minutes, everything when the session ends, and folders a crashed session left are swept at the next start. Roblox's own files are only read. ≤ 4 per prompt, ≤ 8 unsent and ≤ 40 per user per session, ≤ 10 pickups/downloads per user per minute (one at a time), only the uploader can use one, once. Pixels and base64 are never logged. Claude is told the images are game data, not instructions |
+| Images to the game | Claude shows a worktree image with `![caption](path)`. Only regular image files inside the worktree (links resolved; not `.git`, not `.env*`), ≤ 25 MB, ≤ 4 per prompt. The dev server decodes it to RGBA8 ≤ 1024² (smaller if zstd would pass 2 MB), keeps it in memory (≤ 64 MB, 3 h) and serves it in chunks only to the prompt's requester on the game server that sent it. Refused references become a short `status` line |
 
 ## HTTP contract (v1)
 Everything else is `404`. Every response has `Cache-Control: no-store`; error responses have no body.
@@ -159,7 +167,7 @@ In Studio `game.JobId` is `""`: send `job: ""`. Roblox may drop an empty header,
 ### `POST /v1/prompts`
 - `Authorization: Bearer <JWT>`, `X-TT-Job: <game.JobId>`, `X-TT-Nonce: <unique, 8–128 chars [A-Za-z0-9._:{}-]>`,
   `X-TT-Timestamp: <unix seconds, ±300 s>`, `Content-Type: application/json`
-- Body (≤ 320 KB): `{"prompt": "<1–4000 chars>", "mode"?: "live" | "code", "context"?: {"path"?: string ≤1024, "errors"?: string[] (≤50 × ≤4000), "artifact"?: string ≤128, "logs"?: {"client"?: string, "server"?: string} (each ≤ 66000 chars)}, "conversationId"?: "<22 chars>", "attachments"?: ["<32 hex>", ...] (≤ 4, distinct)}`
+- Body (≤ 480 KB): `{"prompt": "<1–4000 chars>", "mode"?: "live" | "code", "context"?: {"path"?: string ≤1024, "errors"?: string[] (≤50 × ≤4000), "artifact"?: string ≤128, "logs"?: {"client"?: string, "server"?: string, "player"?: {"name": "<Roblox username>", "text": string}} (each text ≤ 66000 chars)}, "conversationId"?: "<22 chars>", "attachments"?: ["<32 hex>", ...] (≤ 4, distinct)}`
   - `mode` (default `"live"`) picks the run's tools (see the security model). A conversation can switch modes between
     prompts; the follow-up resumes the same Claude Code session with the new tools.
   - No `conversationId`: a new conversation (a new Claude Code session). With one: a follow-up in that conversation;
@@ -167,10 +175,14 @@ In Studio `game.JobId` is `""`: send `job: ""`. Roblox may drop an empty header,
     own conversation (`404` otherwise) with no prompt still running or waiting for a deploy decision (`409`). If Claude
     Code lost that session, the run starts fresh and says so in a `status` event.
   - A code prompt while another code prompt is queued or running, or a proposal is undecided: `423`.
-  - `attachments`: ids from `POST /v1/attachments`, uploaded by the caller and not used by another prompt (`400`
-    otherwise). Claude gets their paths (`Attached screenshot: .typetorch/attachments/<id>.png (WxH)`).
-  - `context.logs`: the requester's client log history and/or the server's (the game keeps the newest ~64 KB and
-    notes how many older lines it dropped). See "Attached logs" above: files for the run only, never logged.
+  - `attachments`: ids from `POST /v1/attachments[/capture|/asset]`, made by the caller and not used by another
+    prompt (`400` otherwise). When the run starts they move into its temp folder and Claude gets their paths
+    (`Attached screenshot: <temp>/tt-rc-logs-*/screenshot-<id8>.png (WxH)`, readable through `--add-dir`); they are
+    deleted when the run ends (or when a queued prompt is cancelled).
+  - `context.logs`: the requester's client log history, the server's, and/or another player's (`player`: that
+    player's username and client log text, which the game fetched from that player's client). The game keeps the
+    newest ~64 KB of each and notes how many older lines it dropped. See "Attached logs" above: files for the run
+    only, never logged.
 - `200` → `{"id": "<22 chars>", "state": "queued", "conversationId": "<22 chars>"}`
 
 ### `GET /v1/prompts/:id[?since=<n>]`
@@ -180,7 +192,7 @@ In Studio `game.JobId` is `""`: send `job: ""`. Roblox may drop an empty header,
   subscription). Any allowed user of the session may read any prompt of the session.
 - With `?since=<n>` (0–9999999; start at 0) the reply also has `"events": [...]` (the events with `i >= n`, at most
   300), `"next"` (pass it as `since` next time) and `"more"` (another page is ready now). Each event is
-  `{"i", "kind", "text", "tool"?, "target"?, "block"?, "state"?, "detail"?, "ref"?, "commit"?, "files"?, "expiresAt"?}`:
+  `{"i", "kind", "text", "tool"?, "target"?, "block"?, "state"?, "detail"?, "ref"?, "commit"?, "files"?, "expiresAt"?, "image"?}`:
 
   | `kind` | `text` | extra |
   |---|---|---|
@@ -188,6 +200,7 @@ In Studio `game.JobId` is `""`: send `job: ""`. Roblox may drop an empty header,
   | `tool_use` | `Edit src/server/x.ts`, `Bash bun run build`, `Grep foo in src` | `tool`, `target` (path relative to the worktree, command or pattern), `ref` (the tool_use id), `detail` (game tools: the input) |
   | `tool_result` | one line: `120 lines`, `3 files`, `done`, `error: ...` (never file contents) | `tool`, `ref` (pairs it with its `tool_use`, even when Claude runs several tools at once), `detail` (game tools: the full result, capped) |
   | `deploy_proposal` | the SUMMARY line | `commit`, `files` (≤ 50, `added`/`removed` line counts, -1 for binary), `expiresAt` |
+  | `image` | the caption (or the file's path) | `image`: `{"id", "width", "height", "bytes", "chunks"}`, fetched with `GET /v1/images/:id?chunk=n`; it comes before the final status |
   | `status` | the new state (`queued`, `running`, `committed abc1234`, `proposed`, `building`, `deployed`, `discarded`, `answered`, ...) or a note | `state` when it is a state change |
   | `error` | why the run failed (e.g. `api_billing_refused`, `claude timed out`, `deploy failed (exit 1)`) | |
 - `state`: `queued` → `running` → `answered` (no file changes: a question, an explanation, a live action; `summary` is
@@ -214,8 +227,35 @@ In Studio `game.JobId` is `""`: send `job: ""`. Roblox may drop an empty header,
   `data` is the RGBA8 pixels, rows top to bottom (`width × height × 4` bytes, ≤ 4 MB), compressed with zstd (one frame
   that declares that size, as Roblox `EncodingService:CompressBuffer(..., Enum.CompressionAlgorithm.Zstd)` writes) or
   not; decoded `data` is ≤ 2 MB either way.
-- `200` → `{"id": "<32 hex>", "width", "height"}`. `400` for any size or format mismatch, `429` after 20 uploads by this
-  user in this session.
+- `200` → `{"id": "<32 hex>", "width", "height"}`. `400` for any size or format mismatch, `429` when the user holds 8
+  unsent attachments or made 40 this session.
+
+### `POST /v1/attachments/capture` (main path for screenshots)
+- Headers like every POST; body ≤ 1 KB:
+  `{"captureTime": <unix ms>, "localId"?: "<Capture.LocalId>", "placeId"?: <game.PlaceId>, "crop"?: {"x", "y", "w", "h"}}`.
+  `captureTime` is the client's clock (`ScreenshotCapture.CaptureTime.UnixTimestampMillis`, or `DateTime.now()` in the
+  `CaptureScreenshot` callback): it is this PC's clock when the dev plays here. `crop` is the dev's selection in
+  normalized coordinates (0..1 from the top left, `w`/`h` > 0, inside the image).
+- The dev server looks in `%LOCALAPPDATA%\Roblox\tmp-capture-storage` (`TT_CAPTURE_DIR` overrides it) for
+  `<userId>_<placeId>_<unixMs>.png` where `userId` is the **JWT's user** (never anyone else's file) and `placeId`
+  matches (0 = any): a LocalId that names a file stem picks that file; otherwise the closest time within 5 s, waiting
+  up to about 5 s for Roblox to finish writing it (size settled, PNG trailer present). It only reads Roblox's file.
+- `200` → `{"id", "width", "height"}` (the cropped copy, ≤ 1568 px on the long side). `404`: no such file (the dev plays
+  on another PC: use the asset fallback). `422`: not a readable image. `429`: quota, or a pickup already running for
+  this user, or 10 pickups/downloads this minute.
+
+### `POST /v1/attachments/asset` (fallback)
+- Headers like every POST; body `{"assetId": <id>, "crop"?: {...}}`: the asset id from `CaptureService:UploadCaptureAsync` /
+  `StartUploadCaptureAsync`. Downloaded with the Open Cloud key (`apis.roblox.com/asset-delivery-api`; a Decal is followed
+  to its image once), then like a capture.
+- `200` as above; `502` the download failed; `503` the dev server has no Open Cloud key; `422`, `429` as above.
+
+### `GET /v1/images/:id?chunk=<n>`
+- `Authorization: Bearer <JWT>`, `X-TT-Job`. An image Claude showed (an `image` event). Only the prompt's requester on
+  the game server that sent it (`404` otherwise, also once it expired after 3 h or was evicted).
+- `200` → `{"id", "chunk", "chunks", "bytes", "width", "height", "data": "<base64>"}`: chunk `n` (from 0) of the zstd
+  data (64 KB raw per chunk) of `width × height × 4` RGBA8 bytes, rows top to bottom. Concatenate all chunks, then
+  `EncodingService:DecompressBuffer(..., Zstd)` → `EditableImage:WritePixelsBuffer`.
 
 ### `GET /v1/conversations`
 - `Authorization: Bearer <JWT>`, `X-TT-Job`. The caller's own conversations, latest activity first (at most 20):
@@ -239,7 +279,7 @@ that came through the tunnel are refused). Its tools act only on the game server
 | `inspect {realm?, path, depth?, properties?}` | Class, properties, attributes, tags, children |
 | `find {realm?, query, under?, limit?}` | Instances whose Name or ClassName contains the query |
 | `game_status {}` | Artifact, generation, branch, channel, uptime, players with positions |
-| `screenshot {}` | Not available yet |
+| `screenshot {}` | What the requester sees now: the game asks their client to capture and answers `{captureTime, placeId, localId?}` (or `{assetId}` after an upload); the dev server picks up the file like `POST /v1/attachments/capture` and returns it to Claude as an MCP image block (≤ 1568 px; never written to disk by the dev server) |
 
 Delivery: the game server's long-poll (`GET /v1/game/poll?since=<cursor>`, JWT, held up to 20 s) carries this server's
 prompt events and its tool requests; results go to `POST /v1/game/tool-result {id, ...}`. When no poll is open the dev
@@ -260,12 +300,13 @@ Claude gets the result capped at 64 KB inside `<untrusted-game-data>`; with no a
 | `401` | Token endpoint: any failed grant. Other endpoints: missing/invalid access token (signature, alg, iss, aud, expiry, sid, user not allowed/revoked, stale `ver`) | Other endpoints: refresh once; token endpoint: ask for a new code |
 | `403` | Valid token, wrong `X-TT-Job`, branch or scope; cancel or deploy decision by a non-requester | Give up |
 | `400` | Bad body/schema/unknown field, missing or invalid `X-TT-Nonce`/`X-TT-Timestamp`, timestamp outside ±300 s, bad `since`, an attachment that isn't the caller's or was used, an image whose sizes don't match | Fix the request |
-| `404` | Unknown prompt, conversation (or someone else's), proposal or route | |
+| `404` | Unknown prompt, conversation (or someone else's), proposal, image (or someone else's) or route; no capture file for `POST /v1/attachments/capture` | Capture: use the asset fallback |
 | `409` | Nonce already used; cancel of a finished prompt; a deploy decision on a settled proposal; a follow-up while the conversation's last prompt runs or waits for a deploy decision | |
-| `413` / `431` | Body over 320 KB (3 MB for attachments) / headers over 2 KB | |
+| `413` / `431` | Body over 480 KB (3 MB for attachments) / headers over 2 KB | |
 | `423` | A code prompt while another code run or an undecided proposal holds the worktree | Wait for it, or decide the proposal |
-| `429` | This user locked on this job (5 wrong codes), token rate limit, queue full (5), `--max-prompts` reached, 20 attachments uploaded | Back off |
-| `503` | Session shutting down | |
+| `429` | This user locked on this job (5 wrong codes), token rate limit, queue full (5), `--max-prompts` reached, 8 unsent or 40 attachments, a pickup running or 10 pickups/downloads this minute | Back off |
+| `422` / `502` | A capture or asset that isn't a readable image / the asset download failed | |
+| `503` | Session shutting down; `POST /v1/attachments/asset` without an Open Cloud key | |
 
 ### Registration (Open Cloud MessagingService)
 Topic `TypeTorch/remote-claude`, every 60 s (and right away when a user is revoked):
@@ -282,15 +323,18 @@ fast-forwarded (or merged) to the branch head before every run, commits land the
 `git merge remote-claude/<branch>`. Leftovers of a failed or cancelled run are reset before the next one. While a deploy
 proposal waits, runs only clean the worktree (no merge), so it stays exactly at the proposed commit.
 
-Attachments are saved in the worktree as `.typetorch/attachments/<id>.png`, git-ignored through `.git/info/exclude`
-(never a tracked file), so `git add -A` never picks them up. The folder is emptied at startup and deleted at exit.
+Attachments (screenshots) are never in the worktree: they live in `<temp>/tt-rc-att-<session>` and, while their prompt
+runs, in that run's temp folder (see the security model). An old `.typetorch/attachments` folder in the worktree is
+deleted at startup.
 Claude Code keeps its sessions under `~/.claude/projects/`, which is what lets a conversation resume (what Claude read
-during a run, attached logs included, is part of that session's local transcript).
+during a run, attached logs and screenshots included, is part of that session's local transcript, and the screenshot
+tool's image too).
 
 ## Tests
 ```sh
-bun test                 # security, relay (paths, status lines, logs), modes + deploy approval, chat and game-tool
-                         # tests on 127.0.0.1 (a fake claude drives the real runner) and one real Quick Tunnel
+bun test                 # security, relay (paths, status lines, logs), modes + deploy approval, chat, game-tool and
+                         # image tests (PNG decode, downscale, crop, capture pickup, asset fallback, Claude → game),
+                         # all on 127.0.0.1 (a fake claude drives the real runner), and one real Quick Tunnel
                          # (TT_SKIP_TUNNEL=1 to skip it)
 bun test/e2e.ts          # a real two-message conversation with an image attachment through the tunnel and Claude,
                          # in test-fixture/ (--no-deploy)

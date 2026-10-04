@@ -4,10 +4,12 @@
  * exits; the in-memory signing key dies with the process, so every token dies too.
  */
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { Announcer, closedMessage, publishMessage, registrationMessage } from "./announce";
 import { GAME_TOPIC } from "./game-tools";
-import { ATTACHMENT_DIR } from "./attachments";
+import { sweepStaleTempFolders } from "./attachments";
+import { captureDir, openCloudAssetDownloader } from "./images";
 import { checkSubscriptionAuth } from "./billing";
 import { branchChannel, branchFromGit, loadGameConfig } from "./config";
 import { API_KEY_VARS, DEPLOY_SECRET_VARS, Settings, childEnv } from "./env";
@@ -145,10 +147,12 @@ export async function startRemoteClaude(options: RemoteClaudeOptions): Promise<R
 	if (worktree.workBranch !== gitBranch) {
 		logger.info(`"${gitBranch}" is checked out elsewhere, so commits go to ${worktree.workBranch} (git merge ${worktree.workBranch})`);
 	}
-	// Attachments: <worktree>/.typetorch/attachments, git-ignored, emptied now and deleted when the session ends.
-	const attachmentsDir = join(worktree.path, ...ATTACHMENT_DIR.split("/"));
-	await ensureIgnored(worktree.path, `${ATTACHMENT_DIR}/`);
-	rmSync(attachmentsDir, { recursive: true, force: true });
+	// Attachments live in the session's own temp folder outside the worktree (server.ts). Older versions kept them in
+	// <worktree>/.typetorch/attachments: anything left there is deleted.
+	rmSync(join(worktree.path, ".typetorch", "attachments"), { recursive: true, force: true });
+	// Screenshots and log files a crashed session left in the temp folder.
+	const swept = sweepStaleTempFolders(tmpdir());
+	if (swept > 0) logger.info(`deleted ${swept} stale remote-claude temp folder(s)`);
 	if (options.installDeps !== false && existsSync(join(worktree.path, "package.json")) && !existsSync(join(worktree.path, "node_modules"))) {
 		logger.info("installing dependencies in the worktree (bun install)…");
 		const installed = await run([process.execPath, "install"], { cwd: worktree.path, env: childEnv(), timeoutMs: 10 * 60_000 });
@@ -201,7 +205,11 @@ export async function startRemoteClaude(options: RemoteClaudeOptions): Promise<R
 		logger,
 		codeTtlMs: codeTtlMs,
 		now: options.now,
-		attachmentsDir,
+		// Images Claude shows must be files in the worktree; screenshots are picked up where Roblox writes them on this PC,
+		// or (fallback) downloaded with the Open Cloud key.
+		worktree: worktree.path,
+		captureDir: captureDir(),
+		downloadAsset: apiKey ? openCloudAssetDownloader(apiKey.value) : undefined,
 		// Game tools: a wake message per request (no code in it); game servers also poll GET /v1/game/pending.
 		publishWake: apiKey && universeId ? (message) => publishMessage(universeId, apiKey.value, GAME_TOPIC, message, logger) : undefined,
 		onPairingCode: (formatted, reason, expiresAt) => {

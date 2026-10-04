@@ -4,14 +4,14 @@
  * through the real runner in a throwaway git repo.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { inflateSync } from "node:zlib";
-import { ATTACHMENT_LIMITS, decodeAttachment, zstdContentSize } from "../src/attachments";
+import { ATTACHMENT_LIMITS, AttachmentStore, decodeAttachment, zstdContentSize } from "../src/attachments";
 import { assessAuthStatus, checkSubscriptionAuth, judgeInitEvent, SubscriptionRequiredError } from "../src/billing";
 import { childEnv, isApiBillingVar } from "../src/env";
-import { ensureIgnored, ensureWorktree } from "../src/git";
+import { ensureWorktree } from "../src/git";
 import { addEventSecret, redactEvent, safePrefixLength, silentLogger } from "../src/log";
 import { crc32, encodePng, PNG_SIGNATURE } from "../src/png";
 import type { PromptEvent, Runner } from "../src/prompts";
@@ -330,7 +330,8 @@ describe("attachments", () => {
 		const decoded = decodePng(new Uint8Array(readFileSync(file)));
 		expect([decoded.width, decoded.height]).toEqual([37, 21]);
 		expect(Buffer.from(decoded.pixels).equals(Buffer.from(pixels))).toBe(true);
-		expect(srv.attachments.get(id)?.relPath).toBe(`.typetorch/attachments/${id}.png`);
+		expect(srv.attachments.get(id)?.path).toBe(file);
+		expect(srv.attachments.get(id)?.source).toBe("upload");
 	});
 
 	test("uncompressed upload works; every size mismatch is refused", async () => {
@@ -384,14 +385,39 @@ describe("attachments", () => {
 		const done = await waitDone(srv, jwt, created.id);
 		expect(done.attachments?.map((a) => a.id)).toEqual(ids.slice(0, 4));
 		expect((await post(srv, jwt, "/v1/prompts", { prompt: "again", attachments: [ids[0]] })).status).toBe(400); // used
-		// Quota: 6 uploaded by u so far (5 + 0); 14 more fit, the 21st is refused.
-		for (let i = srv.attachments.count(u); i < ATTACHMENT_LIMITS.perUser; i++) expect((await upload()).status).toBe(200);
+		// Unused ones: 1 left (ids[4]); up to 8 may wait unsent, the 9th is refused.
+		for (let i = srv.attachments.unused(u); i < ATTACHMENT_LIMITS.unusedPerUser; i++) expect((await upload()).status).toBe(200);
+		expect(srv.attachments.unused(u)).toBe(ATTACHMENT_LIMITS.unusedPerUser);
 		expect((await upload()).status).toBe(429);
 	});
 
+	test("attachment store: 40 per user per session in all; unused ones expire after 30 min; files are owner-only", () => {
+		let now = 1_000_000;
+		const store = new AttachmentStore(join(attachmentsDir, "store"), () => now);
+		const image = { width: 2, height: 2, pixels: testImage(2, 2) };
+		const first = store.addImage(7, image, "capture");
+		if (typeof first === "string") throw new Error(first);
+		expect(statSync(first.path).mode & 0o777).toBe(process.platform === "win32" ? statSync(first.path).mode & 0o777 : 0o600);
+		// Expired unused: deleted from disk, can't be sent.
+		now += ATTACHMENT_LIMITS.unusedTtlMs;
+		store.prune();
+		expect(existsSync(first.path)).toBe(false);
+		expect(store.check([first.id], 7)).toBeUndefined();
+		// The session total counts every one, used or not.
+		for (let i = store.count(7); i < ATTACHMENT_LIMITS.perUser; i++) {
+			const saved = store.addImage(7, image, "upload");
+			if (typeof saved === "string") throw new Error(saved);
+			saved.promptId = "used"; // as if a prompt took it
+		}
+		expect(store.addImage(7, image, "upload")).toBe("quota");
+		expect(store.addImage(8, image, "upload")).not.toBe("quota");
+		store.clear();
+		expect(existsSync(store.dir)).toBe(false);
+	});
+
 	test("the prompt tells Claude where the screenshots are; files are deleted when the server stops", async () => {
-		const wrapped = wrapPrompt(1, "what is wrong here?", undefined, [{ relPath: ".typetorch/attachments/abc.png", width: 640, height: 360 }]);
-		expect(wrapped).toContain("<attachments>\nAttached screenshot: .typetorch/attachments/abc.png (640x360)\n</attachments>");
+		const wrapped = wrapPrompt(1, "what is wrong here?", undefined, [{ path: "/tmp/tt-rc-logs-x/screenshot-abc.png", width: 640, height: 360 }]);
+		expect(wrapped).toContain("<attachments>\nAttached screenshot: /tmp/tt-rc-logs-x/screenshot-abc.png (640x360)\n</attachments>");
 		const dir = join(attachmentsDir, "stop");
 		const own = createRemoteClaudeServer({ branch: BRANCH, users: USERS, runner: scripted, logger: silentLogger, attachmentsDir: dir });
 		const jwt = await pair(own, USERS[0]);
@@ -487,7 +513,8 @@ describe("real runner with a fake claude (stream mapping, resume, answered, bill
 	let out: string;
 	let server: RemoteClaudeServer;
 	let subscriptionVerified = true;
-	const runs = () => readFileSync(out, "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line) as { args: string[]; stdin: string; resume?: string; billingVars: string[] });
+	type FakeRun = { args: string[]; stdin: string; resume?: string; billingVars: string[]; cwd: string; attached: { path: string; exists: boolean }[] };
+	const runs = () => readFileSync(out, "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line) as FakeRun);
 	const env = (vars: Record<string, string | undefined>) => {
 		for (const [k, v] of Object.entries(vars)) if (v === undefined) delete process.env[k];
 		else process.env[k] = v;
@@ -507,12 +534,11 @@ describe("real runner with a fake claude (stream mapping, resume, answered, bill
 		git("commit", "-q", "-m", "init");
 		git("checkout", "-q", "-b", "dev");
 		const worktree = await ensureWorktree(repo, "dev");
-		await ensureIgnored(worktree.path, ".typetorch/attachments/");
 		out = join(dir, "runs.jsonl");
 		writeFileSync(out, "");
 		env({ TT_FAKE_OUT: out });
 		const runner: Runner = (ctx) => createClaudeRunner({ worktree, ttBranch: BRANCH, deploy: false, claudeCommand: FAKE, subscriptionVerified })(ctx);
-		server = createRemoteClaudeServer({ branch: BRANCH, users: USERS, runner, logger: silentLogger, attachmentsDir: join(worktree.path, ".typetorch", "attachments") });
+		server = createRemoteClaudeServer({ branch: BRANCH, users: USERS, runner, logger: silentLogger, worktree: worktree.path });
 	});
 
 	afterAll(async () => {
@@ -617,19 +643,67 @@ describe("real runner with a fake claude (stream mapping, resume, answered, bill
 		}
 	});
 
-	test("attachments reach Claude as paths inside the worktree", async () => {
+	test("attachments reach Claude in the run's temp folder outside the worktree (--add-dir), deleted after the run", async () => {
 		const jwt = await pair(server, USERS[35]);
 		const res = await post(server, jwt, "/v1/attachments", { width: 4, height: 4, format: "rgba8", compression: "zstd", data: b64(Bun.zstdCompressSync(testImage(4, 4))) });
 		const { id } = (await res.json()) as { id: string };
+		const uploaded = server.attachments.get(id)!.path;
+		expect(existsSync(uploaded)).toBe(true);
 		const created = (await (await post(server, jwt, "/v1/prompts", { prompt: "see image", attachments: [id] })).json()) as View;
 		await waitDone(server, jwt, created.id);
 		const run = runs()[runs().length - 1];
-		expect(run.stdin).toContain(`Attached screenshot: .typetorch/attachments/${id}.png (4x4)`);
-		const wt = server.attachments.dir;
-		expect(existsSync(join(wt, `${id}.png`))).toBe(true);
-		// Git ignores it (never committed by the next run's `git add -A`).
-		const status = Bun.spawnSync(["git", "status", "--porcelain", "--ignored"], { cwd: join(wt, "..", ".."), stdout: "pipe" }).stdout.toString();
-		expect(status).toContain("!! .typetorch/");
+		const runDir = run.args[run.args.indexOf("--add-dir") + 1];
+		expect(runDir.startsWith(tmpdir())).toBe(true);
+		expect(run.attached).toHaveLength(1);
+		expect(run.attached[0].path.startsWith(runDir)).toBe(true);
+		expect(run.attached[0].exists).toBe(true); // readable while Claude runs
+		expect(run.stdin).toContain(`Attached screenshot: ${run.attached[0].path} (4x4)`);
+		expect(run.attached[0].path.startsWith(run.cwd)).toBe(false); // never in the worktree
+		// Gone after the run: the copy, the run folder and the original upload.
+		expect(existsSync(run.attached[0].path)).toBe(false);
+		expect(existsSync(runDir)).toBe(false);
+		expect(existsSync(uploaded)).toBe(false);
+		expect(server.attachments.get(id)!.released).toBe(true);
+	});
+
+	test("images Claude shows (![caption](path)) become image events the requesting game server can fetch", async () => {
+		const owner = USERS[36];
+		const jwt = await pair(server, owner);
+		const created = (await (await post(server, jwt, "/v1/prompts", { prompt: "SHOWIMG please" })).json()) as View;
+		const done = await waitDone(server, jwt, created.id);
+		expect(done.state).toBe("answered");
+		const events = await allEvents(server, jwt, created.id);
+		const shown = events.filter((e) => e.kind === "image");
+		expect(shown).toHaveLength(1);
+		expect(shown[0].text).toBe("a red square");
+		const meta = shown[0].image!;
+		expect([meta.width, meta.height, meta.chunks]).toEqual([24, 16, 1]);
+		// The refused references are short notes: outside the worktree, inside .git, not an image, missing.
+		const notes = events.filter((e) => e.kind === "status" && e.text.startsWith("image not shown")).map((e) => e.text);
+		expect(notes).toEqual([
+			"image not shown: only files in the worktree can be shown",
+			"image not shown: that file can't be shown",
+			"image not shown: not an image file",
+			"image not shown: file not found",
+		]);
+		// The final status comes after the image events.
+		expect(events[events.length - 1]).toMatchObject({ kind: "status", state: "answered" });
+		expect(events.findIndex((e) => e.kind === "image")).toBeLessThan(events.length - 1);
+		// Only the requester, on the game server that sent the prompt.
+		const res = await get(server, jwt, `/v1/images/${meta.id}?chunk=0`);
+		expect(res.status).toBe(200);
+		const body = (await res.json()) as { chunk: number; chunks: number; bytes: number; width: number; height: number; data: string };
+		const pixels = Bun.zstdDecompressSync(Buffer.from(body.data, "base64"));
+		expect(pixels.length).toBe(24 * 16 * 4);
+		expect([...pixels.subarray(0, 4)]).toEqual([255, 0, 0, 255]);
+		expect(body.bytes).toBe(meta.bytes);
+		expect((await get(server, jwt, `/v1/images/${meta.id}?chunk=1`)).status).toBe(404);
+		expect((await get(server, jwt, `/v1/images/${meta.id}?chunk=x`)).status).toBe(400);
+		const stranger = await pair(server, USERS[37]);
+		expect((await get(server, stranger, `/v1/images/${meta.id}?chunk=0`)).status).toBe(404);
+		expect((await get(server, jwt, `/v1/images/${"0".repeat(32)}`)).status).toBe(404);
+		// The image file the run wrote is dropped (live mode never changes files).
+		expect(existsSync(join(runs()[runs().length - 1].cwd, "shots", "red.png"))).toBe(false);
 	});
 });
 

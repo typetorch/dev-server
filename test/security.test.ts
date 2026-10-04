@@ -739,7 +739,9 @@ describe("POST /v1/prompts", () => {
 		const jwt = await tokenFor(user());
 		expect((await createPrompt(jwt, { prompt: "x" }, { "x-padding": "p".repeat(2100) })).status).toBe(431);
 		expect((await tokenRequest(srv, codeGrant(srv, user()), { "x-padding": "p".repeat(2100) })).status).toBe(431);
-		expect((await createPrompt(jwt, { prompt: "x", context: { errors: Array.from({ length: 50 }, () => "e".repeat(4000)), logs: { client: "c".repeat(66_000), server: "s".repeat(66_000) } } })).status).toBe(413);
+		// Every field at its cap (errors, three logs of 66000 two-byte characters) is over the 480 KB body cap.
+		const full = (c: string) => c.repeat(66_000);
+		expect((await createPrompt(jwt, { prompt: "x", context: { errors: Array.from({ length: 50 }, () => "e".repeat(4000)), logs: { client: full("é"), server: full("é"), player: { name: "Bob", text: full("é") } } } })).status).toBe(413);
 		expect((await createPrompt(jwt, { prompt: "x", context: { logs: { client: "c".repeat(66_001) } } })).status).toBe(400);
 		expect((await createPrompt(jwt, { prompt: "p".repeat(4001) })).status).toBe(400);
 		expect((await tokenRequest(srv, { ...codeGrant(srv, user()), pad: "x".repeat(2000) })).status).toBe(401); // token body cap 1 KB
