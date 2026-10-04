@@ -182,7 +182,7 @@ export class PromptQueue {
 		record.finishedAt = now();
 		record.done = true;
 		const extra = [record.commit && `commit ${record.commit.slice(0, 8)}`, record.artifactId, record.error].filter(Boolean).join("  ");
-		this.options.logger.info(`prompt ${record.id.slice(0, 8)} ${record.state}${extra ? `  ${extra}` : ""}`);
+		this.options.logger.info(`prompt ${record.id.slice(0, 8)} finished: ${record.state}${extra ? `  ${extra}` : ""}`);
 	}
 
 	private async pump(): Promise<void> {

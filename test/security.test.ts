@@ -24,6 +24,7 @@ const A = 111;
 const B = 222;
 const C = 333;
 const D = 444;
+const E = 555;
 const OUTSIDER = 999;
 
 /** Holds each prompt "running" until it is cancelled (or 20 s pass), so cancel/ownership tests are deterministic. */
@@ -96,7 +97,7 @@ beforeAll(() => {
 	srv = createRemoteClaudeServer({
 		secret: SECRET,
 		branch: BRANCH,
-		users: [A, B, C, D],
+		users: [A, B, C, D, E],
 		runner: stubRunner,
 		maxQueued: 50,
 		maxPrompts: 1000,
@@ -369,14 +370,54 @@ describe("ownership, revoke", () => {
 		expect(["queued", "running"]).toContain(view.state as string);
 		expect(typeof view.queuedAt).toBe("number");
 		expect(Array.isArray(view.log)).toBe(true);
-		const cancel = (jwt: string) => fetch(`${base}/v1/prompts/${created.id}/cancel`, { method: "POST", headers: { authorization: `Bearer ${jwt}`, "x-tt-job": JOB } });
+		// Like the game: no body, no Content-Type, but a fresh nonce + timestamp on every POST.
+		const cancelHeaders = (jwt: string) => {
+			const headers = promptHeaders(jwt);
+			delete headers["content-type"];
+			return headers;
+		};
+		const cancel = (jwt: string, headers = cancelHeaders(jwt)) => fetch(`${base}/v1/prompts/${created.id}/cancel`, { method: "POST", headers });
 		expect((await cancel(jwtB)).status).toBe(403);
-		const ok = await cancel(jwtA);
+		const noNonce = cancelHeaders(jwtA);
+		delete noNonce["x-tt-nonce"];
+		expect((await cancel(jwtA, noNonce)).status).toBe(400);
+		const stale = { ...cancelHeaders(jwtA), "x-tt-timestamp": String(Math.floor(Date.now() / 1000) - 400) };
+		expect((await cancel(jwtA, stale)).status).toBe(400);
+		const headers = cancelHeaders(jwtA);
+		const ok = await cancel(jwtA, headers);
 		expect(ok.status).toBe(200);
 		expect(await ok.json()).toEqual({ ok: true });
+		expect((await cancel(jwtA, headers)).status).toBe(409); // same nonce again
+		expect((await cancel(jwtA)).status).toBe(200); // already cancelled: still ok
 		await Bun.sleep(50);
 		expect(((await (await getPrompt(jwtA, created.id)).json()) as { state: string }).state).toBe("cancelled");
 		expect((await getPrompt(jwtA, "BBBBBBBBBBBBBBBBBBBBBB")).status).toBe(404);
+	});
+
+	test("Studio: job \"\" in the token and no X-TT-Job header (Roblox drops empty headers) works end to end", async () => {
+		const res = await requestToken(E, { job: "" });
+		expect(res.status).toBe(200);
+		const jwt = ((await res.json()) as { access_token: string }).access_token;
+		expect(decodeJwt(jwt).job).toBe("");
+		const headers = promptHeaders(jwt);
+		delete headers["x-tt-job"];
+		const created = await fetch(`${base}/v1/prompts`, { method: "POST", headers, body: JSON.stringify({ prompt: "studio", context: { artifact: "dev-abc1234" } }) });
+		expect(created.status).toBe(200);
+		const { id } = (await created.json()) as { id: string };
+		expect((await fetch(`${base}/v1/prompts/${id}`, { headers: { authorization: `Bearer ${jwt}` } })).status).toBe(200);
+		// A Studio token can't be used with a real JobId header, and a real-server token can't be used without one.
+		expect((await getPrompt(jwt, id, JOB)).status).toBe(403);
+		const cancelHeaders = promptHeaders(jwt);
+		delete cancelHeaders["x-tt-job"];
+		delete cancelHeaders["content-type"];
+		expect((await fetch(`${base}/v1/prompts/${id}/cancel`, { method: "POST", headers: cancelHeaders })).status).toBe(200);
+	});
+
+	test("ids match the game's checks: session id 32 lowercase hex, prompt ids ^[A-Za-z0-9_-]{1,64}$", async () => {
+		expect(srv.auth.sessionId).toMatch(/^[0-9a-f]{32}$/);
+		const created = (await (await createPrompt(await tokenFor(D))).json()) as { id: string };
+		expect(created.id).toMatch(/^[A-Za-z0-9_-]{1,64}$/);
+		srv.queue.cancel(created.id, "test");
 	});
 
 	test("revoke <userId> (terminal command) kills the user's tokens and token exchange", async () => {

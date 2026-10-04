@@ -156,6 +156,24 @@ export class QuickTunnel {
 		});
 	}
 
+	/**
+	 * Waits until the public URL reaches this server (a fresh trycloudflare.com name can take 10–20 s to resolve), so
+	 * the URL is only announced once game servers can use it. `GET /` is answered by our server with a bare 404 that
+	 * carries our security headers; Cloudflare's own error pages don't.
+	 */
+	async waitReachable(timeoutMs = 45_000): Promise<boolean> {
+		const deadline = Date.now() + timeoutMs;
+		while (Date.now() < deadline && this.url) {
+			try {
+				const res = await fetch(`${this.url}/`, { signal: AbortSignal.timeout(8_000) });
+				await res.arrayBuffer().catch(() => {});
+				if (res.status === 404 && res.headers.get("referrer-policy") === "no-referrer") return true;
+			} catch {}
+			await Bun.sleep(1500);
+		}
+		return false;
+	}
+
 	stop(): void {
 		this.stopping = true;
 		if (this.proc) killTree(this.proc);

@@ -157,11 +157,13 @@ export async function startRemoteClaude(options: RemoteClaudeOptions): Promise<R
 			port: server.port,
 			logger,
 			onUrl: () => {
-				if (started) void announcer?.announce(); // a restart: re-announce the new URL right away
+				// A restart: re-announce the new URL as soon as it is reachable.
+				if (started) void tunnel?.waitReachable().then(() => announcer?.announce());
 			},
 		});
 		try {
 			await tunnel.start();
+			if (!(await tunnel.waitReachable())) logger.warn("the tunnel URL is not reachable yet; announcing anyway");
 		} catch (error) {
 			await server.stop();
 			throw error;

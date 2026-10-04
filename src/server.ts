@@ -197,7 +197,8 @@ export function createRemoteClaudeServer(options: RemoteClaudeServerOptions): Re
 		const { userId, claims } = verified;
 		const who = `roblox:${userId} jti=${claims.jti.slice(0, 8)}`;
 
-		if (route.kind === "create") {
+		// Every POST (create and cancel) carries a fresh X-TT-Nonce and an X-TT-Timestamp within ±300 s.
+		if (req.method === "POST") {
 			const stamp = req.headers.get("x-tt-timestamp") ?? "";
 			if (!/^\d{1,12}$/.test(stamp) || Math.abs(Math.floor(Date.now() / 1000) - Number(stamp)) > TIMESTAMP_WINDOW_SECONDS) {
 				return decide(400, what, `${who} timestamp`), empty(400);
@@ -205,6 +206,9 @@ export function createRemoteClaudeServer(options: RemoteClaudeServerOptions): Re
 			const nonce = req.headers.get("x-tt-nonce") ?? "";
 			if (!NONCE_PATTERN.test(nonce)) return decide(400, what, `${who} nonce missing/invalid`), empty(400);
 			if (!nonces.use(nonce)) return decide(409, what, `${who} nonce replay`), empty(409);
+		}
+
+		if (route.kind === "create") {
 			if (!isJson(req)) return decide(400, what, `${who} content-type`), empty(400);
 			const text = await readBody(req, LIMITS.promptBodyBytes);
 			if (text === TOO_LARGE) return decide(413, what, `${who} body too large`), empty(413);
@@ -223,7 +227,7 @@ export function createRemoteClaudeServer(options: RemoteClaudeServerOptions): Re
 		if (!record) return decide(404, what, who), empty(404);
 		if (route.kind === "get") return json(queue.view(record));
 
-		// Cancel: only the requester (or the dev at the terminal).
+		// Cancel (no body or Content-Type expected; a body is ignored): only the requester (or the dev at the terminal).
 		if (record.userId !== userId) return decide(403, what, `${who} not the requester`), empty(403);
 		const result = queue.cancel(record.id, `roblox:${userId}`);
 		if (result === "finished") return decide(409, what, `${who} already finished`), empty(409);
