@@ -1,6 +1,7 @@
 /** Strict request body validation: exact shapes, size caps, unknown fields rejected. */
 import { ATTACHMENT_ID_PATTERN, ATTACHMENT_LIMITS, type AttachmentRequest } from "./attachments";
 import { CONVERSATION_ID_PATTERN } from "./conversations";
+import { STROKE_COLORS, type Stroke, type StrokeColor } from "./images";
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value) && Object.getPrototypeOf(value) === Object.prototype;
@@ -190,6 +191,45 @@ export function parseCrop(raw: unknown): Crop | undefined {
 	return { x, y, w, h };
 }
 
+export const STROKE_LIMITS = {
+	/** Strokes per image. */
+	strokes: 30,
+	/** Points per stroke. */
+	pointsPerStroke: 400,
+	/** Points of all strokes of one image together. */
+	points: 3000,
+	/** The thickest pen, as a fraction of the capture's height. */
+	maxWidth: 0.04,
+	/**
+	 * The JSON body of a capture or asset request (with its strokes). 3000 points at 4 decimals are about 42 KB; the
+	 * game server refuses drawings over 60 KB of JSON before sending.
+	 */
+	bodyBytes: 64 * 1024,
+} as const;
+
+/**
+ * `[{color: "red"|"yellow"|"white"|"black", width: (0, 0.04], points: [x0, y0, x1, y1, ...]}]`: at most 30 strokes,
+ * 1–400 points each and 3000 in all, every coordinate a finite number in 0..1 (normalized to the FULL capture),
+ * nothing else. A fresh copy, or undefined when malformed. An empty list is no strokes.
+ */
+export function parseStrokes(raw: unknown): Stroke[] | undefined {
+	if (!Array.isArray(raw) || raw.length > STROKE_LIMITS.strokes) return undefined;
+	const strokes: Stroke[] = [];
+	let total = 0;
+	for (const item of raw) {
+		if (!isPlainObject(item) || !onlyKeys(item, ["color", "width", "points"])) return undefined;
+		const { color, width, points } = item;
+		if (typeof color !== "string" || !Object.hasOwn(STROKE_COLORS, color)) return undefined;
+		if (typeof width !== "number" || !Number.isFinite(width) || width <= 0 || width > STROKE_LIMITS.maxWidth) return undefined;
+		if (!Array.isArray(points) || points.length < 2 || points.length % 2 !== 0 || points.length > STROKE_LIMITS.pointsPerStroke * 2) return undefined;
+		for (const value of points) if (typeof value !== "number" || !Number.isFinite(value) || value < 0 || value > 1) return undefined;
+		total += points.length / 2;
+		if (total > STROKE_LIMITS.points) return undefined;
+		strokes.push({ color: color as StrokeColor, width, points: [...(points as number[])] });
+	}
+	return strokes;
+}
+
 export interface CaptureRequest {
 	/** Unix ms on the dev's PC clock (the client's capture time). */
 	captureTime: number;
@@ -199,11 +239,13 @@ export interface CaptureRequest {
 	placeId?: number;
 	/** The part of the screenshot the dev selected (applied before downscaling). */
 	crop?: Crop;
+	/** Marks the dev drew (drawn onto the full capture before the crop and the downscale). */
+	strokes?: Stroke[];
 }
 
-/** `{captureTime: unix ms, localId?: string ≤128, placeId?: number, crop?: Crop}`, nothing else. */
+/** `{captureTime: unix ms, localId?: string ≤128, placeId?: number, crop?: Crop, strokes?: Stroke[]}`, nothing else. */
 export function parseCaptureRequest(raw: unknown): CaptureRequest | undefined {
-	if (!isPlainObject(raw) || !onlyKeys(raw, ["captureTime", "localId", "placeId", "crop"])) return undefined;
+	if (!isPlainObject(raw) || !onlyKeys(raw, ["captureTime", "localId", "placeId", "crop", "strokes"])) return undefined;
 	const { captureTime, localId, placeId } = raw;
 	// 2001-09-09 .. 2286-11-20 in ms: a real clock reading, not seconds or garbage.
 	if (typeof captureTime !== "number" || !Number.isSafeInteger(captureTime) || captureTime < 1e12 || captureTime >= 1e13) return undefined;
@@ -221,17 +263,37 @@ export function parseCaptureRequest(raw: unknown): CaptureRequest | undefined {
 		if (!crop) return undefined;
 		request.crop = crop;
 	}
+	if (raw.strokes !== undefined) {
+		const strokes = parseStrokes(raw.strokes);
+		if (!strokes) return undefined;
+		if (strokes.length > 0) request.strokes = strokes;
+	}
 	return request;
 }
 
-/** `{assetId: positive integer, crop?: Crop}`, nothing else. */
-export function parseAssetRequest(raw: unknown): { assetId: number; crop?: Crop } | undefined {
-	if (!isPlainObject(raw) || !onlyKeys(raw, ["assetId", "crop"])) return undefined;
+export interface AssetRequest {
+	assetId: number;
+	crop?: Crop;
+	strokes?: Stroke[];
+}
+
+/** `{assetId: positive integer, crop?: Crop, strokes?: Stroke[]}`, nothing else. */
+export function parseAssetRequest(raw: unknown): AssetRequest | undefined {
+	if (!isPlainObject(raw) || !onlyKeys(raw, ["assetId", "crop", "strokes"])) return undefined;
 	const { assetId } = raw;
 	if (typeof assetId !== "number" || !Number.isSafeInteger(assetId) || assetId <= 0) return undefined;
-	if (raw.crop === undefined) return { assetId };
-	const crop = parseCrop(raw.crop);
-	return crop ? { assetId, crop } : undefined;
+	const request: AssetRequest = { assetId };
+	if (raw.crop !== undefined) {
+		const crop = parseCrop(raw.crop);
+		if (!crop) return undefined;
+		request.crop = crop;
+	}
+	if (raw.strokes !== undefined) {
+		const strokes = parseStrokes(raw.strokes);
+		if (!strokes) return undefined;
+		if (strokes.length > 0) request.strokes = strokes;
+	}
+	return request;
 }
 
 export const NONCE_PATTERN = /^[A-Za-z0-9._:{}-]{8,128}$/;

@@ -3,7 +3,7 @@
  * (owner-only), so they can never be committed. Three ways in:
  *   - POST /v1/attachments: raw RGBA8 pixels from the game (zstd or not, base64), every size checked;
  *   - POST /v1/attachments/capture: the screenshot the Roblox client wrote on this PC (images.ts pickUpCapture), the
- *     main path; Roblox's own file is only read, the session keeps a downscaled copy;
+ *     main path; Roblox's own file is only read, the session keeps a downscaled copy (the dev's marks drawn in);
  *   - POST /v1/attachments/asset: a capture the game uploaded with CaptureService, downloaded with Open Cloud.
  * Captures and downloads are downscaled to at most 1568 px on the long side. A prompt references attachments by id;
  * when its run starts they are moved into that run's own temp folder (Claude gets `--add-dir` for it) and the folder
@@ -63,6 +63,8 @@ export interface Attachment {
 	promptId?: string;
 	/** Its file was deleted (the prompt ended, it expired unused, or the session stopped). */
 	released?: boolean;
+	/** Strokes the dev drew on it (already in the pixels); Claude is told they are the dev's marks. */
+	marks?: number;
 }
 
 /** Frame_Content_Size of a single zstd frame: a number, undefined when the frame doesn't say, or "invalid". */
@@ -167,10 +169,12 @@ export class AttachmentStore {
 		return this.save(userId, { width: request.width, height: request.height, pixels }, "upload");
 	}
 
-	/** Saves a decoded image (capture pickup, asset download), downscaled for Claude. */
-	addImage(userId: number, image: Rgba, source: AttachmentSource): Attachment | "quota" {
+	/** Saves a decoded image (capture pickup, asset download), downscaled for Claude. `marks`: strokes drawn on it. */
+	addImage(userId: number, image: Rgba, source: AttachmentSource, marks = 0): Attachment | "quota" {
 		if (this.refusal(userId)) return "quota";
-		return this.save(userId, downscale(image, CLAUDE_IMAGE_SIDE), source);
+		const saved = this.save(userId, downscale(image, CLAUDE_IMAGE_SIDE), source);
+		if (marks > 0) saved.marks = marks;
+		return saved;
 	}
 
 	private save(userId: number, image: Rgba, source: AttachmentSource): Attachment {

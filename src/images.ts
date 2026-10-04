@@ -205,6 +205,97 @@ export function cropImage(image: Rgba, crop: { x: number; y: number; w: number; 
 	return { width, height, pixels };
 }
 
+// Marks the dev drew on a screenshot (the crop view's Draw mode) ---------------------------------------------------------
+
+/** The pen colors (the game's crop view uses the same RGB values). */
+export const STROKE_COLORS = {
+	red: [255, 59, 48],
+	yellow: [255, 214, 10],
+	white: [255, 255, 255],
+	black: [0, 0, 0],
+} as const satisfies Record<string, readonly [number, number, number]>;
+
+export type StrokeColor = keyof typeof STROKE_COLORS;
+
+/**
+ * One freehand stroke, validated by schema.ts parseStrokes. `points` is flat (x0, y0, x1, y1, ...), normalized 0..1
+ * from the top left of the FULL capture (not the crop); one point is a dot. `width` is the pen's thickness as a
+ * fraction of the capture's height.
+ */
+export interface Stroke {
+	color: StrokeColor;
+	width: number;
+	points: number[];
+}
+
+/**
+ * Pixels the strokes of one image may test (each segment's band, about length × thickness). Real drawings stay far
+ * below (30 strokes across a 4K capture with the thickest pen test about 7 M); only crafted input reaches it.
+ */
+export const MAX_STROKE_INK = 64_000_000;
+
+/**
+ * Draws the strokes onto `image` in place (and returns it): each segment is a capsule, the union of circle stamps of
+ * the pen's radius along it, computed exactly as "pixel center within the radius of the segment", so joins and ends
+ * are round. Opaque, no anti-aliasing (the downscale that follows smooths the edges). Throws "marks too large" past
+ * MAX_STROKE_INK before drawing anything. Call it before cropping: the points are relative to the full capture.
+ */
+export function drawStrokes(image: Rgba, strokes: readonly Stroke[]): Rgba {
+	const { width: W, height: H, pixels } = image;
+	let ink = 0;
+	for (const stroke of strokes) {
+		const radius = Math.max(1, (stroke.width * H) / 2);
+		const p = stroke.points;
+		for (let i = 0; i + 3 < p.length; i += 2) ink += (Math.hypot((p[i + 2] - p[i]) * W, (p[i + 3] - p[i + 1]) * H) + 2 * radius) * 2 * radius;
+		ink += 4 * radius * radius;
+	}
+	if (ink > MAX_STROKE_INK) throw new Error("marks too large");
+	for (const stroke of strokes) {
+		const [r, g, b] = STROKE_COLORS[stroke.color];
+		const radius = Math.max(1, (stroke.width * H) / 2);
+		const p = stroke.points;
+		const count = p.length / 2;
+		const capsule = (ax: number, ay: number, bx: number, by: number) => {
+			const dx = bx - ax;
+			const dy = by - ay;
+			const length2 = dx * dx + dy * dy;
+			const length = Math.sqrt(length2);
+			const r2 = radius * radius;
+			const top = Math.max(0, Math.floor(Math.min(ay, by) - radius));
+			const bottom = Math.min(H - 1, Math.ceil(Math.max(ay, by) + radius));
+			const boxLeft = Math.max(0, Math.floor(Math.min(ax, bx) - radius));
+			const boxRight = Math.min(W - 1, Math.ceil(Math.max(ax, bx) + radius));
+			for (let y = top; y <= bottom; y++) {
+				const py = y + 0.5;
+				let left = boxLeft;
+				let right = boxRight;
+				// Only the band within the radius of the segment's line can be inside (a tight row span for steep segments).
+				if (Math.abs(dy) > 1e-9) {
+					const at = ax + ((py - ay) * dx) / dy;
+					const half = (radius * length) / Math.abs(dy);
+					left = Math.max(left, Math.floor(at - half - 1));
+					right = Math.min(right, Math.ceil(at + half + 1));
+				}
+				for (let x = left; x <= right; x++) {
+					const px = x + 0.5;
+					const t = length2 > 0 ? Math.min(1, Math.max(0, ((px - ax) * dx + (py - ay) * dy) / length2)) : 0;
+					const ex = px - (ax + t * dx);
+					const ey = py - (ay + t * dy);
+					if (ex * ex + ey * ey > r2) continue;
+					const o = (y * W + x) * 4;
+					pixels[o] = r;
+					pixels[o + 1] = g;
+					pixels[o + 2] = b;
+					pixels[o + 3] = 255;
+				}
+			}
+		};
+		if (count === 1) capsule(p[0] * W, p[1] * H, p[0] * W, p[1] * H);
+		for (let i = 0; i + 1 < count; i++) capsule(p[i * 2] * W, p[i * 2 + 1] * H, p[i * 2 + 2] * W, p[i * 2 + 3] * H);
+	}
+	return image;
+}
+
 export type ImageFormat = "png" | "jpeg" | "webp" | "gif" | "bmp";
 
 /** The image format from the magic bytes (never from a file name or a declared type). */

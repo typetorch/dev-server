@@ -33,12 +33,14 @@ import {
 	cropImage,
 	decodeImage,
 	downscale,
+	drawStrokes,
 	imageMeta,
 	pickUpCapture,
 	prepareGameImage,
 	resolveImageRef,
 	type AssetDownloader,
 	type ImageRef,
+	type Stroke,
 } from "./images";
 import { encodePng } from "./png";
 import { SessionAuth, type Scope } from "./auth";
@@ -71,6 +73,7 @@ import {
 	NONCE_PATTERN,
 	PROMPT_ID_PATTERN,
 	SINCE_PATTERN,
+	STROKE_LIMITS,
 	parseAssetRequest,
 	parseAttachmentRequest,
 	parseCaptureRequest,
@@ -391,8 +394,11 @@ export function createRemoteClaudeServer(options: RemoteClaudeServerOptions): Re
 	const pruneTimer = setInterval(() => attachments.prune(), 60_000);
 	(pruneTimer as { unref?: () => void }).unref?.();
 
-	/** Decodes a picked-up or downloaded image, applies the dev's crop and saves the downscaled copy. */
-	async function importImage(userId: number, bytes: Uint8Array, source: AttachmentSource, crop: Crop | undefined): Promise<Attachment | "quota" | string> {
+	/**
+	 * Decodes a picked-up or downloaded image, draws the dev's marks on the full capture, applies the crop and saves the
+	 * downscaled copy (marks first: their points are relative to the full capture).
+	 */
+	async function importImage(userId: number, bytes: Uint8Array, source: AttachmentSource, crop: Crop | undefined, strokes: Stroke[] = []): Promise<Attachment | "quota" | string> {
 		let image;
 		try {
 			image = await decodeImage(bytes, { ffmpeg: options.ffmpeg });
@@ -400,9 +406,19 @@ export function createRemoteClaudeServer(options: RemoteClaudeServerOptions): Re
 			return oneLine((error as Error).message, 120);
 		}
 		const original = `${image.width}x${image.height}`;
+		if (strokes.length > 0) {
+			try {
+				drawStrokes(image, strokes);
+			} catch (error) {
+				return oneLine((error as Error).message, 120);
+			}
+		}
 		if (crop) image = cropImage(image, crop);
-		const saved = attachments.addImage(userId, image, source);
-		if (typeof saved !== "string") logger.info(`${source} for roblox:${userId}: ${original}${crop ? ` cropped to ${image.width}x${image.height}` : ""} → ${saved.width}x${saved.height} (${saved.pngBytes} bytes)`);
+		const saved = attachments.addImage(userId, image, source, strokes.length);
+		if (typeof saved !== "string") {
+			const marks = strokes.length > 0 ? ` with ${strokes.length} marks` : "";
+			logger.info(`${source} for roblox:${userId}: ${original}${marks}${crop ? ` cropped to ${image.width}x${image.height}` : ""} → ${saved.width}x${saved.height} (${saved.pngBytes} bytes)`);
+		}
 		return saved;
 	}
 
@@ -683,7 +699,9 @@ export function createRemoteClaudeServer(options: RemoteClaudeServerOptions): Re
 		// The screenshot the dev's own client just took: Roblox wrote it on this PC (main path), or uploaded it (fallback).
 		if (route.kind === "attachCapture" || route.kind === "attachAsset") {
 			if (!isJson(req)) return decide(400, what, `${who} content-type`), empty(400);
-			const text = await readBody(req, 1024);
+			// Up to 64 KB: the dev's marks (strokes) travel with the request.
+			const text = await readBody(req, STROKE_LIMITS.bodyBytes);
+			if (text === TOO_LARGE) return decide(413, what, `${who} body too large`), empty(413);
 			if (typeof text !== "string") return decide(400, what, `${who} body`), empty(400);
 			const capture = route.kind === "attachCapture" ? parseCaptureRequest(parseJson(text)) : undefined;
 			const asset = route.kind === "attachAsset" ? parseAssetRequest(parseJson(text)) : undefined;
@@ -713,7 +731,7 @@ export function createRemoteClaudeServer(options: RemoteClaudeServerOptions): Re
 					}
 					note = `asset ${asset!.assetId}`;
 				}
-				const saved = await importImage(userId, bytes, capture ? "capture" : "asset", capture?.crop ?? asset?.crop);
+				const saved = await importImage(userId, bytes, capture ? "capture" : "asset", capture?.crop ?? asset?.crop, capture?.strokes ?? asset?.strokes);
 				if (saved === "quota") return decide(429, what, `${who} attachment quota`), empty(429);
 				if (typeof saved === "string") return decide(422, what, `${who} ${note}: ${saved}`), empty(422);
 				decide(200, what, `${who} ${note} → ${saved.id.slice(0, 8)}.png`);

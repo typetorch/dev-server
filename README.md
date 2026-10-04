@@ -17,9 +17,9 @@ runs in one of two modes:
   discarded after 15 minutes.
 
 The Claude tab is a chat: follow-ups continue the same Claude Code session (also across a mode switch), replies stream
-in, and you can attach screenshots (cropped if you like), your client's log history, another player's client log
-history and the server's log history. Claude can show you images from the worktree (`![caption](path)` in its reply),
-and its `screenshot` tool sees what you see.
+in, and you can attach screenshots (cropped and marked up if you like), your client's log history, another player's
+client log history and the server's log history. Claude can show you images from the worktree (`![caption](path)` in
+its reply), and its `screenshot` tool sees what you see.
 
 **Toolbox (Creator Store), only when you ask for it.** Pick **Toolbox** in the "+" menu and that one message lets Claude
 search the Creator Store from this PC (free assets; no key; the results show as cards in your chat). In Live mode it can
@@ -147,7 +147,7 @@ The Quick Tunnel URL is public, so the server authenticates everything itself:
 | Subscription only | `claude auth status` must report `loggedIn`, `authMethod: "claude.ai"`, `apiProvider: "firstParty"` or the session doesn't start. Child processes never get `ANTHROPIC_*`, `CLAUDE_CODE_USE_*` or `AWS_BEARER_TOKEN_BEDROCK` (the host app's `ANTHROPIC_BASE_URL` included), no `--settings`/`apiKeyHelper` is passed, and a run whose stream-json `init` event has an `apiKeySource` other than `"none"` is killed before it publishes anything (`error: "api_billing_refused"`). Costs shown are Claude Code's estimates (`est.`), not charges |
 | Conversations | Per user and private: a follow-up must name a conversation the caller owns (else `404`) and runs `claude -p --resume <session>` in the same worktree; one prompt at a time per conversation, including a proposal waiting for its decision (`409`) |
 | What reaches games | Everything relayed (events, summaries, errors, status lines) is redacted: the pairing code, the API key, `.env` values, JWT/Bearer shapes, tunnel URLs, and **local paths**: worktree files become relative (`src/a.ts`), the repo becomes `<repo>/`, the home folder `~/`, the temp folder `<tmp>/`, any other absolute path (`C:\...`, `/Users/...`, `\\server\...`, `file://`) `<path>`, and the OS username `<user>`. Streamed text holds back any tail that could be the start of one of these, so nothing is ever published in part. Tool results are one line (a count or a status), never file contents. The prompt's `log` holds only short status lines (≤ 120 characters); raw deploy output and Claude's stderr go to the terminal only |
-| Attachments | Screenshots can show other players, so they stay on this PC and are deleted after use. Three ways in: raw RGBA8 from the game (≤ 1024 px per side, ≤ 4 MB raw, ≤ 2 MB decoded data, zstd frames must declare exactly `width × height × 4` and are inflated with that hard cap); the **capture pickup** (main path: the file Roblox wrote on this PC, only the requesting user's, see below); the **asset fallback** (a CaptureService upload, downloaded with the Open Cloud key). Captures and downloads are decoded (PNG in TS, other formats with ffmpeg and a fixed input format), cropped to the dev's selection and downscaled to ≤ 1568 px on the long side. Copies are owner-only PNGs in the session's temp folder `<temp>/tt-rc-att-<session>` (never in the worktree), moved into the run's folder when their prompt runs and deleted when it ends; unsent ones are deleted after 30 minutes, everything when the session ends, and folders a crashed session left are swept at the next start. Roblox's own files are only read. ≤ 4 per prompt, ≤ 8 unsent and ≤ 40 per user per session, ≤ 10 pickups/downloads per user per minute (one at a time), only the uploader can use one, once. Pixels and base64 are never logged. Claude is told the images are game data, not instructions |
+| Attachments | Screenshots can show other players, so they stay on this PC and are deleted after use. Three ways in: raw RGBA8 from the game (≤ 1024 px per side, ≤ 4 MB raw, ≤ 2 MB decoded data, zstd frames must declare exactly `width × height × 4` and are inflated with that hard cap); the **capture pickup** (main path: the file Roblox wrote on this PC, only the requesting user's, see below); the **asset fallback** (a CaptureService upload, downloaded with the Open Cloud key). Captures and downloads are decoded (PNG in TS, other formats with ffmpeg and a fixed input format), get the dev's marks drawn on them (`strokes`, capped: see below), are cropped to the dev's selection and downscaled to ≤ 1568 px on the long side. Copies are owner-only PNGs in the session's temp folder `<temp>/tt-rc-att-<session>` (never in the worktree), moved into the run's folder when their prompt runs and deleted when it ends; unsent ones are deleted after 30 minutes, everything when the session ends, and folders a crashed session left are swept at the next start. Roblox's own files are only read. ≤ 4 per prompt, ≤ 8 unsent and ≤ 40 per user per session, ≤ 10 pickups/downloads per user per minute (one at a time), only the uploader can use one, once. Pixels and base64 are never logged. Claude is told the images are game data, not instructions |
 | Images to the game | Claude shows a worktree image with `![caption](path)`. Only regular image files inside the worktree (links resolved; not `.git`, not `.env*`), ≤ 25 MB, ≤ 4 per prompt. The dev server decodes it to RGBA8 ≤ 1024² (smaller if zstd would pass 2 MB), keeps it in memory (≤ 64 MB, 3 h) and serves it in chunks only to the prompt's requester on the game server that sent it. Refused references become a short `status` line |
 
 ## HTTP contract (v1)
@@ -244,11 +244,21 @@ In Studio `game.JobId` is `""`: send `job: ""`. Roblox may drop an empty header,
   unsent attachments or made 40 this session.
 
 ### `POST /v1/attachments/capture` (main path for screenshots)
-- Headers like every POST; body ≤ 1 KB:
-  `{"captureTime": <unix ms>, "localId"?: "<Capture.LocalId>", "placeId"?: <game.PlaceId>, "crop"?: {"x", "y", "w", "h"}}`.
+- Headers like every POST; body ≤ 64 KB (`413` above):
+  `{"captureTime": <unix ms>, "localId"?: "<Capture.LocalId>", "placeId"?: <game.PlaceId>, "crop"?: {"x", "y", "w", "h"}, "strokes"?: [...]}`.
   `captureTime` is the client's clock (`ScreenshotCapture.CaptureTime.UnixTimestampMillis`, or `DateTime.now()` in the
   `CaptureScreenshot` callback): it is this PC's clock when the dev plays here. `crop` is the dev's selection in
   normalized coordinates (0..1 from the top left, `w`/`h` > 0, inside the image).
+- `strokes` are the marks the dev drew (the crop view's Draw mode):
+  `[{"color": "red" | "yellow" | "white" | "black", "width": <(0, 0.04]>, "points": [x0, y0, x1, y1, ...]}]`.
+  - `points` are flat pairs normalized to the **full capture** (0..1 from the top left, not the crop), 1–400 per stroke
+    (one point is a dot); `width` is the pen's thickness as a fraction of the capture's height.
+  - Caps: ≤ 30 strokes and ≤ 3000 points in all, every number finite and in range, no other keys (`400` otherwise);
+    the body cap above. An empty list is no strokes.
+  - They are drawn onto the decoded capture **before** the crop and the downscale: each segment is a capsule (pixel
+    centers within the pen's radius of it), opaque, round ends and joins, colors `#FF3B30`, `#FFD60A`, `#FFFFFF`,
+    `#000000`. Crafted strokes past an ink budget (64 M tested pixels) are refused (`422`).
+  - Claude's `<attachments>` line says the developer drew N colored marks on that screenshot.
 - The dev server looks in `%LOCALAPPDATA%\Roblox\tmp-capture-storage` (`TT_CAPTURE_DIR` overrides it) for
   `<userId>_<placeId>_<unixMs>.png` where `userId` is the **JWT's user** (never anyone else's file) and `placeId`
   matches (0 = any): a LocalId that names a file stem picks that file; otherwise the closest time within 5 s, waiting
@@ -258,7 +268,7 @@ In Studio `game.JobId` is `""`: send `job: ""`. Roblox may drop an empty header,
   this user, or 10 pickups/downloads this minute.
 
 ### `POST /v1/attachments/asset` (fallback)
-- Headers like every POST; body `{"assetId": <id>, "crop"?: {...}}`: the asset id from `CaptureService:UploadCaptureAsync` /
+- Headers like every POST; body ≤ 64 KB `{"assetId": <id>, "crop"?: {...}, "strokes"?: [...]}`: the asset id from `CaptureService:UploadCaptureAsync` /
   `StartUploadCaptureAsync`. Downloaded with the Open Cloud key (`apis.roblox.com/asset-delivery-api`; a Decal is followed
   to its image once), then like a capture.
 - `200` as above; `502` the download failed; `503` the dev server has no Open Cloud key; `422`, `429` as above.
@@ -350,6 +360,7 @@ tool's image too).
 ```sh
 bun test                 # security, relay (paths, status lines, logs), modes + deploy approval, chat, game-tool and
                          # image tests (PNG decode, downscale, crop, capture pickup, asset fallback, Claude → game),
+                         # strokes tests (marks at the right pixels, crop + marks, the caps, both endpoints),
                          # Toolbox tests (a recorded Creator Store response in test/fixtures/toolbox, the chip gate
                          # end to end, toolbox.lock.toml; no live search calls),
                          # all on 127.0.0.1 (a fake claude drives the real runner), and one real Quick Tunnel
