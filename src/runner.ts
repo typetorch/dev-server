@@ -34,7 +34,7 @@
  *     commit is kept but no deploy is offered;
  *   - Claude, git and the build never inherit the API key or values from .env files.
  */
-import { existsSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, relative, resolve } from "node:path";
 import { API_BILLING_REFUSED, judgeInitEvent } from "./billing";
@@ -322,6 +322,70 @@ export function deployedArtifactId(stdout: string): string | undefined {
 	return found;
 }
 
+/** The proposal id from `typetorch deploy --json` stdout when the deploy waits for approval ({proposal: {id}}). */
+export function deployProposalId(stdout: string): string | undefined {
+	try {
+		const id = (JSON.parse(stdout) as { proposal?: { id?: unknown } })?.proposal?.id;
+		if (typeof id === "string" && /^[0-9a-f]{8}$/.test(id)) return id;
+	} catch {}
+	return undefined;
+}
+
+export type ProposalDecision =
+	| { status: "approved"; artifactId?: string; seq?: number }
+	| { status: "rejected"; reason?: string }
+	| { status: "expired" }
+	| { status: "pending"; expiresAt?: number };
+
+function jsonLines(file: string): any[] {
+	if (!existsSync(file)) return [];
+	const out: any[] = [];
+	for (const line of readFileSync(file, "utf8").split(/\r?\n/)) {
+		if (!line.trim()) continue;
+		try {
+			out.push(JSON.parse(line));
+		} catch {}
+	}
+	return out;
+}
+
+/**
+ * A deploy proposal's state, read from the CLI's state dir: proposals.jsonl ("proposed", then "approved"/"rejected";
+ * 24 h expiry) and deployments.jsonl (the approved deploy, with its proposalId). The CLI writes both; the dev-server
+ * only reads them.
+ */
+export function proposalDecision(stateDir: string, id: string, now = Date.now()): ProposalDecision {
+	let expiresAt: number | undefined;
+	for (const entry of jsonLines(join(stateDir, "proposals.jsonl"))) {
+		if (entry?.id !== id) continue;
+		if (entry.event === "proposed" && typeof entry.expiresAt === "string") expiresAt ??= Date.parse(entry.expiresAt);
+		else if (entry.event === "approved") {
+			const deployed = jsonLines(join(stateDir, "deployments.jsonl")).find((d) => d?.proposalId === id);
+			return { status: "approved", artifactId: deployed?.artifactId ?? entry.artifactId, seq: deployed?.seq ?? entry.seq };
+		} else if (entry.event === "rejected") return { status: "rejected", reason: typeof entry.reason === "string" ? entry.reason : undefined };
+	}
+	if (expiresAt !== undefined && expiresAt <= now) return { status: "expired" };
+	return { status: "pending", expiresAt };
+}
+
+/** Polls proposalDecision until the proposal is decided or expires (or `signal` aborts). */
+export async function waitForProposal(stateDir: string, id: string, signal: AbortSignal, intervalMs = 2000): Promise<ProposalDecision | "cancelled"> {
+	while (!signal.aborted) {
+		const decision = proposalDecision(stateDir, id);
+		if (decision.status !== "pending") return decision;
+		await new Promise<void>((resolve) => {
+			const timer = setTimeout(done, intervalMs);
+			function done() {
+				clearTimeout(timer);
+				signal.removeEventListener("abort", done);
+				resolve();
+			}
+			signal.addEventListener("abort", done, { once: true });
+		});
+	}
+	return "cancelled";
+}
+
 /** The text of a tool_result block (string content or its text parts). */
 export function resultText(block: Record<string, unknown>): string {
 	const content = block.content;
@@ -598,13 +662,20 @@ export function createClaudeRunner(options: ClaudeRunnerOptions): Runner {
 	const runDeploy = async (ctx: DeployContext, cli: CliCommand, summary?: string): Promise<DeployOutcome> => {
 		const { signal } = ctx;
 		ctx.log(`deploying: typetorch deploy --branch ${options.ttBranch}`);
-		// --json: stdout carries one JSON document (deployment.artifactId); human lines go to stderr.
+		// --json: stdout carries one JSON document (deployment.artifactId, or proposal.id); human lines go to stderr.
 		// --message: Claude's SUMMARY line, the first "what changed" line of the artifact (an argv element, no shell).
+		// --proposed-by: the dev approves and signs every deploy on their PC (`typetorch approve`); the dev-server only
+		// prepares it (build, upload, moderation, proposal). The CLI never signs for this proposer.
 		const message = summary ? ["--message", oneLine(summary.replace(/[\u0000-\u001f\u007f]+/g, " "), 200)] : [];
-		const deploy = Bun.spawn([...cli.cmd, "deploy", "--branch", options.ttBranch, "--json", ...message], {
+		const stateDir = options.stateDir ?? join(wt.repo, ".typetorch");
+		const env = childEnv({ extra: { ...options.deployEnv, TYPETORCH_STATE_DIR: stateDir } });
+		// Defense in depth: the deploy never gets a plaintext signing key or the CI opt-in.
+		delete env.TYPETORCH_SIGNING_KEY;
+		delete env.TYPETORCH_ALLOW_ENV_SIGNING_KEY;
+		const deploy = Bun.spawn([...cli.cmd, "deploy", "--branch", options.ttBranch, "--json", "--proposed-by", "dev-server/claude", ...message], {
 			cwd: wt.path,
 			// The main repo's state dir, passed explicitly: one deployments.jsonl and one seq for every checkout.
-			env: childEnv({ extra: { ...options.deployEnv, TYPETORCH_STATE_DIR: options.stateDir ?? join(wt.repo, ".typetorch") } }),
+			env,
 			stdin: "ignore",
 			stdout: "pipe",
 			stderr: "pipe",
@@ -624,12 +695,26 @@ export function createClaudeRunner(options: ClaudeRunnerOptions): Runner {
 			forEachLine(deploy.stderr as ReadableStream<Uint8Array>, onDeployLine),
 		]);
 		artifactId = deployedArtifactId(stdout.join("\n")) ?? artifactId;
+		const proposalId = deployProposalId(stdout.join("\n"));
 		const deployCode = await deploy.exited;
 		clearTimeout(deployTimer);
 		signal.removeEventListener("abort", killDeploy);
 		if (signal.aborted) return { ok: false, error: "cancelled" };
 		if (deployCode !== 0) return { ok: false, error: `deploy failed (exit ${deployCode})`, artifactId };
-		return { ok: true, artifactId };
+		if (!proposalId) return { ok: true, artifactId };
+
+		// Built, uploaded and approved by moderation; now the dev approves it on their PC. The chat gets one short line;
+		// the terminal gets the command ("deploy: " lines stay at the terminal).
+		ctx.log(`Waiting for your approval on your PC (proposal ${proposalId})`);
+		ctx.log(`deploy: approve it in a terminal on this PC: typetorch approve ${proposalId}   (or: typetorch reject ${proposalId})`);
+		const decision = await waitForProposal(stateDir, proposalId, signal);
+		if (decision === "cancelled") return { ok: false, error: "cancelled", artifactId };
+		if (decision.status === "approved") {
+			ctx.log(`approved on your PC${decision.seq !== undefined ? `: deploy #${decision.seq}` : ""}`);
+			return { ok: true, artifactId: decision.artifactId ?? artifactId };
+		}
+		if (decision.status === "rejected") return { ok: false, error: "rejected on your PC", artifactId };
+		return { ok: false, error: "the approval expired (24 h)", artifactId };
 	};
 
 	return async (ctx: RunContext): Promise<RunOutcome> => {
