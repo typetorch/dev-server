@@ -150,7 +150,15 @@ export class PromptQueue {
 	private stopped = false;
 
 	constructor(
-		private readonly options: { runner: Runner; maxQueued: number; maxPrompts: number; logger: Logger; runTools?: RunTools },
+		private readonly options: {
+			runner: Runner;
+			maxQueued: number;
+			maxPrompts: number;
+			logger: Logger;
+			runTools?: RunTools;
+			/** Every stored event (the game-server feed). */
+			onEvent?: (record: PromptRecord, event: PromptEvent) => void;
+		},
 	) {}
 
 	get createdCount(): number {
@@ -171,6 +179,11 @@ export class PromptQueue {
 
 	get(id: string): PromptRecord | undefined {
 		return this.records.get(id);
+	}
+
+	/** Publishes a prompt's buffered reply text now (before a tool call, so the text comes first). */
+	flush(record: PromptRecord): void {
+		this.flushText(record, true);
 	}
 
 	/** Why a prompt can't be accepted right now, or undefined when it can. */
@@ -315,6 +328,7 @@ export class PromptQueue {
 		if (event.state !== undefined) clean.state = event.state;
 		if (event.detail !== undefined) clean.detail = redactEvent(event.detail, 2000);
 		record.events.push(clean);
+		this.options.onEvent?.(record, clean);
 	}
 
 	/** Publishes buffered text: everything when `all` (block end, reads, other events), else only the safe prefix. */

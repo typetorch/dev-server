@@ -121,7 +121,9 @@ export function systemPrompt(gitBranch: string, workBranch: string, ttBranch: st
 		"  small, reversible snippets that touch only the requester (their character, their data). Never touch DataStores,",
 		"  other players, teleports or anything shared with production unless the developer explicitly asks.",
 		"- Never read, print or write secrets, API keys or .env files.",
-		"- Reply in short Markdown. When you changed files, end your final message with exactly one line:",
+		"- Your reply shows in a small in-game chat that renders basic Markdown (paragraphs, lists, bold, code). Keep it",
+		"  short; prefer short lists over tables. Never use emojis.",
+		"- When you changed files, end your final message with exactly one line:",
 		"  SUMMARY: <what you changed, at most 72 characters>",
 	].join("\n");
 }

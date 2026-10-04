@@ -10,6 +10,8 @@
  *   GET  /v1/game/pending           JWT → game-tool requests waiting for this user's game server (job)
  *   GET  /v1/game/requests/:id      JWT → one request (tool + args), only for its user AND job
  *   POST /v1/game/requests/:id/result JWT → the game server's answer
+ *   GET  /v1/game/poll?since=n      JWT → long-poll: this server's chat events and tool requests (feed.ts)
+ *   POST /v1/game/tool-result       JWT → {id, ...result} for a request from the poll
  *   POST /mcp                       per-run bearer token (local claude only) → MCP JSON-RPC: the game tools
  * Errors are bare status codes with no body; the reason is only logged locally (never a token or code).
  */
@@ -21,6 +23,7 @@ import { SessionAuth, type Scope } from "./auth";
 import { CONVERSATION_ID_PATTERN, ConversationStore, type Conversation } from "./conversations";
 import { NonceCache, SlidingWindow } from "./limits";
 import { addSecret, consoleLogger, oneLine, type Logger } from "./log";
+import { GameFeeds, requestPayload } from "./feed";
 import { DEFAULT_CODE_TTL_MS, PairingCode, type RotateReason } from "./pairing";
 import {
 	GAME_LIMITS,
@@ -74,6 +77,8 @@ type Route =
 	| { kind: "conversations" }
 	| { kind: "conversation"; id: string }
 	| { kind: "gamePending" }
+	| { kind: "gamePoll" }
+	| { kind: "gameToolResult" }
 	| { kind: "gameRequest"; id: string }
 	| { kind: "gameResult"; id: string };
 
@@ -87,6 +92,8 @@ function matchRoute(method: string, path: string): Route | undefined {
 	if (method === "POST" && path === "/v1/attachments") return { kind: "attach" };
 	if (method === "GET" && path === "/v1/conversations") return { kind: "conversations" };
 	if (method === "GET" && path === "/v1/game/pending") return { kind: "gamePending" };
+	if (method === "GET" && path === "/v1/game/poll") return { kind: "gamePoll" };
+	if (method === "POST" && path === "/v1/game/tool-result") return { kind: "gameToolResult" };
 	let m = /^\/v1\/prompts\/([^/]{1,128})$/.exec(path);
 	if (m && method === "GET") return { kind: "get", id: m[1] };
 	m = /^\/v1\/prompts\/([^/]{1,128})\/cancel$/.exec(path);
@@ -108,6 +115,8 @@ const SCOPE_FOR: Record<AuthedRoute["kind"], Scope> = {
 	conversation: "prompt:read",
 	cancel: "prompt:cancel",
 	gamePending: "prompt:read",
+	gamePoll: "prompt:read",
+	gameToolResult: "prompt:create",
 	gameRequest: "prompt:read",
 	gameResult: "prompt:create",
 };
@@ -192,6 +201,8 @@ export interface RemoteClaudeServerOptions {
 	 * publisher). Without it, game servers still find requests through GET /v1/game/pending.
 	 */
 	publishWake?: (message: string) => Promise<boolean>;
+	/** Tests: long-poll hold and coalescing (defaults 20 s and 250 ms). */
+	feedTiming?: { holdMs?: number; coalesceMs?: number };
 	/** Tests: how long a tool call waits for the game (default: approval + timeout + grace). */
 	gameWaitMs?: (defaultMs: number) => number;
 	/** Tests only (honored only when NODE_ENV=test): a known signing key so tests can forge crafted tokens. */
@@ -239,12 +250,14 @@ export function createRemoteClaudeServer(options: RemoteClaudeServerOptions): Re
 	addSecret(pairing.raw);
 	addSecret(pairing.formatted);
 	const gameRequests = new GameRequestStore();
+	const feeds = new GameFeeds(options.feedTiming);
 	let localUrl = "";
 	const queue = new PromptQueue({
 		runner: options.runner,
 		maxQueued: options.maxQueued ?? 5,
 		maxPrompts: options.maxPrompts ?? 50,
 		logger,
+		onEvent: (record, event) => feeds.promptEvent(record, event, () => queue.view(record)),
 		// Each run gets the game tools over MCP with its own bearer token, valid only while it runs.
 		runTools: (record) => {
 			const token = gameRequests.issueRunToken(record.id);
@@ -323,6 +336,10 @@ export function createRemoteClaudeServer(options: RemoteClaudeServerOptions): Re
 				return `POST /v1/prompts/${oneLine(route.id, 12)}/cancel`;
 			case "gamePending":
 				return "GET /v1/game/pending";
+			case "gamePoll":
+				return "GET /v1/game/poll";
+			case "gameToolResult":
+				return "POST /v1/game/tool-result";
 			case "gameRequest":
 				return `GET /v1/game/requests/${oneLine(route.id, 8)}`;
 			case "gameResult":
@@ -450,6 +467,36 @@ export function createRemoteClaudeServer(options: RemoteClaudeServerOptions): Re
 			return json({ ...conversationSummary(conversation), messages: records.map(message), truncated: conversation.promptIds.length > MESSAGES_RETURNED });
 		}
 
+		if (route.kind === "gamePoll") {
+			const raw = url.searchParams.get("since");
+			if (raw !== null && !SINCE_PATTERN.test(raw)) return decide(400, what, `${who} bad since`), empty(400);
+			const pending = () => gameRequests.pendingFor(userId, claims.job).length > 0;
+			const reply = await feeds.poll(userId, claims.job, raw === null ? undefined : Number(raw), pending, req.signal);
+			const requests = gameRequests.pendingFor(userId, claims.job).map((request) => {
+				request.state = "delivered";
+				return requestPayload(request);
+			});
+			if (requests.length > 0) decide(200, what, `${who} ${requests.map((r) => r.tool).join(", ")} delivered`);
+			return json({ ...reply, requests });
+		}
+
+		if (route.kind === "gameToolResult") {
+			if (!isJson(req)) return decide(400, what, `${who} content-type`), empty(400);
+			const text = await readBody(req, GAME_LIMITS.resultBodyBytes);
+			if (text === TOO_LARGE) return decide(413, what, `${who} body too large`), empty(413);
+			if (text === undefined) return decide(400, what, `${who} body encoding`), empty(400);
+			const body = parseJson(text) as Record<string, unknown> | undefined;
+			const id = body && typeof body === "object" ? body.id : undefined;
+			const request = typeof id === "string" && REQUEST_ID_PATTERN.test(id) ? gameRequests.get(id) : undefined;
+			if (!request || request.userId !== userId || request.job !== claims.job) return decide(404, what, `${who} not theirs or unknown`), empty(404);
+			const { id: _id, ...rest } = body as Record<string, unknown>;
+			const result = parseGameResult(rest);
+			if (!result) return decide(400, what, `${who} body schema`), empty(400);
+			if (!gameRequests.complete(request.id, result)) return decide(410, what, `${who} ${request.state}`), empty(410);
+			decide(200, what, `${who} ${request.tool} ${result.denied ? "denied" : result.ok ? "ok" : "error"}${result.ms !== undefined ? ` ${result.ms} ms` : ""}`);
+			return json({ ok: true });
+		}
+
 		if (route.kind === "gamePending") {
 			const pending = gameRequests.pendingFor(userId, claims.job).map((r) => ({ id: r.id, tool: r.tool }));
 			return json({ requests: pending });
@@ -508,6 +555,7 @@ export function createRemoteClaudeServer(options: RemoteClaudeServerOptions): Re
 		if (typeof call === "string") return { text: call, isError: true };
 		if (call.tool === "screenshot") return { text: "Screenshots are not available yet.", isError: true };
 		if (gameRequests.countFor(record.id) >= GAME_LIMITS.perPrompt) return { text: "Too many game tool calls in this prompt.", isError: true };
+		queue.flush(record);
 		const request = gameRequests.create({
 			promptId: record.id,
 			conversationId: record.conversation?.id,
@@ -519,7 +567,9 @@ export function createRemoteClaudeServer(options: RemoteClaudeServerOptions): Re
 			timeoutSeconds: call.timeoutSeconds,
 		});
 		logger.info(`game tool ${call.tool} ${request.id.slice(0, 8)} for roblox:${record.userId} on job ${record.job.slice(0, 8) || "(studio)"}: "${oneLine(call.description, 60)}"`);
-		if (options.publishWake) void options.publishWake(wakeMessage(auth.sessionId, record.job, request.id, record.userId));
+		// The game server's long-poll picks it up at once; a wake message only when no poll is open.
+		feeds.requestAdded(record.userId, record.job);
+		if (options.publishWake && !feeds.isPolling(record.userId, record.job)) void options.publishWake(wakeMessage(auth.sessionId, record.job, request.id, record.userId));
 		const defaultMs = waitMsFor(call);
 		const done = await gameRequests.wait(request.id, options.gameWaitMs ? options.gameWaitMs(defaultMs) : defaultMs, record.abort.signal);
 		if (!done) logger.warn(`game tool ${call.tool} ${request.id.slice(0, 8)}: no answer from the game server`);
@@ -575,6 +625,8 @@ export function createRemoteClaudeServer(options: RemoteClaudeServerOptions): Re
 			const route = matchRoute(req.method, url.pathname);
 			if (!route) return empty(404);
 			if (headersTooLarge(req)) return decide(431, `${req.method} ${url.pathname.slice(0, 40)}`, "headers too large"), empty(431);
+			// The long-poll holds up to 20 s (Bun closes idle requests after 10 s by default).
+			if (route.kind === "gamePoll") bunServer.timeout(req, 40);
 			return route.kind === "token" ? handleToken(req) : handleAuthed(req, url, route);
 		},
 		error(error: Error): Response {

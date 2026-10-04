@@ -296,3 +296,100 @@ describe("helpers", () => {
 		expect(summarizeToolResult("mcp__typetorch-game__run_luau", { content: "No answer from the game server", is_error: true })).toBe("error: No answer from the game server");
 	});
 });
+
+describe("game feed (long-poll)", () => {
+	test("streams this server's prompt events and delivers tool requests; results go to /v1/game/tool-result", async () => {
+		let release: () => void = () => {};
+		const streaming: Runner = async (ctx) => {
+			ctx.text(1, "Hello ");
+			await Bun.sleep(50);
+			ctx.text(1, "world");
+			const replies: unknown[] = [];
+			seen.set(ctx.record.id, replies);
+			const call = await mcp(ctx.mcp!.url, ctx.mcp!.token, { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "game_status", arguments: {} } });
+			replies.push(await call.json());
+			await new Promise<void>((resolve) => (release = resolve));
+			return { state: "answered", summary: "ok" };
+		};
+		const wakesHere: string[] = [];
+		const own = createRemoteClaudeServer({
+			branch: "dev",
+			users: USERS,
+			runner: streaming,
+			logger: silentLogger,
+			attachmentsDir: join(dir, "c"),
+			feedTiming: { holdMs: 1500, coalesceMs: 50 },
+			publishWake: async (m) => (wakesHere.push(m), true),
+		});
+		try {
+			const res = await fetch(`${own.localUrl}/v1/token`, {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({ grant: "code", sid: own.auth.sessionId, user: USERS[7], job: JOB, branch: "dev", code: own.pairing.formatted }),
+			});
+			const jwt = ((await res.json()) as { access_token: string }).access_token;
+			const poll = async (since?: number) => {
+				const r = await fetch(`${own.localUrl}/v1/game/poll${since === undefined ? "" : `?since=${since}`}`, { headers: { authorization: `Bearer ${jwt}`, "x-tt-job": JOB } });
+				expect(r.status).toBe(200);
+				return (await r.json()) as { cursor: number; reset?: boolean; items: any[]; requests: any[] };
+			};
+			const start = await poll();
+			expect(start.items).toEqual([]);
+			// An idle poll holds, then answers empty with the same cursor.
+			const t0 = Date.now();
+			const idle = await poll(start.cursor);
+			expect(Date.now() - t0).toBeGreaterThanOrEqual(1400);
+			expect(idle.items).toEqual([]);
+			// A prompt: the open poll returns its events quickly.
+			const holding = poll(idle.cursor);
+			const created = await fetch(`${own.localUrl}/v1/prompts`, { method: "POST", headers: postHeaders(jwt), body: JSON.stringify({ prompt: "hi" }) });
+			const { id } = (await created.json()) as { id: string };
+			const t1 = Date.now();
+			const first = await holding;
+			expect(Date.now() - t1).toBeLessThan(1000);
+			expect(first.items.some((item) => item.type === "event" && item.promptId === id && item.event.state === "queued")).toBe(true);
+			expect(first.items.some((item) => item.type === "prompt" && item.prompt.id === id)).toBe(true);
+			// Keep polling until the tool request arrives (no wake message: a poll was open).
+			let cursor = first.cursor;
+			let text = "";
+			let request: any;
+			for (let i = 0; i < 20 && !request; i++) {
+				const reply = await poll(cursor);
+				cursor = reply.cursor;
+				for (const item of reply.items) if (item.type === "event" && item.event.kind === "assistant_text") text += item.event.text;
+				request = reply.requests[0];
+			}
+			expect(text).toBe("Hello world");
+			expect(request).toMatchObject({ tool: "game_status", promptId: id });
+			expect(wakesHere).toEqual([]);
+			// The result, answered once, reaches the tool call.
+			const answer = (body: unknown, token = jwt) =>
+				fetch(`${own.localUrl}/v1/game/tool-result`, { method: "POST", headers: { ...postHeaders(token), "x-tt-job": JOB }, body: JSON.stringify(body) });
+			const strangerRes = await fetch(`${own.localUrl}/v1/token`, {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({ grant: "code", sid: own.auth.sessionId, user: USERS[6], job: JOB, branch: "dev", code: own.pairing.formatted }),
+			});
+			const stranger = ((await strangerRes.json()) as { access_token: string }).access_token;
+			expect((await answer({ id: request.id, ok: true, data: "{}" }, stranger)).status).toBe(404);
+			expect((await answer({ id: request.id, ok: true, data: '{"players":1}' })).status).toBe(200);
+			expect((await answer({ id: request.id, ok: true })).status).toBe(410);
+			for (let i = 0; i < 50 && !seen.get(id)?.length; i++) await Bun.sleep(20);
+			expect(toolText(seen.get(id)![0]).content[0].text).toContain('{"players":1}');
+			release();
+			// The final state arrives through the feed too.
+			let final: any;
+			for (let i = 0; i < 20 && !final; i++) {
+				const reply = await poll(cursor);
+				cursor = reply.cursor;
+				final = reply.items.find((item) => item.type === "prompt" && item.prompt.state === "answered");
+			}
+			expect(final.prompt).toMatchObject({ id, state: "answered", summary: "ok" });
+			// A cursor from another dev-server run → reset.
+			expect((await poll(cursor + 10_000)).reset).toBe(true);
+		} finally {
+			release();
+			await own.stop();
+		}
+	}, 30_000);
+});
