@@ -10,7 +10,7 @@ import { GAME_TOPIC } from "./game-tools";
 import { ATTACHMENT_DIR } from "./attachments";
 import { checkSubscriptionAuth } from "./billing";
 import { branchChannel, branchFromGit, loadGameConfig } from "./config";
-import { API_KEY_VARS, Settings, childEnv } from "./env";
+import { API_KEY_VARS, DEPLOY_SECRET_VARS, Settings, childEnv } from "./env";
 import { branchExists, currentBranch, ensureIgnored, ensureWorktree, repoRoot, type Worktree } from "./git";
 import { addEventSecret, addSecret, consoleLogger, setEventPaths, type Logger } from "./log";
 import { run } from "./proc";
@@ -102,6 +102,18 @@ export async function startRemoteClaude(options: RemoteClaudeOptions): Promise<R
 	const announce = options.announce !== false;
 	const apiKey = settings.first(API_KEY_VARS);
 	addSecret(apiKey?.value);
+	// What the deploy (the TypeTorch CLI) gets: the shared key, any per-job keys, the signing key, and the CLI's own
+	// env file path. Claude never sees any of them (childEnv allowlist).
+	const deployEnv: Record<string, string> = {};
+	if (apiKey) deployEnv[apiKey.name] = apiKey.value;
+	for (const name of DEPLOY_SECRET_VARS) {
+		const found = settings.first([name]);
+		if (!found) continue;
+		addSecret(found.value);
+		deployEnv[name] = found.value;
+	}
+	const envFile = settings.first(["TYPETORCH_ENV_FILE"]);
+	if (envFile) deployEnv.TYPETORCH_ENV_FILE = envFile.value;
 	// No .env value may reach a game client through prompt events.
 	for (const value of settings.fileValues()) addEventSecret(value);
 	const universeId = config.universeId ?? (Number(settings.get("UNIVERSE_ID")?.value) || undefined);
@@ -173,7 +185,7 @@ export async function startRemoteClaude(options: RemoteClaudeOptions): Promise<R
 			ttBranch: branch,
 			deploy,
 			cli,
-			deployEnv: apiKey ? { [apiKey.name]: apiKey.value } : undefined,
+			deployEnv: Object.keys(deployEnv).length > 0 ? deployEnv : undefined,
 			claudeCommand,
 			subscriptionVerified,
 			model: options.model,

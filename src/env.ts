@@ -117,7 +117,10 @@ export function isApiBillingVar(name: string): boolean {
 }
 
 /** Variables never passed to Claude Code or git (they would be readable by anything those processes run). */
-export const SCRUBBED_VARS: readonly string[] = [...API_KEY_VARS, ...API_BILLING_VARS];
+/** The CLI's per-job Open Cloud keys and the deploy signing key (cli env.ts): passed to deploys only. */
+export const DEPLOY_SECRET_VARS = ["OPENCLOUD_ASSETS_KEY", "OPENCLOUD_DEPLOY_KEY", "OPENCLOUD_PLACE_KEY", "TYPETORCH_SIGNING_KEY"] as const;
+
+export const SCRUBBED_VARS: readonly string[] = [...API_KEY_VARS, ...DEPLOY_SECRET_VARS, ...API_BILLING_VARS];
 
 /**
  * Variables that tie a process to the Claude Code session that launched this server (set when the dev server itself
