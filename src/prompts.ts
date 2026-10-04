@@ -31,6 +31,7 @@ import type { ImageMeta, ImageRef } from "./images";
 import type { Logger } from "./log";
 import { oneLine, redactEvent, safePrefixLength } from "./log";
 import type { PromptContext } from "./schema";
+import type { ToolboxTile } from "./toolbox-tools";
 
 /**
  * States: queued → running → answered | failed | cancelled; code mode with changes: → committed → proposed (a deploy
@@ -55,7 +56,7 @@ const TEXT_CHUNK = 2000;
 /** Streamed text is published at most this often (and whenever a reader asks). */
 const TEXT_FLUSH_MS = 250;
 
-export type EventKind = "assistant_text" | "tool_use" | "tool_result" | "status" | "error" | "deploy_proposal" | "image";
+export type EventKind = "assistant_text" | "tool_use" | "tool_result" | "status" | "error" | "deploy_proposal" | "image" | "toolbox_results";
 
 export interface PromptEvent {
 	i: number;
@@ -79,6 +80,8 @@ export interface PromptEvent {
 	expiresAt?: number;
 	/** image: an image Claude showed, ready for the requesting dev's game server (GET /v1/images/:id). */
 	image?: ImageMeta;
+	/** toolbox_results: the Creator Store results Claude got, as cards for the chat (at most 10; toolbox-tools.ts). */
+	tiles?: ToolboxTile[];
 }
 
 /** What the queue keeps of a deploy proposal; `actions` are the runner's (never serialized). */
@@ -142,6 +145,11 @@ export interface PromptRecord {
 	prompt: string;
 	/** live (default) or code: decides the run's tools (runner.ts) and which game tools the MCP server serves. */
 	mode: PromptMode;
+	/**
+	 * The dev picked "Toolbox" in the "+" menu for this very message (plans/14). Set at creation, never changed: only
+	 * then does the run get the Creator Store tools (allow and deny rules, MCP tools/list and every tools/call).
+	 */
+	readonly toolbox: boolean;
 	context?: PromptContext;
 	conversation?: Conversation;
 	/** Code mode, after a commit: the deploy waiting for the requesting dev. */
@@ -255,6 +263,8 @@ export interface CreateOptions {
 	job?: string;
 	/** Default "live". */
 	mode?: PromptMode;
+	/** The Toolbox chip was on for this message. */
+	toolbox?: boolean;
 }
 
 /** Per-run tools (run_luau): set up before the runner starts, disposed when it ends. */
@@ -324,6 +334,12 @@ export class PromptQueue {
 		this.pushEvent(record, { kind: "image", text: oneLine(caption, 200), image });
 	}
 
+	/** Creator Store results as cards in the chat (after the text that came before the search). */
+	toolboxEvent(record: PromptRecord, text: string, tiles: ToolboxTile[]): void {
+		this.flushText(record, true);
+		this.pushEvent(record, { kind: "toolbox_results", text: oneLine(text, 120), tiles });
+	}
+
 	/** A short note in the chat (a dim line), e.g. why an image was not shown. */
 	note(record: PromptRecord, text: string): void {
 		this.flushText(record, true);
@@ -374,6 +390,7 @@ export class PromptQueue {
 			job: extra.job ?? "",
 			prompt,
 			mode,
+			toolbox: extra.toolbox === true,
 			context,
 			conversation: extra.conversation,
 			attachments: extra.attachments ?? [],
@@ -389,7 +406,7 @@ export class PromptQueue {
 		for (const attachment of record.attachments) attachment.promptId = record.id;
 		if (extra.conversation) extra.conversation.promptIds.push(record.id);
 		this.pushEvent(record, { kind: "status", text: "queued", state: "queued" });
-		this.options.logger.info(`prompt ${record.id.slice(0, 8)} queued  roblox:${userId}  ${mode}  "${oneLine(prompt, 60)}"`);
+		this.options.logger.info(`prompt ${record.id.slice(0, 8)} queued  roblox:${userId}  ${mode}${record.toolbox ? " +toolbox" : ""}  "${oneLine(prompt, 60)}"`);
 		queueMicrotask(() => void this.pump());
 		return record;
 	}
@@ -584,6 +601,8 @@ export class PromptQueue {
 		}
 		if (event.expiresAt !== undefined) clean.expiresAt = event.expiresAt;
 		if (event.image !== undefined) clean.image = { ...event.image };
+		// Already cleaned and capped by toolbox.ts (strangers' text); the game re-checks every field.
+		if (event.tiles !== undefined) clean.tiles = event.tiles.slice(0, 10).map((tile) => ({ ...tile }));
 		record.events.push(clean);
 		this.options.onEvent?.(record, clean);
 	}

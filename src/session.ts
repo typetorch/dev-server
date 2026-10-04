@@ -19,6 +19,7 @@ import { run } from "./proc";
 import type { Runner } from "./prompts";
 import { createClaudeRunner, protectedGlobs, resolveCli } from "./runner";
 import { createRemoteClaudeServer, type RemoteClaudeServer } from "./server";
+import { ToolboxLock } from "./toolbox-lock";
 import { attachTerminal } from "./terminal";
 import { QuickTunnel, findCloudflared } from "./tunnel";
 
@@ -182,6 +183,8 @@ export async function startRemoteClaude(options: RemoteClaudeOptions): Promise<R
 	const cli = resolveCli(options.cli);
 	const deploy = options.deploy !== false;
 	if (deploy && !cli) logger.warn("TypeTorch CLI not found; prompts will stop at \"committed\" (pass --cli <path>)");
+	// toolbox_add writes toolbox.lock.toml (the server); the runner accepts exactly that write in a commit.
+	const toolboxLock = new ToolboxLock(worktree.path);
 	const runner =
 		options.runner ??
 		createClaudeRunner({
@@ -195,6 +198,7 @@ export async function startRemoteClaude(options: RemoteClaudeOptions): Promise<R
 			model: options.model,
 			maxBudgetUsd: options.maxBudgetUsd,
 			protect: options.protect,
+			toolboxLock,
 		});
 	const server = createRemoteClaudeServer({
 		branch,
@@ -208,6 +212,7 @@ export async function startRemoteClaude(options: RemoteClaudeOptions): Promise<R
 		// Images Claude shows must be files in the worktree; screenshots are picked up where Roblox writes them on this PC,
 		// or (fallback) downloaded with the Open Cloud key.
 		worktree: worktree.path,
+		toolboxLock,
 		captureDir: captureDir(),
 		downloadAsset: apiKey ? openCloudAssetDownloader(apiKey.value) : undefined,
 		// Game tools: a wake message per request (no code in it); game servers also poll GET /v1/game/pending.

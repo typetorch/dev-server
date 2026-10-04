@@ -10,6 +10,7 @@
  *     screenshot {}                                     what the requesting dev sees: their client captures it, this
  *                                                       PC's Roblox file is picked up (or the upload downloaded), and
  *                                                       Claude gets the image (spike S11)
+ *     toolbox_insert (toolbox-tools.ts, Toolbox chip only)  a Creator Store asset, with the dev's approval card
  *   dev server: a request bound to the prompt's requester (user id) and the game server that sent the prompt (the
  *               JWT `job`); a tiny wake message on MessagingService topic TypeTorch/tool {v,s,j,x,u} (never the code);
  *   game server (same JobId, dev channel, requester still in it and still a dev):
@@ -28,6 +29,11 @@ export const GAME_TOOLS = ["run_luau", "game_logs", "inspect", "find", "game_sta
 /** What code-mode runs may call: everything except run_luau (live mode only). */
 export const READ_ONLY_GAME_TOOLS = ["game_logs", "inspect", "find", "game_status", "screenshot"] as const;
 export type GameToolName = (typeof GAME_TOOLS)[number];
+/**
+ * What a game request can ask the game to run: the game tools, plus toolbox_insert (toolbox-tools.ts; offered only to
+ * runs whose prompt carried the Toolbox chip, and never through parseToolCall).
+ */
+export type GameRequestTool = GameToolName | "toolbox_insert";
 /** As Claude Code names MCP tools: mcp__<server>__<tool>. */
 export const fullToolName = (tool: GameToolName) => `mcp__${GAME_MCP_SERVER}__${tool}`;
 export const GAME_TOOL_PREFIX = `mcp__${GAME_MCP_SERVER}__`;
@@ -76,7 +82,7 @@ export interface GameRequest {
 	conversationId?: string;
 	userId: number;
 	job: string;
-	tool: GameToolName;
+	tool: GameRequestTool;
 	args: Record<string, unknown>;
 	/** A short label the developer sees. */
 	description: string;
@@ -409,7 +415,8 @@ export function parseToolCall(name: unknown, raw: unknown): ParsedToolCall | str
 }
 
 /** How long the dev server waits for a request's result. */
-export function waitMsFor(call: ParsedToolCall): number {
-	const approval = call.tool === "run_luau" ? GAME_LIMITS.approvalSeconds : 0;
+export function waitMsFor(call: Pick<ParsedToolCall, "timeoutSeconds"> & { tool: GameRequestTool }): number {
+	// run_luau and toolbox_insert wait for the dev's approval card first.
+	const approval = call.tool === "run_luau" || call.tool === "toolbox_insert" ? GAME_LIMITS.approvalSeconds : 0;
 	return (approval + call.timeoutSeconds + GAME_LIMITS.graceSeconds) * 1000;
 }

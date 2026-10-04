@@ -62,6 +62,9 @@ import {
 	wakeMessage,
 } from "./game-tools";
 import { PromptQueue, type PromptRecord, type Runner } from "./prompts";
+import { ToolboxClient } from "./toolbox";
+import { ToolboxLock } from "./toolbox-lock";
+import { TOOLBOX_INSERT_LIMITS, ToolboxService, isToolboxTool, type ToolboxGameResult, type ToolboxRun } from "./toolbox-tools";
 import {
 	CHUNK_PATTERN,
 	LIMITS,
@@ -240,6 +243,10 @@ export interface RemoteClaudeServerOptions {
 	attachmentsDir?: string;
 	/** The worktree Claude works in: images it shows (`![caption](path)`) must be files inside it. Without it, none. */
 	worktree?: string;
+	/** toolbox_add's lock file (shared with the runner). Default: one in `worktree`; without either, toolbox_add is off. */
+	toolboxLock?: ToolboxLock;
+	/** The Creator Store search client (tests inject one with a fake fetch). */
+	toolboxClient?: ToolboxClient;
 	/** Where the Roblox client writes screenshots on this PC (default images.ts captureDir()). */
 	captureDir?: string;
 	/** How long a capture pickup waits for Roblox to write the file (default 5 s). */
@@ -336,8 +343,39 @@ export function createRemoteClaudeServer(options: RemoteClaudeServerOptions): Re
 				dispose: () => {
 					gameRequests.revokeRunToken(token);
 					gameRequests.expirePrompt(record.id);
+					toolbox.endPrompt(record.id);
 				},
 			};
+		},
+	});
+	/**
+	 * Creator Store tools (plans/14): only for runs whose prompt carried the Toolbox chip, re-checked on every call.
+	 * toolbox_insert becomes a game request to the run's own game server (approval card there; no "always").
+	 */
+	const toolbox = new ToolboxService({
+		client: options.toolboxClient ?? new ToolboxClient(),
+		lock: options.toolboxLock ?? (options.worktree ? new ToolboxLock(options.worktree) : undefined),
+		logger,
+		gameCall: async (run, args, description, timeoutSeconds): Promise<ToolboxGameResult | undefined> => {
+			const record = queue.get(run.promptId);
+			if (!record || record.done || record.toolbox !== true || record.mode !== "live") return undefined;
+			if (gameRequests.countFor(record.id) >= GAME_LIMITS.perPrompt) return { ok: false, error: "too many game tool calls in this prompt" };
+			const request = gameRequests.create({
+				promptId: record.id,
+				conversationId: record.conversation?.id,
+				userId: record.userId,
+				job: record.job,
+				tool: "toolbox_insert",
+				args,
+				description,
+				timeoutSeconds,
+			});
+			logger.info(`game tool toolbox_insert ${request.id.slice(0, 8)} for roblox:${record.userId} on job ${record.job.slice(0, 8) || "(studio)"}: "${oneLine(description, 60)}"`);
+			feeds.requestAdded(record.userId, record.job);
+			if (options.publishWake && !feeds.isPolling(record.userId, record.job)) void options.publishWake(wakeMessage(auth.sessionId, record.job, request.id, record.userId));
+			const defaultMs = waitMsFor({ tool: "toolbox_insert", timeoutSeconds: TOOLBOX_INSERT_LIMITS.loadSeconds });
+			const done = await gameRequests.wait(request.id, options.gameWaitMs ? options.gameWaitMs(defaultMs) : defaultMs, record.abort.signal);
+			return done?.result;
 		},
 	});
 	const conversations = new ConversationStore();
@@ -606,7 +644,7 @@ export function createRemoteClaudeServer(options: RemoteClaudeServerOptions): Re
 			if (refused === "code-busy") return decide(423, what, `${who} code mode busy (a code run or deploy proposal is pending)`), empty(423);
 			const isNew = conversation === undefined;
 			conversation ??= conversations.create(userId, body.prompt);
-			const record = queue.create(userId, body.prompt, body.context, { conversation, attachments: used, job: claims.job, mode });
+			const record = queue.create(userId, body.prompt, body.context, { conversation, attachments: used, job: claims.job, mode, toolbox: body.toolbox === true });
 			if (typeof record === "string") {
 				if (isNew) conversations.discard(conversation.id);
 				const status = record === "stopped" ? 503 : record === "code-busy" ? 423 : 429;
@@ -880,7 +918,16 @@ export function createRemoteClaudeServer(options: RemoteClaudeServerOptions): Re
 			} else if (method === "ping") reply({});
 			else if (method === "tools/list") {
 				const allowed: readonly string[] = record.mode === "live" ? GAME_TOOLS : READ_ONLY_GAME_TOOLS;
-				reply({ tools: GAME_TOOL_DEFS.filter((def) => allowed.includes(def.name)) });
+				// Creator Store tools only when this prompt carried the Toolbox chip (plans/14).
+				reply({ tools: [...GAME_TOOL_DEFS.filter((def) => allowed.includes(def.name)), ...toolbox.definitionsFor(record)] });
+			}
+			else if (method === "tools/call" && isToolboxTool(params?.name)) {
+				// Re-checked on every call: the chip of this very prompt, the mode, the ids of this conversation's searches.
+				const run: ToolboxRun = { promptId: record.id, conversationId: record.conversation?.id, userId: record.userId, mode: record.mode, toolbox: record.toolbox === true };
+				queue.flush(record);
+				const result = await toolbox.call(run, params?.name, params?.arguments, record.abort.signal);
+				if (result.event) queue.toolboxEvent(record, result.event.text, result.event.tiles);
+				reply({ content: [{ type: "text", text: result.text }], isError: result.isError });
 			}
 			else if (method === "tools/call") {
 				const result = await callGameTool(record, params?.name, params?.arguments);

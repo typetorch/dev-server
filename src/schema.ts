@@ -90,21 +90,27 @@ export interface PromptRequest {
 	attachments?: string[];
 	/** "live" (default) or "code": which tools the run gets (runner.ts). */
 	mode?: "live" | "code";
+	/** The dev picked "Toolbox" in the "+" menu for this message: the run gets the Creator Store tools (plans/14). */
+	toolbox?: boolean;
 }
 
 /**
  * `{prompt: string ≤4000, mode?: "live"|"code", context?: {path?, errors?: string[], artifact?, logs?: {client?, server?}},
- * conversationId?: string, attachments?: string[] (≤4, distinct)}`, nothing else.
+ * conversationId?: string, attachments?: string[] (≤4, distinct), toolbox?: boolean}`, nothing else.
  */
 export function parsePromptRequest(raw: unknown): PromptRequest | undefined {
-	if (!isPlainObject(raw) || !onlyKeys(raw, ["prompt", "context", "conversationId", "attachments", "mode"])) return undefined;
-	const { prompt, context, conversationId, attachments, mode } = raw;
+	if (!isPlainObject(raw) || !onlyKeys(raw, ["prompt", "context", "conversationId", "attachments", "mode", "toolbox"])) return undefined;
+	const { prompt, context, conversationId, attachments, mode, toolbox } = raw;
 	if (typeof prompt !== "string" || prompt.trim().length === 0 || prompt.length > LIMITS.promptChars) return undefined;
 	if (prompt.includes("\u0000")) return undefined;
 	const request: PromptRequest = { prompt };
 	if (mode !== undefined) {
 		if (mode !== "live" && mode !== "code") return undefined;
 		request.mode = mode;
+	}
+	if (toolbox !== undefined) {
+		if (typeof toolbox !== "boolean") return undefined;
+		if (toolbox) request.toolbox = true;
 	}
 	if (conversationId !== undefined) {
 		if (typeof conversationId !== "string" || !CONVERSATION_ID_PATTERN.test(conversationId)) return undefined;

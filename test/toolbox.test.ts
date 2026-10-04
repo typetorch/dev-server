@@ -18,7 +18,7 @@ import {
 	formatSearchResult,
 	fullToolboxName,
 	parseToolboxCall,
-	resultsEventData,
+	resultsTiles,
 	toolboxAllowedRules,
 	toolboxDeniedRules,
 	toolboxSystemLines,
@@ -184,7 +184,7 @@ describe("untrusted text reaches Claude escaped", () => {
 		expect(text.match(/<\/untrusted-toolbox-data>/g)).toHaveLength(1);
 		expect(text).not.toContain("<b>");
 		expect(text).toContain("\\u003c/untrusted-toolbox-data\\u003e");
-		const tiles = JSON.parse(resultsEventData(page));
+		const tiles = resultsTiles(page);
 		expect(tiles[0]).toMatchObject({ id: 580221169, verified: true, scripts: 0, upPercent: 95, voteCount: 7000 });
 		expect(JSON.stringify(tiles[0]).length).toBeLessThan(260);
 	});

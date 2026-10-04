@@ -22,6 +22,8 @@
  *
  * Game tools: every run gets the "typetorch-game" MCP server (game-tools.ts) through a per-run --mcp-config file that
  * holds a bearer token valid only while that run lives; its tools target only the requesting dev's game server.
+ * Creator Store tools (toolbox-tools.ts) are allowed only when the prompt carried the Toolbox chip; otherwise all three
+ * are in --disallowedTools, the MCP server doesn't list them and refuses every call (plans/14).
  *
  * Defense in depth around prompt injection from game data:
  *   - the attached context is JSON-escaped inside <untrusted-game-context> and the system prompt says it is data;
@@ -46,6 +48,8 @@ import { changedFiles, commitStaged, diffStat, resetWorktree, resetWorktreeTo, s
 import { oneLine } from "./log";
 import type { DeployContext, DeployOutcome, LogFile, PromptMode, RunContext, RunOutcome, Runner } from "./prompts";
 import { forEachLine, killTree } from "./proc";
+import { TOOLBOX_LOCK_FILE, type ToolboxLock } from "./toolbox-lock";
+import { toolboxAllowedRules, toolboxDeniedRules, toolboxSystemLines } from "./toolbox-tools";
 
 // Exact commands only: a wildcard such as `bun run build*` also matched `bun run build-x.ts`, which runs any file Claude
 // just wrote, outside every file-tool restriction (security audit C1). `typetorch build` / `typetorch test` were
@@ -85,6 +89,8 @@ const PROTECTED_GLOBS = [
 	"**/foreman.toml",
 	"**/wally.toml",
 	"**/asphalt.toml",
+	// Written only by the dev-server (toolbox_add); its own write is accepted (ClaudeRunnerOptions.toolboxLock).
+	`**/${TOOLBOX_LOCK_FILE}`,
 	"**/.env*",
 	"**/.gitattributes",
 	"**/.gitmodules",
@@ -118,7 +124,7 @@ export function isProtectedPath(path: string, extra: readonly string[] = []): bo
 	return patterns.some((g) => g.match(p) || g.match(`x/${p}`)) || /(^|\/)\.env/.test(p);
 }
 
-export function systemPrompt(gitBranch: string, workBranch: string, ttBranch: string, mode: PromptMode = "live"): string {
+export function systemPrompt(gitBranch: string, workBranch: string, ttBranch: string, mode: PromptMode = "live", toolbox = false): string {
 	const modeRules =
 		mode === "live"
 			? [
@@ -169,6 +175,7 @@ export function systemPrompt(gitBranch: string, workBranch: string, ttBranch: st
 		"- run_luau changes the live server at once and nothing it does is saved. Prefer small, reversible snippets that",
 		"  touch only the requester (their character, their data). Never touch DataStores, other players, teleports or",
 		"  anything shared with production unless the developer explicitly asks.",
+		...toolboxSystemLines(mode, toolbox),
 		"- Never read, print or write secrets, API keys or .env files.",
 		"- Your reply shows in a small in-game chat that renders basic Markdown (paragraphs, lists, bold, code). Keep it",
 		"  short; prefer short lists over tables. Never use emojis.",
@@ -442,11 +449,15 @@ export interface ClaudeRunnerOptions {
 	protect?: string[];
 	runTimeoutMs?: number;
 	deployTimeoutMs?: number;
+	/** The worktree's toolbox.lock.toml (toolbox_add): a change that is exactly its own last write isn't Claude's edit. */
+	toolboxLock?: ToolboxLock;
 }
 
 export interface ClaudeArgsRun {
 	/** live (default) or code: decides the built-in and game tools (see the header). */
 	mode?: PromptMode;
+	/** The prompt carried the Toolbox chip (plans/14): only then are the Creator Store tools allowed. */
+	toolbox?: boolean;
 	resume?: string;
 	mcpConfigFile?: string;
 	/** Extra folders the file tools may read (the run's attached-log folder, outside the worktree). */
@@ -466,9 +477,10 @@ export function claudeArgs(options: Pick<ClaudeRunnerOptions, "model" | "maxBudg
 		"--tools",
 		MODE_TOOLS[mode].join(","),
 		"--allowedTools",
-		[...ALLOWED_TOOLS[mode], ...(mcpConfigFile ? GAME_TOOL_RULES[mode] : [])].join(","),
+		[...ALLOWED_TOOLS[mode], ...(mcpConfigFile ? [...GAME_TOOL_RULES[mode], ...toolboxAllowedRules(mode, run.toolbox)] : [])].join(","),
 		"--disallowedTools",
-		disallowedTools(options.protect).join(","),
+		// Deny rules win: every Creator Store tool this run may not use (all of them without the Toolbox chip).
+		[...disallowedTools(options.protect), ...toolboxDeniedRules(mode, run.toolbox)].join(","),
 		"--permission-mode",
 		"dontAsk",
 		"--permission-prompts",
@@ -536,9 +548,10 @@ export function createClaudeRunner(options: ClaudeRunnerOptions): Runner {
 	const spawnClaude = async (ctx: RunContext, input: string, resume: string | undefined, mcpConfigFile: string | undefined): Promise<ClaudeRun> => {
 		const { signal } = ctx;
 		const mode = ctx.record.mode;
-		const system = systemPrompt(wt.branch, wt.workBranch, options.ttBranch, mode);
+		const toolbox = ctx.record.toolbox === true;
+		const system = systemPrompt(wt.branch, wt.workBranch, options.ttBranch, mode, toolbox);
 		const addDirs = ctx.logFiles ? [ctx.logFiles.dir] : [];
-		const proc = Bun.spawn([...claude, ...claudeArgs(options, system, { mode, resume, mcpConfigFile, addDirs })], {
+		const proc = Bun.spawn([...claude, ...claudeArgs(options, system, { mode, toolbox, resume, mcpConfigFile, addDirs })], {
 			cwd: wt.path,
 			env: childEnv({ forClaude: true }),
 			stdin: new TextEncoder().encode(input),
@@ -766,7 +779,9 @@ export function createClaudeRunner(options: ClaudeRunnerOptions): Runner {
 
 		// 3. Commit (the server, not Claude).
 		const summary = cleanSummary(summaryLine?.[1] ?? (firstLine(record.prompt) || "change"));
-		const protectedFiles = files.filter((file) => isProtectedPath(file, options.protect));
+		// toolbox.lock.toml is protected, but the dev-server's own toolbox_add write (byte for byte) is fine to deploy.
+		const ownLockWrite = options.toolboxLock?.isOwnWrite() === true;
+		const protectedFiles = files.filter((file) => isProtectedPath(file, options.protect) && !(ownLockWrite && file.replace(/\\/g, "/") === TOOLBOX_LOCK_FILE));
 		ctx.log(`changed: ${files.slice(0, 6).join(", ")}${files.length > 6 ? ` (+${files.length - 6})` : ""}`);
 		const commit = await commitStaged(wt, `remote-claude: ${summary}`, `Requested-By: roblox:${record.userId}`);
 		ctx.setState("committed", { commit, summary });

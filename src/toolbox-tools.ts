@@ -327,9 +327,9 @@ export interface ToolboxTile {
 	seconds?: number;
 }
 
-/** The `toolbox_results` event payload for the chat's result cards: at most 10 tiles, as JSON. */
-export function resultsEventData(page: ToolboxPage): string {
-	const tiles: ToolboxTile[] = page.results.slice(0, TOOLBOX_LIMITS.maxResults).map((asset) => {
+/** The `toolbox_results` event's tiles for the chat's result cards: at most 10. */
+export function resultsTiles(page: ToolboxPage): ToolboxTile[] {
+	return page.results.slice(0, TOOLBOX_LIMITS.maxResults).map((asset) => {
 		const tile: ToolboxTile = { id: asset.id, type: asset.type, name: asset.name, creator: asset.creator.name, verified: asset.creator.verified };
 		if (asset.scripts !== undefined) tile.scripts = asset.scripts;
 		if (asset.votes) {
@@ -340,7 +340,6 @@ export function resultsEventData(page: ToolboxPage): string {
 		if (asset.durationSeconds !== undefined) tile.seconds = asset.durationSeconds;
 		return tile;
 	});
-	return JSON.stringify(tiles);
 }
 
 /**
@@ -401,7 +400,7 @@ export interface ToolboxCallResult {
 	text: string;
 	isError: boolean;
 	/** toolbox_search: the result cards for the chat (prompt event `toolbox_results`). */
-	event?: { kind: "toolbox_results"; text: string; data: string };
+	event?: { kind: "toolbox_results"; text: string; tiles: ToolboxTile[] };
 }
 
 const fail = (text: string): ToolboxCallResult => ({ text, isError: true });
@@ -466,7 +465,7 @@ export class ToolboxService {
 		return {
 			text: redactEvent(text, 64 * 1024),
 			isError: false,
-			event: { kind: "toolbox_results", text: `${oneLine(query.query, 60)} (${query.type}): ${page.results.length}`, data: resultsEventData(page) },
+			event: { kind: "toolbox_results", text: `${oneLine(query.query, 60)} (${query.type}): ${page.results.length}`, tiles: resultsTiles(page) },
 		};
 	}
 
