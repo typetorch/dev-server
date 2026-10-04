@@ -470,6 +470,10 @@ describe("helpers", () => {
 			expect(isProtectedPath(p)).toBe(true);
 		}
 		for (const p of ["src/server/main.server.ts", "README.md", "src/shared/package-info.ts", "docs/scripts.md"]) expect(isProtectedPath(p)).toBe(false);
+		expect(isProtectedPath("tools/gen.ts", ["tools/**"])).toBe(true);
+		expect(isProtectedPath("src/tools/gen.ts", ["tools/**"])).toBe(false);
+		expect(() => isProtectedPath("x", ["a,b"])).toThrow();
+		expect(() => isProtectedPath("x", ["Bash(rm)"])).toThrow();
 	});
 
 	test("registration messages fit the contract and 1 KiB", () => {

@@ -52,13 +52,24 @@ const PROTECTED_GLOBS = [
 	"scripts/**",
 ];
 
-export const DISALLOWED_TOOLS = ["WebFetch", "WebSearch", ...PROTECTED_GLOBS.map((g) => `Edit(${g})`), "Read(**/.env*)"];
+/** Extra protected globs (--protect): path characters only; no commas or parentheses (they would split the rule list). */
+export const PROTECT_GLOB_PATTERN = /^[A-Za-z0-9_.\-/*?[\]!]+$/;
 
-const PROTECTED_PATTERNS = PROTECTED_GLOBS.map((glob) => new Bun.Glob(glob));
+export function protectedGlobs(extra: readonly string[] = []): string[] {
+	for (const glob of extra) if (!PROTECT_GLOB_PATTERN.test(glob)) throw new Error(`--protect: "${glob}" is not a simple glob`);
+	return [...PROTECTED_GLOBS, ...extra];
+}
 
-export function isProtectedPath(path: string): boolean {
+export function disallowedTools(extra: readonly string[] = []): string[] {
+	return ["WebFetch", "WebSearch", ...protectedGlobs(extra).map((g) => `Edit(${g})`), "Read(**/.env*)"];
+}
+
+export const DISALLOWED_TOOLS = disallowedTools();
+
+export function isProtectedPath(path: string, extra: readonly string[] = []): boolean {
 	const p = path.replace(/\\/g, "/");
-	return PROTECTED_PATTERNS.some((g) => g.match(p) || g.match(`x/${p}`)) || /(^|\/)\.env/.test(p);
+	const patterns = protectedGlobs(extra).map((glob) => new Bun.Glob(glob));
+	return patterns.some((g) => g.match(p) || g.match(`x/${p}`)) || /(^|\/)\.env/.test(p);
 }
 
 export function systemPrompt(gitBranch: string, workBranch: string, ttBranch: string): string {
@@ -143,11 +154,13 @@ export interface ClaudeRunnerOptions {
 	claudePath?: string;
 	model?: string;
 	maxBudgetUsd?: number;
+	/** Extra globs Claude may not edit and whose change blocks the deploy (files your build executes). */
+	protect?: string[];
 	runTimeoutMs?: number;
 	deployTimeoutMs?: number;
 }
 
-export function claudeArgs(options: Pick<ClaudeRunnerOptions, "model" | "maxBudgetUsd">, system: string): string[] {
+export function claudeArgs(options: Pick<ClaudeRunnerOptions, "model" | "maxBudgetUsd" | "protect">, system: string): string[] {
 	const args = [
 		"-p",
 		"--output-format",
@@ -159,7 +172,7 @@ export function claudeArgs(options: Pick<ClaudeRunnerOptions, "model" | "maxBudg
 		"--allowedTools",
 		ALLOWED_TOOLS.join(","),
 		"--disallowedTools",
-		DISALLOWED_TOOLS.join(","),
+		disallowedTools(options.protect).join(","),
 		"--permission-mode",
 		"dontAsk",
 		"--permission-prompts",
@@ -254,7 +267,7 @@ export function createClaudeRunner(options: ClaudeRunnerOptions): Runner {
 		// 2. Commit (the server, not Claude).
 		const files = await changedFiles(wt);
 		if (files.length === 0) return { state: "failed", error: "no changes", summary };
-		const protectedFiles = files.filter(isProtectedPath);
+		const protectedFiles = files.filter((file) => isProtectedPath(file, options.protect));
 		ctx.log(`changed: ${files.slice(0, 6).join(", ")}${files.length > 6 ? ` (+${files.length - 6})` : ""}`);
 		const commit = await commitStaged(wt, `remote-claude: ${summary}`, `Requested-By: roblox:${record.userId}`);
 		ctx.setState("committed", { commit, summary });

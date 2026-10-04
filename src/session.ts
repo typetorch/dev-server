@@ -12,7 +12,7 @@ import { branchExists, currentBranch, ensureWorktree, repoRoot, type Worktree } 
 import { addSecret, consoleLogger, type Logger } from "./log";
 import { run } from "./proc";
 import type { Runner } from "./prompts";
-import { createClaudeRunner, resolveCli } from "./runner";
+import { createClaudeRunner, protectedGlobs, resolveCli } from "./runner";
 import { secretStrengthError } from "./secret";
 import { createRemoteClaudeServer, type RemoteClaudeServer } from "./server";
 import { attachTerminal } from "./terminal";
@@ -43,6 +43,8 @@ export interface RemoteClaudeOptions {
 	terminal?: boolean;
 	model?: string;
 	maxBudgetUsd?: number;
+	/** Extra globs Claude may not edit and whose change blocks the deploy (files your build script executes). */
+	protect?: string[];
 	logger?: Logger;
 	/** Replaces the Claude runner (tests). */
 	runner?: Runner;
@@ -67,6 +69,7 @@ export async function startRemoteClaude(options: RemoteClaudeOptions): Promise<R
 	const logger = options.logger ?? consoleLogger();
 	const users = [...new Set(options.users)];
 	if (users.length === 0) throw new Error("--users is required (Roblox user ids, comma-separated; no default, no wildcard)");
+	protectedGlobs(options.protect); // throws on a bad --protect glob
 
 	// 1. Repo, branch, channel.
 	const repo = await repoRoot(resolve(options.repo ?? process.cwd()));
@@ -127,6 +130,7 @@ export async function startRemoteClaude(options: RemoteClaudeOptions): Promise<R
 			deployEnv: apiKey ? { [apiKey.name]: apiKey.value } : undefined,
 			model: options.model,
 			maxBudgetUsd: options.maxBudgetUsd,
+			protect: options.protect,
 		});
 	const server = createRemoteClaudeServer({
 		secret: secret!.value,

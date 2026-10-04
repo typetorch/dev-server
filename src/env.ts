@@ -6,7 +6,7 @@
  * (Claude Code, git, build tools) never inherit the exchange secret or the Open Cloud API key by accident. Values are
  * never printed; only variable names and file paths are.
  */
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 
 export function parseDotEnv(text: string): Record<string, string> {
@@ -108,13 +108,43 @@ const PARENT_SESSION_VARS = [
 	"CLAUDE_PID",
 ];
 
-/** process.env without the secret variables (and, for Claude, without parent-session variables). */
+let autoLoaded: Map<string, Set<string>> | undefined;
+
+/**
+ * Bun loads `.env`, `.env.local`, `.env.<NODE_ENV>`... from the working directory into process.env on its own. Those
+ * values are the dev's local secrets (API keys, tokens), not environment, so child processes must not inherit them.
+ * Returns key → values found in the working directory's `.env*` files.
+ */
+function autoLoadedDotEnv(): Map<string, Set<string>> {
+	if (autoLoaded) return autoLoaded;
+	autoLoaded = new Map();
+	let names: string[] = [];
+	try {
+		names = readdirSync(process.cwd()).filter((name) => /^\.env(\..+)?$/.test(name));
+	} catch {}
+	for (const name of names) {
+		try {
+			for (const [key, value] of Object.entries(parseDotEnv(readFileSync(join(process.cwd(), name), "utf8")))) {
+				if (!autoLoaded.has(key)) autoLoaded.set(key, new Set());
+				autoLoaded.get(key)!.add(value);
+			}
+		} catch {}
+	}
+	return autoLoaded;
+}
+
+/**
+ * process.env for a child process: without the secret variables, without anything Bun auto-loaded from a `.env` file,
+ * and (for Claude) without parent-session variables. `extra` is added last (the deploy gets the API key this way).
+ */
 export function childEnv(options: { forClaude?: boolean; extra?: Record<string, string> } = {}): Record<string, string> {
 	const env: Record<string, string> = {};
 	const drop = new Set([...SCRUBBED_VARS, ...(options.forClaude ? PARENT_SESSION_VARS : [])]);
+	const fromFiles = autoLoadedDotEnv();
 	for (const [key, value] of Object.entries(process.env)) {
 		if (value === undefined) continue;
 		if (drop.has(key) || drop.has(key.toUpperCase())) continue;
+		if (fromFiles.get(key)?.has(value)) continue;
 		env[key] = value;
 	}
 	env.GIT_TERMINAL_PROMPT = "0";
