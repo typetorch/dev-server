@@ -1,0 +1,258 @@
+{
+	"nextPageToken": "MV8xXzJfNA==_e63d7c3d2e3d0566be32385a46a94e29",
+	"queryFacets": {
+		"appliedFacets": [],
+		"availableFacets": [
+			"pine",
+			"autumn",
+			"fruit",
+			"blossom",
+			"old",
+			"forest",
+			"leafless",
+			"exotic",
+			"swamp",
+			"dead"
+		]
+	},
+	"creatorStoreAssets": [
+		{
+			"voting": {
+				"showVotes": true,
+				"upVotes": 6650,
+				"downVotes": 350,
+				"canVote": false,
+				"hasVoted": false,
+				"voteCount": 7000,
+				"upVotePercent": 95
+			},
+			"creator": {
+				"creator": "user/24773541",
+				"userId": 24773541,
+				"name": "SheriffTaco",
+				"verified": true
+			},
+			"creatorStoreProduct": {
+				"purchasePrice": {
+					"currencyCode": "USD",
+					"quantity": {
+						"significand": 0,
+						"exponent": 0
+					}
+				},
+				"purchasable": true
+			},
+			"asset": {
+				"subTypes": [],
+				"hasScripts": false,
+				"scriptCount": 0,
+				"objectMeshSummary": {
+					"triangles": 13080,
+					"vertices": 13218
+				},
+				"instanceCounts": {
+					"script": 0,
+					"meshPart": 36,
+					"animation": 0,
+					"decal": 0,
+					"audio": 0,
+					"tool": 0
+				},
+				"capabilities": {
+					"shouldSandbox": true
+				},
+				"id": 580221169,
+				"name": "Tree",
+				"description": "",
+				"assetTypeId": 10,
+				"socialLinks": [],
+				"previewAssets": {
+					"imagePreviewAssets": [],
+					"videoPreviewAssets": []
+				},
+				"createTime": "2016-12-20T01:58:43.163Z",
+				"updateTime": "2016-12-20T01:58:43.18Z",
+				"categoryPath": "3d__nature"
+			}
+		},
+		{
+			"voting": {
+				"showVotes": true,
+				"upVotes": 8900,
+				"downVotes": 1100,
+				"canVote": false,
+				"hasVoted": false,
+				"voteCount": 10000,
+				"upVotePercent": 89
+			},
+			"creator": {
+				"creator": "user/1826533",
+				"userId": 1826533,
+				"name": "Aurarus",
+				"verified": true
+			},
+			"creatorStoreProduct": {
+				"purchasePrice": {
+					"currencyCode": "USD",
+					"quantity": {
+						"significand": 0,
+						"exponent": 0
+					}
+				},
+				"purchasable": true
+			},
+			"asset": {
+				"subTypes": [],
+				"hasScripts": true,
+				"scriptCount": 2,
+				"objectMeshSummary": {
+					"triangles": 24478,
+					"vertices": 35458
+				},
+				"instanceCounts": {
+					"script": 2,
+					"meshPart": 0,
+					"animation": 0,
+					"decal": 0,
+					"audio": 0,
+					"tool": 0
+				},
+				"capabilities": {
+					"shouldSandbox": true
+				},
+				"id": 125459331,
+				"name": "Tree House",
+				"description": "A Treehouse made by me :D\r\n\r\nFree to take; you can even customize the interior.\r\nAll design done by me; this was inspired off of the countless other tree houses on free models, and I felt like this is a good contribution to sort of replace the outdated ones.\r\n\r\nTags: \r\nbuilding \r\ngiant \r\nbig \r\nawesome \r\namazing \r\nhome \r\nclub \r\nwar \r\nsniper \r\nladder \r\nstairs \r\nwood \r\ntrees \r\ngnome \r\nelf \r\nelven \r\nelves \r\ncamp \r\ncamping \r\nfort \r\nbase \r\nno furniture \r\nhosue \r\nnew \r\nfree \r\ntree \r\nhouse\r\nbuilding \r\nbuildings \r\nstructure \r\nstructures",
+				"assetTypeId": 10,
+				"socialLinks": [],
+				"previewAssets": {
+					"imagePreviewAssets": [],
+					"videoPreviewAssets": []
+				},
+				"createTime": "2013-08-06T15:10:22.153Z",
+				"updateTime": "2016-10-23T14:21:44.833Z",
+				"categoryPath": "3d__structures"
+			}
+		},
+		{
+			"voting": {
+				"showVotes": true,
+				"upVotes": 3680,
+				"downVotes": 320,
+				"canVote": false,
+				"hasVoted": false,
+				"voteCount": 4000,
+				"upVotePercent": 92
+			},
+			"creator": {
+				"creator": "user/303373309",
+				"userId": 303373309,
+				"name": "Chr1sDevv",
+				"verified": true
+			},
+			"creatorStoreProduct": {
+				"purchasePrice": {
+					"currencyCode": "USD",
+					"quantity": {
+						"significand": 0,
+						"exponent": 0
+					}
+				},
+				"purchasable": true
+			},
+			"asset": {
+				"subTypes": [],
+				"hasScripts": false,
+				"scriptCount": 0,
+				"objectMeshSummary": {
+					"triangles": 11550,
+					"vertices": 12572
+				},
+				"instanceCounts": {
+					"script": 0,
+					"meshPart": 7,
+					"animation": 0,
+					"decal": 0,
+					"audio": 0,
+					"tool": 0
+				},
+				"capabilities": {
+					"shouldSandbox": true
+				},
+				"id": 3256343670,
+				"name": "Realistic Trees",
+				"description": "",
+				"assetTypeId": 10,
+				"socialLinks": [],
+				"previewAssets": {
+					"imagePreviewAssets": [],
+					"videoPreviewAssets": []
+				},
+				"createTime": "2019-06-04T05:40:07.083Z",
+				"updateTime": "2023-03-14T04:49:04.143Z",
+				"categoryPath": "3d__nature"
+			}
+		},
+		{
+			"voting": {
+				"showVotes": true,
+				"upVotes": 376,
+				"downVotes": 24,
+				"canVote": false,
+				"hasVoted": false,
+				"voteCount": 400,
+				"upVotePercent": 94
+			},
+			"creator": {
+				"creator": "user/4046905981",
+				"userId": 4046905981,
+				"name": "Death_St5p",
+				"verified": true
+			},
+			"creatorStoreProduct": {
+				"purchasePrice": {
+					"currencyCode": "USD",
+					"quantity": {
+						"significand": 0,
+						"exponent": 0
+					}
+				},
+				"purchasable": true
+			},
+			"asset": {
+				"subTypes": [],
+				"hasScripts": false,
+				"scriptCount": 0,
+				"objectMeshSummary": {
+					"triangles": 348,
+					"vertices": 696
+				},
+				"instanceCounts": {
+					"script": 0,
+					"meshPart": 0,
+					"animation": 0,
+					"decal": 0,
+					"audio": 0,
+					"tool": 0
+				},
+				"capabilities": {
+					"shouldSandbox": true
+				},
+				"id": 17280628013,
+				"name": "studded tree",
+				"description": "",
+				"assetTypeId": 10,
+				"socialLinks": [],
+				"previewAssets": {
+					"imagePreviewAssets": [],
+					"videoPreviewAssets": []
+				},
+				"createTime": "2024-04-25T10:30:06.003Z",
+				"updateTime": "2024-04-25T10:30:06.007Z",
+				"categoryPath": "3d__nature"
+			}
+		}
+	],
+	"totalResults": 1000,
+	"filteredKeyword": ""
+}
