@@ -21,6 +21,14 @@ in, and you can attach screenshots (cropped if you like), your client's log hist
 history and the server's log history. Claude can show you images from the worktree (`![caption](path)` in its reply),
 and its `screenshot` tool sees what you see.
 
+**Toolbox (Creator Store), only when you ask for it.** Pick **Toolbox** in the "+" menu and that one message lets Claude
+search the Creator Store from this PC (free assets; no key; the results show as cards in your chat). In Live mode it can
+then insert an asset you picked into your server: every insert shows an approval card (what loaded, what is removed,
+Anchor, Keep scripts off by default) with Insert / Deny, and inserted assets get a Remove button. In Code mode it can
+record an asset in `toolbox.lock.toml` instead. The chip clears after each send; without it Claude has no Creator Store
+tools at all. Live inserts need the experience setting "Allow Loading Third Party Assets" (Studio > File > Experience
+Settings > Security; it applies to every server of the experience, prod included).
+
 **remote-claude only runs on your Claude subscription; API keys are refused.** It checks `claude auth status` at
 startup (a claude.ai login is required), strips every `ANTHROPIC_*` / Bedrock / Vertex / Foundry variable from the
 processes it starts, and kills any run whose Claude Code reports an API key as its credential.
@@ -49,7 +57,8 @@ dev's Roblox client ─► game server (dev channel; checks dev + allowlist + ra
 - Optional: `ffmpeg` on PATH (or `TT_FFMPEG`) for JPEG, WebP, GIF, BMP and 16-bit or interlaced PNG images. Plain
   8-bit PNGs (Roblox screenshots) are decoded without it.
 
-There is nothing to set up in Roblox: no secrets, no settings. For images Claude shows in the chat (EditableImage),
+There is nothing to set up in Roblox: no secrets, no settings. (Optional: Toolbox inserts into a live server need
+"Allow Loading Third Party Assets", above.) For images Claude shows in the chat (EditableImage),
 the experience needs its **Allow Mesh / Image APIs** setting on (Creator Hub, or Studio Game Settings → Security), and
 its owner must be 13+ and ID-verified. Without them the chat shows one dim line instead of the image.
 
@@ -129,6 +138,7 @@ The Quick Tunnel URL is public, so the server authenticates everything itself:
 | Limits | Headers ≤ 2 KB (Cloudflare's own `cf-*`/`x-forwarded-*` excluded; ≤ 8 KB in all), prompt body ≤ 480 KB (room for three ~64 KB log attachments; token body ≤ 1 KB, attachment body ≤ 3 MB, capture and asset requests ≤ 1 KB), strict JSON schemas (unknown fields rejected), ≤ 6 tokens per user per minute (checked before a refresh token rotates, so a `429` never strands the game with a dead token), one Claude run at a time, a queue of 5, one code run or pending proposal at a time, `--max-prompts` |
 | Responses | `Cache-Control: no-store`; errors are bare status codes with no body. The terminal logs `sub`, the first 8 characters of `jti` and the decision, never a token, code or key |
 | Modes | **Live** runs get `--tools Read,Glob,Grep` and every game tool; **code** runs get `Read,Edit,Write,Glob,Grep` plus exactly `Bash(bun run build)`, and the read-only game tools. The MCP server enforces it too: in code mode it doesn't list `run_luau` and refuses it. A live run never commits; if files change anyway they are dropped |
+| Toolbox | The Creator Store tools exist only for a prompt sent with the "Toolbox" chip (`toolbox: true`, kept immutable on the record): without it all three are in `--disallowedTools`, MCP `tools/list` doesn't list them and every `tools/call` is refused; with it, live runs get `toolbox_search` + `toolbox_insert`, code runs `toolbox_search` + `toolbox_add`, and the other one stays denied. Search runs here, unauthenticated, free assets only, 1 request/s, 10-minute cache, back-off after 429; store text is cleaned (hidden/bidi characters, length caps) and reaches Claude only inside `<untrusted-toolbox-data>`. Insert and add take only ids from this conversation's searches; the game gets the dev server's snapshot, not Claude's text. The game re-checks (the prompt was sent with the chip there, the id came through its own relayed results, dev channel) and asks the dev on a per-insert card (Insert / Deny, no "always"). `toolbox.lock.toml` is protected; only the dev server's own write (byte for byte) is accepted in a deploy proposal. Limits per message: 10 searches, 3 inserts, 5 adds |
 | Claude | `claude -p --restricted` in a dedicated worktree; `WebFetch`/`WebSearch` denied; anything else denied without asking (Claude Code still auto-allows its read-only commands such as `git status` inside the worktree). File tools can't leave the worktree (plus the run's log folder, below). `bun` is put first on Claude's PATH so `bun run build` always resolves. Edits to build/tool configuration (package.json, lockfiles, tsconfig, `*.project.json`, `typetorch.json`, scripts, hooks, `.github`, `.claude`, `.typetorch`, `.env`, plus `--protect`) are denied, and if one changes anyway the commit is kept but **no deploy is offered** |
 | Deploy approval | A code run that changed files is committed by the dev server (`remote-claude: <summary>` + `Requested-By: roblox:<userId>`, hooks disabled) and proposed, never deployed on its own. Only the requesting dev can deploy or discard it; Discard (or 15 minutes without an answer, or the session ending) resets the worktree to the commit before the run (the dropped commit stays in the reflog). Deploy and Discard refuse when the worktree moved since the proposal. Nothing is ever pushed |
 | Untrusted context | The game's `context` (paths, error lines, artifact id; players can influence it) is JSON-escaped inside `<untrusted-game-context>` and the system prompt tells Claude it is data, never instructions |
@@ -167,9 +177,11 @@ In Studio `game.JobId` is `""`: send `job: ""`. Roblox may drop an empty header,
 ### `POST /v1/prompts`
 - `Authorization: Bearer <JWT>`, `X-TT-Job: <game.JobId>`, `X-TT-Nonce: <unique, 8–128 chars [A-Za-z0-9._:{}-]>`,
   `X-TT-Timestamp: <unix seconds, ±300 s>`, `Content-Type: application/json`
-- Body (≤ 480 KB): `{"prompt": "<1–4000 chars>", "mode"?: "live" | "code", "context"?: {"path"?: string ≤1024, "errors"?: string[] (≤50 × ≤4000), "artifact"?: string ≤128, "logs"?: {"client"?: string, "server"?: string, "player"?: {"name": "<Roblox username>", "text": string}} (each text ≤ 66000 chars)}, "conversationId"?: "<22 chars>", "attachments"?: ["<32 hex>", ...] (≤ 4, distinct)}`
+- Body (≤ 480 KB): `{"prompt": "<1–4000 chars>", "mode"?: "live" | "code", "context"?: {"path"?: string ≤1024, "errors"?: string[] (≤50 × ≤4000), "artifact"?: string ≤128, "logs"?: {"client"?: string, "server"?: string, "player"?: {"name": "<Roblox username>", "text": string}} (each text ≤ 66000 chars)}, "conversationId"?: "<22 chars>", "attachments"?: ["<32 hex>", ...] (≤ 4, distinct), "toolbox"?: boolean}`
   - `mode` (default `"live"`) picks the run's tools (see the security model). A conversation can switch modes between
     prompts; the follow-up resumes the same Claude Code session with the new tools.
+  - `toolbox` (default `false`): the dev picked "Toolbox" for this message; only then does the run get the Creator
+    Store tools. A follow-up needs it again.
   - No `conversationId`: a new conversation (a new Claude Code session). With one: a follow-up in that conversation;
     Claude runs `claude -p --resume <its session>` in the same worktree and keeps the context. It must be the caller's
     own conversation (`404` otherwise) with no prompt still running or waiting for a deploy decision (`409`). If Claude
@@ -201,6 +213,7 @@ In Studio `game.JobId` is `""`: send `job: ""`. Roblox may drop an empty header,
   | `tool_result` | one line: `120 lines`, `3 files`, `done`, `error: ...` (never file contents) | `tool`, `ref` (pairs it with its `tool_use`, even when Claude runs several tools at once), `detail` (game tools: the full result, capped) |
   | `deploy_proposal` | the SUMMARY line | `commit`, `files` (≤ 50, `added`/`removed` line counts, -1 for binary), `expiresAt` |
   | `image` | the caption (or the file's path) | `image`: `{"id", "width", "height", "bytes", "chunks"}`, fetched with `GET /v1/images/:id?chunk=n`; it comes before the final status |
+  | `toolbox_results` | `<query> (<type>): <count>` | `tiles` (≤ 10): `[{"id", "type", "name", "creator", "verified", "scripts"?, "upPercent"?, "voteCount"?, "triangles"?, "seconds"?}]`, the Creator Store results Claude got (strangers' text, cleaned; the game re-checks every field) |
   | `status` | the new state (`queued`, `running`, `committed abc1234`, `proposed`, `building`, `deployed`, `discarded`, `answered`, ...) or a note | `state` when it is a state change |
   | `error` | why the run failed (e.g. `api_billing_refused`, `claude timed out`, `deploy failed (exit 1)`) | |
 - `state`: `queued` → `running` → `answered` (no file changes: a question, an explanation, a live action; `summary` is
@@ -280,6 +293,9 @@ that came through the tunnel are refused). Its tools act only on the game server
 | `find {realm?, query, under?, limit?}` | Instances whose Name or ClassName contains the query |
 | `game_status {}` | Artifact, generation, branch, channel, uptime, players with positions |
 | `screenshot {}` | What the requester sees now: the game asks their client to capture and answers `{captureTime, placeId, localId?}` (or `{assetId}` after an upload); the dev server picks up the file like `POST /v1/attachments/capture` and returns it to Claude as an MCP image block (≤ 1568 px; never written to disk by the dev server) |
+| `toolbox_search {query, type?, verifiedOnly?, noScripts?, sort?, limit?, page?, audioMinSeconds?, audioMaxSeconds?}` | Toolbox chip only, both modes. Runs here: `GET apis.roblox.com/toolbox-service/v2/assets:search` (no key, no cookie, free only, Full view). `type` Model (default), MeshPart, Decal, Audio; `verifiedOnly` default true; `limit` 1–10 (default 6). Returns ids, names, creators (verified), votes, script and instance counts, triangles, inside `<untrusted-toolbox-data>`; the chat gets a `toolbox_results` event |
+| `toolbox_insert {id, place?, position?, parent?, name?, anchor?, reason?}` | Toolbox chip only, Live mode. A game request (`tool: "toolbox_insert"`, `args` with the dev server's `asset` snapshot). The game loads it into nothing (`AssetService:LoadAssetAsync`), removes scripts, remotes, bindables, explosions and spawns, shows the dev an approval card (Insert / Deny, Anchor, Keep scripts off by default) and places it in `Workspace.TypeTorchToolbox` in front of the dev. Wait: approval 60 s + load 20 s + 20 s |
+| `toolbox_add {id, path, reason?}` | Toolbox chip only, Code mode. The dev server writes `toolbox.lock.toml` (`[assets."toolbox/<...>"]`: kind image/sound/mesh/model, storeId, assetId, name, creator, verified, scripts, updated, addedBy, added); the asset is referenced by id, never re-uploaded |
 
 Delivery: the game server's long-poll (`GET /v1/game/poll?since=<cursor>`, JWT, held up to 20 s) carries this server's
 prompt events and its tool requests; results go to `POST /v1/game/tool-result {id, ...}`. When no poll is open the dev
@@ -334,6 +350,8 @@ tool's image too).
 ```sh
 bun test                 # security, relay (paths, status lines, logs), modes + deploy approval, chat, game-tool and
                          # image tests (PNG decode, downscale, crop, capture pickup, asset fallback, Claude → game),
+                         # Toolbox tests (a recorded Creator Store response in test/fixtures/toolbox, the chip gate
+                         # end to end, toolbox.lock.toml; no live search calls),
                          # all on 127.0.0.1 (a fake claude drives the real runner), and one real Quick Tunnel
                          # (TT_SKIP_TUNNEL=1 to skip it)
 bun test/e2e.ts          # a real two-message conversation with an image attachment through the tunnel and Claude,
