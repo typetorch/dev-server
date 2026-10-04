@@ -39,11 +39,15 @@ export interface PromptEvent {
 	block?: number;
 	/** status: the new state. */
 	state?: PromptState;
+	/** tool_use / tool_result of run_luau: the code, or the full result (capped, redacted). */
+	detail?: string;
 }
 
 export interface PromptRecord {
 	id: string;
 	userId: number;
+	/** The game server (JobId from the JWT) that sent the prompt: the only server run_luau can target. */
+	job: string;
 	prompt: string;
 	context?: PromptContext;
 	conversation?: Conversation;
@@ -99,10 +103,12 @@ export interface RunContext {
 	signal: AbortSignal;
 	/** The Claude Code session to resume (a follow-up in a conversation), if any. */
 	resume?: string;
+	/** The run_luau MCP endpoint for this run (a bearer token valid only while it runs). */
+	mcp?: { url: string; token: string };
 	log(line: string): void;
 	setState(state: "committed" | "building", fields?: { commit?: string; summary?: string }): void;
 	/** A tool_use / tool_result / status / error event (assistant text goes through `text`). */
-	event(kind: Exclude<EventKind, "assistant_text">, text: string, extra?: { tool?: string; target?: string }): void;
+	event(kind: Exclude<EventKind, "assistant_text">, text: string, extra?: { tool?: string; target?: string; detail?: string }): void;
 	/** Appends streamed assistant text to text block `block` (published in chunks). */
 	text(block: number, chunk: string): void;
 	/** Records the Claude Code session id of this run (from the init event) on its conversation. */
@@ -129,7 +135,12 @@ function newPromptId(): string {
 export interface CreateOptions {
 	conversation?: Conversation;
 	attachments?: Attachment[];
+	/** The JWT's job (game server) that sent the prompt. */
+	job?: string;
 }
+
+/** Per-run tools (run_luau): set up before the runner starts, disposed when it ends. */
+export type RunTools = (record: PromptRecord) => { mcp: { url: string; token: string }; dispose: () => void } | undefined;
 
 export class PromptQueue {
 	private readonly records = new Map<string, PromptRecord>();
@@ -139,7 +150,7 @@ export class PromptQueue {
 	private stopped = false;
 
 	constructor(
-		private readonly options: { runner: Runner; maxQueued: number; maxPrompts: number; logger: Logger },
+		private readonly options: { runner: Runner; maxQueued: number; maxPrompts: number; logger: Logger; runTools?: RunTools },
 	) {}
 
 	get createdCount(): number {
@@ -185,6 +196,7 @@ export class PromptQueue {
 		const record: PromptRecord = {
 			id: newPromptId(),
 			userId,
+			job: extra.job ?? "",
 			prompt,
 			context,
 			conversation: extra.conversation,
@@ -301,6 +313,7 @@ export class PromptQueue {
 		if (event.target !== undefined) clean.target = redactEvent(oneLine(event.target, 160));
 		if (event.block !== undefined) clean.block = event.block;
 		if (event.state !== undefined) clean.state = event.state;
+		if (event.detail !== undefined) clean.detail = redactEvent(event.detail, 2000);
 		record.events.push(clean);
 	}
 
@@ -357,10 +370,17 @@ export class PromptQueue {
 		this.pushEvent(record, { kind: "status", text: "running", state: "running" });
 		this.options.logger.info(`prompt ${record.id.slice(0, 8)} running`);
 		const live = () => !record.abort.signal.aborted && !record.done;
+		let tools: ReturnType<RunTools> | undefined;
+		try {
+			tools = this.options.runTools?.(record);
+		} catch (error) {
+			this.options.logger.warn(`prompt ${record.id.slice(0, 8)}: run tools unavailable: ${(error as Error).message}`);
+		}
 		const ctx: RunContext = {
 			record,
 			signal: record.abort.signal,
 			resume: record.conversation?.claudeSessionId,
+			mcp: tools?.mcp,
 			log: (line) => this.pushLog(record, line),
 			setState: (state, fields) => {
 				if (record.abort.signal.aborted) return;
@@ -374,7 +394,7 @@ export class PromptQueue {
 			event: (kind, text, extra) => {
 				if (!live()) return;
 				this.flushText(record, true);
-				this.pushEvent(record, { kind, text, tool: extra?.tool, target: extra?.target });
+				this.pushEvent(record, { kind, text, tool: extra?.tool, target: extra?.target, detail: extra?.detail });
 			},
 			text: (block, chunk) => {
 				if (live()) this.appendText(record, block, chunk);
@@ -393,6 +413,7 @@ export class PromptQueue {
 		} catch (error) {
 			this.finish(record, { state: record.abort.signal.aborted ? "cancelled" : "failed", error: record.abort.signal.aborted ? undefined : (error as Error).message });
 		} finally {
+			tools?.dispose();
 			this.running = undefined;
 			queueMicrotask(() => void this.pump());
 		}

@@ -181,6 +181,31 @@ In Studio `game.JobId` is `""`: send `job: ""`. Roblox may drop an empty header,
   (the last 30 prompts; `events` with the chunks of each text block merged; continue a running prompt with
   `GET /v1/prompts/:id?since=<next>`). Use it to reopen a chat after a swap or a rejoin.
 
+### Game tools (MCP, for Claude)
+Every run gets an MCP server named `typetorch-game` (`--mcp-config`, a per-run bearer token, loopback only: requests
+that came through the tunnel are refused). Its tools act only on the game server that sent the prompt (the JWT's
+`job`) and only for the user who sent it:
+
+| Tool | What it does |
+|---|---|
+| `run_luau {code, description?, timeoutSeconds?}` | Luau on the server (`player` = the requester, `kernel`, `persist(key)`). The dev approves each snippet in the chat (or "Always in this chat"); needs `ServerScriptService.LoadStringEnabled` |
+| `game_logs {realm?, since?, filter?, limit?}` | Server logs, or the requester's client logs (`realm: "client"`) |
+| `inspect {realm?, path, depth?, properties?}` | Class, properties, attributes, tags, children |
+| `find {realm?, query, under?, limit?}` | Instances whose Name or ClassName contains the query |
+| `game_status {}` | Artifact, generation, branch, channel, uptime, players with positions |
+| `screenshot {}` | Not available yet |
+
+Delivery: the dev server publishes `{"v":1,"s":<session>,"j":<JobId>,"x":<request id>,"u":<user id>}` on topic
+`TypeTorch/tool` (never the code), and the game server also polls while a prompt runs:
+- `GET /v1/game/pending` (JWT) → `{"requests": [{"id", "tool"}]}`: this user's requests for this job;
+- `GET /v1/game/requests/:id` (JWT) → `{"id", "tool", "args", "description", "timeoutSeconds", "conversationId", "promptId"}`;
+  `404` unless the token's user AND job match the request, `410` once it expired or was answered;
+- `POST /v1/game/requests/:id/result` (JWT, nonce, timestamp) `{"ok", "output"?: string[], "returned"?, "error"?, "data"?, "ms"?, "denied"?}`
+  (≤ 80 KB) → `{"ok": true}`; once only.
+
+Claude gets the result capped at 64 KB inside `<untrusted-game-data>`; with no answer in time (approval 60 s + timeout
++ 20 s) it gets a clear error.
+
 ### Status codes
 | Code | Meaning | Game server should |
 |---|---|---|

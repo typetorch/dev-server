@@ -29,6 +29,30 @@ export function closedMessage(sessionId: string): string {
 	return JSON.stringify({ v: 1, s: sessionId, closed: true });
 }
 
+/** One Open Cloud MessagingService publish (at most 1 KiB). The key goes only in the x-api-key header. */
+export async function publishMessage(universeId: number, apiKey: string, topic: string, message: string, logger: Logger): Promise<boolean> {
+	if (Buffer.byteLength(message, "utf8") > 1024) {
+		logger.error(`message for ${topic} is over 1 KiB; not sent`);
+		return false;
+	}
+	try {
+		const response = await fetch(`${API}/cloud/v2/universes/${universeId}:publishMessage`, {
+			method: "POST",
+			headers: { "x-api-key": apiKey, "content-type": "application/json" },
+			body: JSON.stringify({ topic, message }),
+			signal: AbortSignal.timeout(15_000),
+		});
+		if (!response.ok) {
+			logger.warn(`publishMessage ${topic} failed: HTTP ${response.status}`);
+			return false;
+		}
+		return true;
+	} catch (error) {
+		logger.warn(`publishMessage ${topic} failed: ${(error as Error).name}`);
+		return false;
+	}
+}
+
 export class Announcer {
 	private timer: ReturnType<typeof setInterval> | undefined;
 
@@ -42,27 +66,8 @@ export class Announcer {
 		},
 	) {}
 
-	async publish(message: string): Promise<boolean> {
-		if (Buffer.byteLength(message, "utf8") > 1024) {
-			this.options.logger.error("registration message is over 1 KiB (too many users?); not sent");
-			return false;
-		}
-		try {
-			const response = await fetch(`${API}/cloud/v2/universes/${this.options.universeId}:publishMessage`, {
-				method: "POST",
-				headers: { "x-api-key": this.options.apiKey, "content-type": "application/json" },
-				body: JSON.stringify({ topic: TOPIC, message }),
-				signal: AbortSignal.timeout(15_000),
-			});
-			if (!response.ok) {
-				this.options.logger.warn(`publishMessage failed: HTTP ${response.status}`);
-				return false;
-			}
-			return true;
-		} catch (error) {
-			this.options.logger.warn(`publishMessage failed: ${(error as Error).name}`);
-			return false;
-		}
+	publish(message: string): Promise<boolean> {
+		return publishMessage(this.options.universeId, this.options.apiKey, TOPIC, message, this.options.logger);
 	}
 
 	/** Publishes the current registration now. */

@@ -5,7 +5,8 @@
  */
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
-import { Announcer, closedMessage, registrationMessage } from "./announce";
+import { Announcer, closedMessage, publishMessage, registrationMessage } from "./announce";
+import { GAME_TOPIC } from "./game-tools";
 import { ATTACHMENT_DIR } from "./attachments";
 import { checkSubscriptionAuth } from "./billing";
 import { branchChannel, branchFromGit, loadGameConfig } from "./config";
@@ -187,6 +188,8 @@ export async function startRemoteClaude(options: RemoteClaudeOptions): Promise<R
 		codeTtlMs: codeTtlMs,
 		now: options.now,
 		attachmentsDir,
+		// Game tools: a wake message per request (no code in it); game servers also poll GET /v1/game/pending.
+		publishWake: apiKey && universeId ? (message) => publishMessage(universeId, apiKey.value, GAME_TOPIC, message, logger) : undefined,
 		onPairingCode: (formatted, reason, expiresAt) => {
 			if (reason === "auto") logger.warn("pairing code rotated automatically after 30 wrong attempts; paired servers keep working");
 			if (reason === "expired") logger.info("pairing code expired; new code below (paired servers keep working until their refresh token expires)");

@@ -7,8 +7,13 @@
  *   POST /v1/attachments            JWT → {id, width, height}   (RGBA8 screenshot → PNG in the worktree)
  *   GET  /v1/conversations          JWT → the caller's conversations, latest first
  *   GET  /v1/conversations/:id      JWT → one of the caller's conversations with its messages
+ *   GET  /v1/game/pending           JWT → game-tool requests waiting for this user's game server (job)
+ *   GET  /v1/game/requests/:id      JWT → one request (tool + args), only for its user AND job
+ *   POST /v1/game/requests/:id/result JWT → the game server's answer
+ *   POST /mcp                       per-run bearer token (local claude only) → MCP JSON-RPC: the game tools
  * Errors are bare status codes with no body; the reason is only logged locally (never a token or code).
  */
+import type { Server } from "bun";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ATTACHMENT_ID_PATTERN, ATTACHMENT_LIMITS, AttachmentStore } from "./attachments";
@@ -17,6 +22,18 @@ import { CONVERSATION_ID_PATTERN, ConversationStore, type Conversation } from ".
 import { NonceCache, SlidingWindow } from "./limits";
 import { addSecret, consoleLogger, oneLine, type Logger } from "./log";
 import { DEFAULT_CODE_TTL_MS, PairingCode, type RotateReason } from "./pairing";
+import {
+	GAME_LIMITS,
+	GAME_MCP_SERVER,
+	GAME_TOOL_DEFS,
+	GameRequestStore,
+	REQUEST_ID_PATTERN,
+	formatGameResult,
+	parseGameResult,
+	parseToolCall,
+	waitMsFor,
+	wakeMessage,
+} from "./game-tools";
 import { PromptQueue, type PromptRecord, type Runner } from "./prompts";
 import {
 	LIMITS,
@@ -55,21 +72,31 @@ type Route =
 	| { kind: "cancel"; id: string }
 	| { kind: "attach" }
 	| { kind: "conversations" }
-	| { kind: "conversation"; id: string };
+	| { kind: "conversation"; id: string }
+	| { kind: "gamePending" }
+	| { kind: "gameRequest"; id: string }
+	| { kind: "gameResult"; id: string };
 
 type AuthedRoute = Exclude<Route, { kind: "token" }>;
+
+const MCP_PATH = "/mcp";
 
 function matchRoute(method: string, path: string): Route | undefined {
 	if (method === "POST" && path === "/v1/token") return { kind: "token" };
 	if (method === "POST" && path === "/v1/prompts") return { kind: "create" };
 	if (method === "POST" && path === "/v1/attachments") return { kind: "attach" };
 	if (method === "GET" && path === "/v1/conversations") return { kind: "conversations" };
+	if (method === "GET" && path === "/v1/game/pending") return { kind: "gamePending" };
 	let m = /^\/v1\/prompts\/([^/]{1,128})$/.exec(path);
 	if (m && method === "GET") return { kind: "get", id: m[1] };
 	m = /^\/v1\/prompts\/([^/]{1,128})\/cancel$/.exec(path);
 	if (m && method === "POST") return { kind: "cancel", id: m[1] };
 	m = /^\/v1\/conversations\/([^/]{1,128})$/.exec(path);
 	if (m && method === "GET") return { kind: "conversation", id: m[1] };
+	m = /^\/v1\/game\/requests\/([^/]{1,128})$/.exec(path);
+	if (m && method === "GET") return { kind: "gameRequest", id: m[1] };
+	m = /^\/v1\/game\/requests\/([^/]{1,128})\/result$/.exec(path);
+	if (m && method === "POST") return { kind: "gameResult", id: m[1] };
 	return undefined;
 }
 
@@ -80,6 +107,9 @@ const SCOPE_FOR: Record<AuthedRoute["kind"], Scope> = {
 	conversations: "prompt:read",
 	conversation: "prompt:read",
 	cancel: "prompt:cancel",
+	gamePending: "prompt:read",
+	gameRequest: "prompt:read",
+	gameResult: "prompt:create",
 };
 
 const TOO_LARGE = Symbol("too large");
@@ -157,6 +187,13 @@ export interface RemoteClaudeServerOptions {
 	 * (embedding and tests).
 	 */
 	attachmentsDir?: string;
+	/**
+	 * Publishes a game-tool wake message on MessagingService topic TypeTorch/tool (session.ts passes the Open Cloud
+	 * publisher). Without it, game servers still find requests through GET /v1/game/pending.
+	 */
+	publishWake?: (message: string) => Promise<boolean>;
+	/** Tests: how long a tool call waits for the game (default: approval + timeout + grace). */
+	gameWaitMs?: (defaultMs: number) => number;
 	/** Tests only (honored only when NODE_ENV=test): a known signing key so tests can forge crafted tokens. */
 	unsafeSigningKey?: Uint8Array;
 }
@@ -167,6 +204,7 @@ export interface RemoteClaudeServer {
 	readonly pairing: PairingCode;
 	readonly conversations: ConversationStore;
 	readonly attachments: AttachmentStore;
+	readonly gameRequests: GameRequestStore;
 	readonly port: number;
 	/** http://127.0.0.1:<port> */
 	readonly localUrl: string;
@@ -200,11 +238,24 @@ export function createRemoteClaudeServer(options: RemoteClaudeServerOptions): Re
 	);
 	addSecret(pairing.raw);
 	addSecret(pairing.formatted);
+	const gameRequests = new GameRequestStore();
+	let localUrl = "";
 	const queue = new PromptQueue({
 		runner: options.runner,
 		maxQueued: options.maxQueued ?? 5,
 		maxPrompts: options.maxPrompts ?? 50,
 		logger,
+		// Each run gets the game tools over MCP with its own bearer token, valid only while it runs.
+		runTools: (record) => {
+			const token = gameRequests.issueRunToken(record.id);
+			return {
+				mcp: { url: `${localUrl}${MCP_PATH}`, token },
+				dispose: () => {
+					gameRequests.revokeRunToken(token);
+					gameRequests.expirePrompt(record.id);
+				},
+			};
+		},
 	});
 	const conversations = new ConversationStore();
 	const attachments = new AttachmentStore(
@@ -270,6 +321,12 @@ export function createRemoteClaudeServer(options: RemoteClaudeServerOptions): Re
 				return `GET /v1/prompts/${oneLine(route.id, 12)}`;
 			case "cancel":
 				return `POST /v1/prompts/${oneLine(route.id, 12)}/cancel`;
+			case "gamePending":
+				return "GET /v1/game/pending";
+			case "gameRequest":
+				return `GET /v1/game/requests/${oneLine(route.id, 8)}`;
+			case "gameResult":
+				return `POST /v1/game/requests/${oneLine(route.id, 8)}/result`;
 		}
 	};
 
@@ -354,7 +411,7 @@ export function createRemoteClaudeServer(options: RemoteClaudeServerOptions): Re
 			if (refused === "stopped") return decide(503, what, `${who} shutting down`), empty(503);
 			const isNew = conversation === undefined;
 			conversation ??= conversations.create(userId, body.prompt);
-			const record = queue.create(userId, body.prompt, body.context, { conversation, attachments: used });
+			const record = queue.create(userId, body.prompt, body.context, { conversation, attachments: used, job: claims.job });
 			if (typeof record === "string") {
 				if (isNew) conversations.discard(conversation.id);
 				return decide(record === "stopped" ? 503 : 429, what, `${who} ${record}`), empty(record === "stopped" ? 503 : 429);
@@ -393,6 +450,40 @@ export function createRemoteClaudeServer(options: RemoteClaudeServerOptions): Re
 			return json({ ...conversationSummary(conversation), messages: records.map(message), truncated: conversation.promptIds.length > MESSAGES_RETURNED });
 		}
 
+		if (route.kind === "gamePending") {
+			const pending = gameRequests.pendingFor(userId, claims.job).map((r) => ({ id: r.id, tool: r.tool }));
+			return json({ requests: pending });
+		}
+
+		if (route.kind === "gameRequest" || route.kind === "gameResult") {
+			// Only the request's own user on its own game server (the token's job) may read or answer it.
+			const request = REQUEST_ID_PATTERN.test(route.id) ? gameRequests.get(route.id) : undefined;
+			if (!request || request.userId !== userId || request.job !== claims.job) return decide(404, what, `${who} not theirs or unknown`), empty(404);
+			if (route.kind === "gameRequest") {
+				if (request.state === "expired" || request.state === "done") return decide(410, what, `${who} ${request.state}`), empty(410);
+				request.state = "delivered";
+				decide(200, what, `${who} ${request.tool} delivered`);
+				return json({
+					id: request.id,
+					tool: request.tool,
+					args: request.args,
+					description: request.description,
+					timeoutSeconds: request.timeoutSeconds,
+					conversationId: request.conversationId,
+					promptId: request.promptId,
+				});
+			}
+			if (!isJson(req)) return decide(400, what, `${who} content-type`), empty(400);
+			const text = await readBody(req, GAME_LIMITS.resultBodyBytes);
+			if (text === TOO_LARGE) return decide(413, what, `${who} body too large`), empty(413);
+			if (text === undefined) return decide(400, what, `${who} body encoding`), empty(400);
+			const result = parseGameResult(parseJson(text));
+			if (!result) return decide(400, what, `${who} body schema`), empty(400);
+			if (!gameRequests.complete(request.id, result)) return decide(410, what, `${who} ${request.state}`), empty(410);
+			decide(200, what, `${who} ${request.tool} ${result.denied ? "denied" : result.ok ? "ok" : "error"}${result.ms !== undefined ? ` ${result.ms} ms` : ""}`);
+			return json({ ok: true });
+		}
+
 		if (!PROMPT_ID_PATTERN.test(route.id)) return decide(404, what, who), empty(404);
 		const record = queue.get(route.id);
 		if (!record) return decide(404, what, who), empty(404);
@@ -411,14 +502,76 @@ export function createRemoteClaudeServer(options: RemoteClaudeServerOptions): Re
 		return json({ ok: true });
 	}
 
+	/** One game-tool call from the running prompt's Claude: create, wake, wait, format. */
+	async function callGameTool(record: PromptRecord, name: unknown, args: unknown): Promise<{ text: string; isError: boolean }> {
+		const call = parseToolCall(name, args);
+		if (typeof call === "string") return { text: call, isError: true };
+		if (call.tool === "screenshot") return { text: "Screenshots are not available yet.", isError: true };
+		if (gameRequests.countFor(record.id) >= GAME_LIMITS.perPrompt) return { text: "Too many game tool calls in this prompt.", isError: true };
+		const request = gameRequests.create({
+			promptId: record.id,
+			conversationId: record.conversation?.id,
+			userId: record.userId,
+			job: record.job,
+			tool: call.tool,
+			args: call.args,
+			description: call.description,
+			timeoutSeconds: call.timeoutSeconds,
+		});
+		logger.info(`game tool ${call.tool} ${request.id.slice(0, 8)} for roblox:${record.userId} on job ${record.job.slice(0, 8) || "(studio)"}: "${oneLine(call.description, 60)}"`);
+		if (options.publishWake) void options.publishWake(wakeMessage(auth.sessionId, record.job, request.id, record.userId));
+		const defaultMs = waitMsFor(call);
+		const done = await gameRequests.wait(request.id, options.gameWaitMs ? options.gameWaitMs(defaultMs) : defaultMs, record.abort.signal);
+		if (!done) logger.warn(`game tool ${call.tool} ${request.id.slice(0, 8)}: no answer from the game server`);
+		return formatGameResult(call.tool, done?.result);
+	}
+
+	/**
+	 * The game tools as an MCP server (streamable HTTP, JSON responses). Only the local claude process of a running
+	 * prompt can use it: it needs that run's bearer token, and requests that came through the tunnel are refused.
+	 */
+	async function handleMcp(req: Request, bunServer: Server<unknown>): Promise<Response> {
+		for (const name of req.headers.keys()) if (isProxyHeader(name)) return empty(404);
+		if (req.method !== "POST") return empty(405);
+		const m = /^Bearer ([A-Za-z0-9_-]{20,100})$/.exec(req.headers.get("authorization") ?? "");
+		const promptId = m ? gameRequests.promptForToken(m[1]) : undefined;
+		const record = promptId ? queue.get(promptId) : undefined;
+		if (!record || record.done) return decide(401, "POST /mcp", "no run token"), empty(401);
+		bunServer.timeout(req, 0); // a tool call waits for the game (and the dev's approval)
+		const text = await readBody(req, 64 * 1024);
+		if (typeof text !== "string") return empty(413);
+		const body = parseJson(text);
+		const messages = Array.isArray(body) ? body : [body];
+		const replies: unknown[] = [];
+		for (const message of messages) {
+			if (typeof message !== "object" || message === null) continue;
+			const { id, method, params } = message as { id?: unknown; method?: unknown; params?: Record<string, unknown> };
+			if (id === undefined || id === null) continue; // notifications
+			const reply = (result: unknown) => replies.push({ jsonrpc: "2.0", id, result });
+			const fail = (code: number, text: string) => replies.push({ jsonrpc: "2.0", id, error: { code, message: text } });
+			if (method === "initialize") {
+				const version = typeof params?.protocolVersion === "string" ? params.protocolVersion : "2025-06-18";
+				reply({ protocolVersion: version, capabilities: { tools: { listChanged: false } }, serverInfo: { name: GAME_MCP_SERVER, version: "0.1.0" } });
+			} else if (method === "ping") reply({});
+			else if (method === "tools/list") reply({ tools: GAME_TOOL_DEFS });
+			else if (method === "tools/call") {
+				const result = await callGameTool(record, params?.name, params?.arguments);
+				reply({ content: [{ type: "text", text: result.text }], isError: result.isError });
+			} else fail(-32601, "method not found");
+		}
+		if (replies.length === 0) return new Response(null, { status: 202, headers: BASE_HEADERS });
+		return json(Array.isArray(body) ? replies : replies[0]);
+	}
+
 	const server = Bun.serve({
 		hostname: "127.0.0.1",
 		port: options.port ?? 0,
 		development: false,
 		// The attachment body is the largest; every route still enforces its own cap while reading.
 		maxRequestBodySize: ATTACHMENT_LIMITS.maxBodyBytes + 64 * 1024,
-		async fetch(req: Request): Promise<Response> {
+		async fetch(req: Request, bunServer: Server<unknown>): Promise<Response> {
 			const url = new URL(req.url);
+			if (url.pathname === MCP_PATH) return handleMcp(req, bunServer);
 			const route = matchRoute(req.method, url.pathname);
 			if (!route) return empty(404);
 			if (headersTooLarge(req)) return decide(431, `${req.method} ${url.pathname.slice(0, 40)}`, "headers too large"), empty(431);
@@ -431,12 +584,14 @@ export function createRemoteClaudeServer(options: RemoteClaudeServerOptions): Re
 	});
 
 	const port = server.port as number;
+	localUrl = `http://127.0.0.1:${port}`;
 	return {
 		auth,
 		queue,
 		pairing,
 		conversations,
 		attachments,
+		gameRequests,
 		port,
 		localUrl: `http://127.0.0.1:${port}`,
 		rotateAll() {
