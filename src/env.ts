@@ -120,7 +120,14 @@ export function isApiBillingVar(name: string): boolean {
 /** The CLI's per-job Open Cloud keys (cli env.ts): passed to deploys only. */
 export const DEPLOY_SECRET_VARS = ["OPENCLOUD_ASSETS_KEY", "OPENCLOUD_DEPLOY_KEY", "OPENCLOUD_PLACE_KEY"] as const;
 
-export const SCRUBBED_VARS: readonly string[] = [...API_KEY_VARS, ...DEPLOY_SECRET_VARS, ...API_BILLING_VARS];
+/**
+ * The CLI's prod signing keys (CLI 0.5, plans/03 "Signed prod messages and heads"): the key file paths, plus CLI 0.2-0.3
+ * leftovers. remote-claude only deploys dev-channel branches, which are never signed, so neither Claude nor the deploy
+ * it runs ever gets one of these (not even the paths).
+ */
+export const SIGNING_KEY_VARS = ["TYPETORCH_KEY_FILE", "TYPETORCH_FALLBACK_KEY_FILE", "TYPETORCH_SIGNING_KEY", "TYPETORCH_ALLOW_ENV_SIGNING_KEY"] as const;
+
+export const SCRUBBED_VARS: readonly string[] = [...API_KEY_VARS, ...DEPLOY_SECRET_VARS, ...SIGNING_KEY_VARS, ...API_BILLING_VARS];
 
 /**
  * Variables that tie a process to the Claude Code session that launched this server (set when the dev server itself
