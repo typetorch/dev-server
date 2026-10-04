@@ -287,8 +287,11 @@ export function summarizeToolResult(tool: string | undefined, block: Record<stri
 	}
 }
 
-/** Artifact ids: <channel>-<commit>[-dirty-<sha6>][.r<n>] (a revision suffix when a commit is redeployed with other bytes). */
-const ARTIFACT_ID = /\b(?:dev|prod)-[0-9a-f]{7,40}(?:-dirty-[0-9a-f]{6})?(?:\.r\d+)?(?![\w-]|\.\w)/g;
+/**
+ * Artifact ids: `<commit7>[-dirty]-<hash6>` (CLI 0.2), or the legacy `<channel>-<commit>[-dirty-<sha6>][.r<n>]`.
+ */
+const ARTIFACT_ID =
+	/\b(?:(?:[0-9a-f]{7}|uncommitted)(?:-dirty)?-[0-9a-f]{6}|(?:dev|prod)-[0-9a-f]{7,40}(?:-dirty-[0-9a-f]{6})?(?:\.r\d+)?)(?![\w-]|\.\w)/g;
 
 /** The last artifact id in a line of deploy output. */
 export function lastArtifactId(line: string): string | undefined {
@@ -347,6 +350,11 @@ export interface ClaudeRunnerOptions {
 	cli?: CliCommand;
 	/** Extra env for the deploy only (the Open Cloud API key, under the variable name it was found as). */
 	deployEnv?: Record<string, string>;
+	/**
+	 * TYPETORCH_STATE_DIR for the deploy: the main repo's `.typetorch` (default `<worktree.repo>/.typetorch`), so
+	 * deploys from the worktree share the repo's deployments.jsonl and its seq (security audit P-C1/S-L8).
+	 */
+	stateDir?: string;
 	claudePath?: string;
 	/** The whole claude command (tests: [bun, fake-claude.ts]); wins over claudePath. */
 	claudeCommand?: string[];
@@ -561,13 +569,16 @@ export function createClaudeRunner(options: ClaudeRunnerOptions): Runner {
 	 * `typetorch deploy --branch <branch> --json` in the worktree: deploys its HEAD. Runs only after the requesting dev
 	 * approved the proposal in the chat.
 	 */
-	const runDeploy = async (ctx: DeployContext, cli: CliCommand): Promise<DeployOutcome> => {
+	const runDeploy = async (ctx: DeployContext, cli: CliCommand, summary?: string): Promise<DeployOutcome> => {
 		const { signal } = ctx;
 		ctx.log(`deploying: typetorch deploy --branch ${options.ttBranch}`);
 		// --json: stdout carries one JSON document (deployment.artifactId); human lines go to stderr.
-		const deploy = Bun.spawn([...cli.cmd, "deploy", "--branch", options.ttBranch, "--json"], {
+		// --message: Claude's SUMMARY line, the first "what changed" line of the artifact (an argv element, no shell).
+		const message = summary ? ["--message", oneLine(summary.replace(/[\u0000-\u001f\u007f]+/g, " "), 200)] : [];
+		const deploy = Bun.spawn([...cli.cmd, "deploy", "--branch", options.ttBranch, "--json", ...message], {
 			cwd: wt.path,
-			env: childEnv({ extra: options.deployEnv }),
+			// The main repo's state dir, passed explicitly: one deployments.jsonl and one seq for every checkout.
+			env: childEnv({ extra: { ...options.deployEnv, TYPETORCH_STATE_DIR: options.stateDir ?? join(wt.repo, ".typetorch") } }),
 			stdin: "ignore",
 			stdout: "pipe",
 			stderr: "pipe",
@@ -674,7 +685,7 @@ export function createClaudeRunner(options: ClaudeRunnerOptions): Runner {
 				files: await diffStat(wt, base, commit),
 				deploy: async (deployCtx) => {
 					if ((await head()) !== commit) return { ok: false, error: "the worktree moved since this proposal; deploy by hand" };
-					return runDeploy(deployCtx, cli);
+					return runDeploy(deployCtx, cli, summary);
 				},
 				discard: async () => {
 					if ((await head()) !== commit) return { ok: false, error: "the worktree moved since this proposal; reset it by hand" };
