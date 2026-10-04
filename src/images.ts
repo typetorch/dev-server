@@ -19,7 +19,7 @@
  * 1024 px per side, zstd-compressed, served in base64 chunks to the requesting dev's game server only
  * (GET /v1/images/:id?chunk=n), which relays them to that dev's client (EditableImage).
  */
-import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync } from "node:fs";
+import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { constants as zlibConstants, inflateSync, zstdCompressSync } from "node:zlib";
@@ -298,6 +298,13 @@ export function captureDir(): string {
 
 /** `<userId>_<placeId>_<unixMs>.png` */
 export const CAPTURE_NAME = /^(\d{1,19})_(\d{1,19})_(\d{10,16})\.png$/i;
+/**
+ * Script captures (CaptureService.TakeScreenshotCaptureAsync) are saved as `wob-<number>` (PNG bytes, no extension)
+ * instead: no user or place in the name, so they are matched by the LocalId's digits or by modified time. Only the
+ * Roblox client on this PC writes this folder; a second account playing on the same PC at the same moment could be
+ * picked up (documented).
+ */
+export const SCRIPT_CAPTURE_NAME = /^wob-(\d{1,19})$/i;
 /** A capture's LocalId may name its file stem; only these characters are ever used to build a file name. */
 const LOCAL_ID_STEM = /(\d{1,19}_\d{1,19}_\d{10,16})/;
 
@@ -338,6 +345,27 @@ export function findCaptureFile(dir: string, query: CaptureQuery): CaptureMatch 
 		if (query.placeId !== undefined && query.placeId > 0 && m[2] !== String(query.placeId)) return undefined;
 		return { deltaMs: Number(m[3]) - query.captureMs };
 	};
+	const mtimeDelta = (name: string): number | undefined => {
+		try {
+			return statSync(join(dir, name)).mtimeMs - query.captureMs;
+		} catch {
+			return undefined;
+		}
+	};
+	// Script captures: the LocalId's number names the file; else the newest one modified within the window.
+	const localDigits = query.localId ? /(\d{1,19})/.exec(query.localId)?.[1] : undefined;
+	if (localDigits) {
+		const name = names.find((candidate) => candidate.toLowerCase() === `wob-${localDigits}`);
+		const delta = name ? mtimeDelta(name) : undefined;
+		if (name && delta !== undefined && Math.abs(delta) <= 60_000) return { file: join(dir, name), name, deltaMs: delta, exact: true };
+	}
+	let bestScript: CaptureMatch | undefined;
+	for (const name of names) {
+		if (!SCRIPT_CAPTURE_NAME.test(name)) continue;
+		const delta = mtimeDelta(name);
+		if (delta === undefined || Math.abs(delta) > windowMs) continue;
+		if (!bestScript || Math.abs(delta) < Math.abs(bestScript.deltaMs)) bestScript = { file: join(dir, name), name, deltaMs: delta, exact: false };
+	}
 	const stem = query.localId ? LOCAL_ID_STEM.exec(query.localId)?.[1] : undefined;
 	if (stem) {
 		const name = names.find((candidate) => candidate.toLowerCase() === `${stem}.png`);
@@ -350,7 +378,8 @@ export function findCaptureFile(dir: string, query: CaptureQuery): CaptureMatch 
 		if (!own || Math.abs(own.deltaMs) > windowMs) continue;
 		if (!best || Math.abs(own.deltaMs) < Math.abs(best.deltaMs)) best = { file: join(dir, name), name, deltaMs: own.deltaMs, exact: false };
 	}
-	return best;
+	if (best && bestScript) return Math.abs(bestScript.deltaMs) < Math.abs(best.deltaMs) ? bestScript : best;
+	return best ?? bestScript;
 }
 
 const IEND_TRAILER = Uint8Array.of(0, 0, 0, 0, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82);

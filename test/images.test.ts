@@ -661,3 +661,27 @@ describe("player logs (another player's client logs)", () => {
 		}
 	});
 });
+
+describe("script captures (wob-<n>, no extension)", () => {
+	test("found by the LocalId's number, else by modified time within the window", () => {
+		const dir = mkdtempSync(join(tmpdir(), "tt-wob-"));
+		try {
+			const t = Date.now();
+			const old = join(dir, "wob-100");
+			const fresh = join(dir, "wob-101");
+			writeFileSync(old, "png");
+			writeFileSync(fresh, "png");
+			utimesSync(old, new Date(t - 30_000), new Date(t - 30_000));
+			utimesSync(fresh, new Date(t + 200), new Date(t + 200));
+			const byId = findCaptureFile(dir, { userId: 111, captureMs: t, localId: "100" });
+			expect(byId?.name).toBe("wob-100");
+			expect(byId?.exact).toBe(true);
+			const byTime = findCaptureFile(dir, { userId: 111, captureMs: t });
+			expect(byTime?.name).toBe("wob-101");
+			expect(byTime?.exact).toBe(false);
+			expect(findCaptureFile(dir, { userId: 111, captureMs: t + 30_000 })).toBeUndefined();
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+});
