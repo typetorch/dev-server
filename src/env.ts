@@ -76,6 +76,11 @@ export class Settings {
 		return this.values.get(name);
 	}
 
+	/** Every value read from a `.env` file (never printed; used to keep them out of prompt events). */
+	fileValues(): string[] {
+		return [...this.values.values()].map((setting) => setting.value);
+	}
+
 	first(names: readonly string[]): (Setting & { name: string }) | undefined {
 		for (const name of names) {
 			const found = this.get(name);
@@ -88,8 +93,31 @@ export class Settings {
 /** Open Cloud API key variables, in the TypeTorch CLI's priority order. */
 export const API_KEY_VARS = ["TYPETORCH_API_KEY", "OPENCLOUD_API_KEY", "ROBLOX_API_KEY"] as const;
 
+/**
+ * remote-claude only runs on the dev's Claude subscription (claude.ai login), never on pay-per-token API billing.
+ * These variables would make Claude Code bill an API account or a cloud provider instead (or route its traffic
+ * elsewhere), so no child process ever gets them. Any other ANTHROPIC_* variable is dropped too.
+ */
+export const API_BILLING_VARS: readonly string[] = [
+	"ANTHROPIC_API_KEY",
+	"ANTHROPIC_AUTH_TOKEN",
+	"ANTHROPIC_BASE_URL",
+	"ANTHROPIC_BEDROCK_BASE_URL",
+	"ANTHROPIC_VERTEX_PROJECT_ID",
+	"CLAUDE_CODE_USE_BEDROCK",
+	"CLAUDE_CODE_USE_VERTEX",
+	"CLAUDE_CODE_USE_FOUNDRY",
+	"AWS_BEARER_TOKEN_BEDROCK",
+];
+
+/** True for variables that select API billing or another provider (API_BILLING_VARS, ANTHROPIC_*, CLAUDE_CODE_USE_*). */
+export function isApiBillingVar(name: string): boolean {
+	const upper = name.toUpperCase();
+	return API_BILLING_VARS.includes(upper) || upper.startsWith("ANTHROPIC_") || upper.startsWith("CLAUDE_CODE_USE_");
+}
+
 /** Variables never passed to Claude Code or git (they would be readable by anything those processes run). */
-export const SCRUBBED_VARS: readonly string[] = [...API_KEY_VARS];
+export const SCRUBBED_VARS: readonly string[] = [...API_KEY_VARS, ...API_BILLING_VARS];
 
 /**
  * Variables that tie a process to the Claude Code session that launched this server (set when the dev server itself
@@ -133,8 +161,9 @@ function autoLoadedDotEnv(): Map<string, Set<string>> {
 }
 
 /**
- * process.env for a child process: without the API key variables, without anything Bun auto-loaded from a `.env` file,
- * and (for Claude) without parent-session variables. `extra` is added last (the deploy gets the API key this way).
+ * process.env for a child process: without the Open Cloud API key variables, without any variable that would switch
+ * Claude Code to API billing (isApiBillingVar), without anything Bun auto-loaded from a `.env` file, and (for Claude)
+ * without parent-session variables. `extra` is added last (the deploy gets the Open Cloud API key this way).
  */
 export function childEnv(options: { forClaude?: boolean; extra?: Record<string, string> } = {}): Record<string, string> {
 	const env: Record<string, string> = {};
@@ -142,7 +171,7 @@ export function childEnv(options: { forClaude?: boolean; extra?: Record<string, 
 	const fromFiles = autoLoadedDotEnv();
 	for (const [key, value] of Object.entries(process.env)) {
 		if (value === undefined) continue;
-		if (drop.has(key) || drop.has(key.toUpperCase())) continue;
+		if (drop.has(key) || drop.has(key.toUpperCase()) || isApiBillingVar(key)) continue;
 		if (fromFiles.get(key)?.has(value)) continue;
 		env[key] = value;
 	}

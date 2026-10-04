@@ -1,21 +1,38 @@
 /**
- * The loopback HTTP server (plans/11 §3, pairing-code variant). Four endpoints, nothing else:
- *   POST /v1/token                pairing code or refresh token → 5-minute JWT
- *   POST /v1/prompts              JWT → {id, state:"queued"}
- *   GET  /v1/prompts/:id          JWT → status
- *   POST /v1/prompts/:id/cancel   JWT → {ok:true}
+ * The loopback HTTP server (plans/11 §3, pairing-code variant). These endpoints, nothing else:
+ *   POST /v1/token                  pairing code or refresh token → 5-minute JWT
+ *   POST /v1/prompts                JWT → {id, state:"queued", conversationId}
+ *   GET  /v1/prompts/:id[?since=n]  JWT → status (+ events i >= n)
+ *   POST /v1/prompts/:id/cancel     JWT → {ok:true}
+ *   POST /v1/attachments            JWT → {id, width, height}   (RGBA8 screenshot → PNG in the worktree)
+ *   GET  /v1/conversations          JWT → the caller's conversations, latest first
+ *   GET  /v1/conversations/:id      JWT → one of the caller's conversations with its messages
  * Errors are bare status codes with no body; the reason is only logged locally (never a token or code).
  */
-import type { Server } from "bun";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { ATTACHMENT_ID_PATTERN, ATTACHMENT_LIMITS, AttachmentStore } from "./attachments";
 import { SessionAuth, type Scope } from "./auth";
+import { CONVERSATION_ID_PATTERN, ConversationStore, type Conversation } from "./conversations";
 import { NonceCache, SlidingWindow } from "./limits";
 import { addSecret, consoleLogger, oneLine, type Logger } from "./log";
 import { DEFAULT_CODE_TTL_MS, PairingCode, type RotateReason } from "./pairing";
-import { PromptQueue, type Runner } from "./prompts";
-import { LIMITS, NONCE_PATTERN, PROMPT_ID_PATTERN, parsePromptRequest, parseTokenGrant } from "./schema";
+import { PromptQueue, type PromptRecord, type Runner } from "./prompts";
+import {
+	LIMITS,
+	NONCE_PATTERN,
+	PROMPT_ID_PATTERN,
+	SINCE_PATTERN,
+	parseAttachmentRequest,
+	parsePromptRequest,
+	parseTokenGrant,
+} from "./schema";
 
 export const TIMESTAMP_WINDOW_SECONDS = 300;
 export const TOKENS_PER_USER_PER_MINUTE = 6;
+/** Conversations listed by GET /v1/conversations, and messages returned by GET /v1/conversations/:id. */
+export const CONVERSATIONS_LISTED = 20;
+export const MESSAGES_RETURNED = 30;
 
 const BASE_HEADERS: Record<string, string> = {
 	"cache-control": "no-store",
@@ -35,17 +52,35 @@ type Route =
 	| { kind: "token" }
 	| { kind: "create" }
 	| { kind: "get"; id: string }
-	| { kind: "cancel"; id: string };
+	| { kind: "cancel"; id: string }
+	| { kind: "attach" }
+	| { kind: "conversations" }
+	| { kind: "conversation"; id: string };
+
+type AuthedRoute = Exclude<Route, { kind: "token" }>;
 
 function matchRoute(method: string, path: string): Route | undefined {
 	if (method === "POST" && path === "/v1/token") return { kind: "token" };
 	if (method === "POST" && path === "/v1/prompts") return { kind: "create" };
+	if (method === "POST" && path === "/v1/attachments") return { kind: "attach" };
+	if (method === "GET" && path === "/v1/conversations") return { kind: "conversations" };
 	let m = /^\/v1\/prompts\/([^/]{1,128})$/.exec(path);
 	if (m && method === "GET") return { kind: "get", id: m[1] };
 	m = /^\/v1\/prompts\/([^/]{1,128})\/cancel$/.exec(path);
 	if (m && method === "POST") return { kind: "cancel", id: m[1] };
+	m = /^\/v1\/conversations\/([^/]{1,128})$/.exec(path);
+	if (m && method === "GET") return { kind: "conversation", id: m[1] };
 	return undefined;
 }
+
+const SCOPE_FOR: Record<AuthedRoute["kind"], Scope> = {
+	create: "prompt:create",
+	attach: "prompt:create",
+	get: "prompt:read",
+	conversations: "prompt:read",
+	conversation: "prompt:read",
+	cancel: "prompt:cancel",
+};
 
 const TOO_LARGE = Symbol("too large");
 
@@ -117,6 +152,11 @@ export interface RemoteClaudeServerOptions {
 	codeTtlMs?: number;
 	/** Clock in ms for code and refresh-token expiry (tests inject one). */
 	now?: () => number;
+	/**
+	 * Absolute folder for attachment PNGs: `<worktree>/.typetorch/attachments` (git-ignored). Default: a temp folder
+	 * (embedding and tests).
+	 */
+	attachmentsDir?: string;
 	/** Tests only (honored only when NODE_ENV=test): a known signing key so tests can forge crafted tokens. */
 	unsafeSigningKey?: Uint8Array;
 }
@@ -125,11 +165,14 @@ export interface RemoteClaudeServer {
 	readonly auth: SessionAuth;
 	readonly queue: PromptQueue;
 	readonly pairing: PairingCode;
+	readonly conversations: ConversationStore;
+	readonly attachments: AttachmentStore;
 	readonly port: number;
 	/** http://127.0.0.1:<port> */
 	readonly localUrl: string;
 	/** New signing key, no refresh tokens, new pairing code: every credential issued so far dies. */
 	rotateAll(): void;
+	/** Stops the server and deletes the attachment files. */
 	stop(): Promise<void>;
 }
 
@@ -163,6 +206,10 @@ export function createRemoteClaudeServer(options: RemoteClaudeServerOptions): Re
 		maxPrompts: options.maxPrompts ?? 50,
 		logger,
 	});
+	const conversations = new ConversationStore();
+	const attachments = new AttachmentStore(
+		options.attachmentsDir ?? join(tmpdir(), `typetorch-attachments-${auth.sessionId.slice(0, 12)}`),
+	);
 	const tokenLimiter = new SlidingWindow(TOKENS_PER_USER_PER_MINUTE, 60_000);
 	const nonces = new NonceCache();
 
@@ -209,14 +256,65 @@ export function createRemoteClaudeServer(options: RemoteClaudeServerOptions): Re
 		return json({ access_token: issued.token, expires_in: 300, refresh_token: grant.refresh_token, refresh_expires_in: left });
 	}
 
-	async function handlePrompts(req: Request, route: Exclude<Route, { kind: "token" }>): Promise<Response> {
-		const what = route.kind === "create" ? "POST /v1/prompts" : `${route.kind === "get" ? "GET" : "POST"} /v1/prompts/${oneLine(route.id, 12)}${route.kind === "cancel" ? "/cancel" : ""}`;
+	const describeRoute = (route: AuthedRoute): string => {
+		switch (route.kind) {
+			case "create":
+				return "POST /v1/prompts";
+			case "attach":
+				return "POST /v1/attachments";
+			case "conversations":
+				return "GET /v1/conversations";
+			case "conversation":
+				return `GET /v1/conversations/${oneLine(route.id, 12)}`;
+			case "get":
+				return `GET /v1/prompts/${oneLine(route.id, 12)}`;
+			case "cancel":
+				return `POST /v1/prompts/${oneLine(route.id, 12)}/cancel`;
+		}
+	};
+
+	/** A prompt as a conversation message (replay after a swap or rejoin). */
+	const message = (record: PromptRecord) => {
+		const view = queue.view(record);
+		const { events, next } = queue.condensed(record);
+		return {
+			id: record.id,
+			prompt: record.prompt,
+			state: view.state,
+			summary: view.summary,
+			commit: view.commit,
+			artifactId: view.artifactId,
+			error: view.error,
+			costUsd: view.costUsd,
+			attachments: view.attachments ?? [],
+			queuedAt: view.queuedAt,
+			startedAt: view.startedAt,
+			finishedAt: view.finishedAt,
+			events,
+			next,
+		};
+	};
+
+	const conversationSummary = (conversation: Conversation) => {
+		const lastId = conversation.promptIds[conversation.promptIds.length - 1];
+		const last = lastId ? queue.get(lastId) : undefined;
+		return {
+			id: conversation.id,
+			title: conversation.title,
+			createdAt: conversation.createdAt,
+			updatedAt: conversation.updatedAt,
+			prompts: conversation.promptIds.length,
+			state: last?.state,
+		};
+	};
+
+	async function handleAuthed(req: Request, url: URL, route: AuthedRoute): Promise<Response> {
+		const what = describeRoute(route);
 		const authz = req.headers.get("authorization") ?? "";
 		const m = /^Bearer ([A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*)$/.exec(authz);
 		if (!m || m[1].length > 2048) return decide(401, what, "no bearer token"), empty(401);
-		const scope: Scope = route.kind === "create" ? "prompt:create" : route.kind === "get" ? "prompt:read" : "prompt:cancel";
 		const job = req.headers.get("x-tt-job") ?? "";
-		const verified = await auth.verify(m[1], job, scope);
+		const verified = await auth.verify(m[1], job, SCOPE_FOR[route.kind]);
 		if (!verified.ok) {
 			const who = verified.userId !== undefined ? `roblox:${verified.userId} ` : "";
 			return decide(verified.status, what, `${who}${verified.jti ? `jti=${verified.jti.slice(0, 8)} ` : ""}${verified.reason}`), empty(verified.status);
@@ -224,7 +322,7 @@ export function createRemoteClaudeServer(options: RemoteClaudeServerOptions): Re
 		const { userId, claims } = verified;
 		const who = `roblox:${userId} jti=${claims.jti.slice(0, 8)}`;
 
-		// Every POST (create and cancel) carries a fresh X-TT-Nonce and an X-TT-Timestamp within ±300 s.
+		// Every POST (create, cancel, attach) carries a fresh X-TT-Nonce and an X-TT-Timestamp within ±300 s.
 		if (req.method === "POST") {
 			const stamp = req.headers.get("x-tt-timestamp") ?? "";
 			if (!/^\d{1,12}$/.test(stamp) || Math.abs(Math.floor(Date.now() / 1000) - Number(stamp)) > TIMESTAMP_WINDOW_SECONDS) {
@@ -242,17 +340,67 @@ export function createRemoteClaudeServer(options: RemoteClaudeServerOptions): Re
 			if (text === undefined) return decide(400, what, `${who} body encoding`), empty(400);
 			const body = parsePromptRequest(parseJson(text));
 			if (!body) return decide(400, what, `${who} body schema`), empty(400);
-			const record = queue.create(userId, body.prompt, body.context);
-			if (record === "max-prompts" || record === "queue-full") return decide(429, what, `${who} ${record}`), empty(429);
-			if (record === "stopped") return decide(503, what, `${who} shutting down`), empty(503);
-			decide(200, what, `${who} queued ${record.id.slice(0, 8)}`);
-			return json({ id: record.id, state: record.state });
+			// A follow-up: only in the caller's own conversation, and not while its previous prompt is still going.
+			let conversation: Conversation | undefined;
+			if (body.conversationId !== undefined) {
+				conversation = conversations.owned(body.conversationId, userId);
+				if (!conversation) return decide(404, what, `${who} unknown conversation`), empty(404);
+				if (queue.busy(conversation)) return decide(409, what, `${who} conversation busy`), empty(409);
+			}
+			const used = attachments.check(body.attachments ?? [], userId);
+			if (!used) return decide(400, what, `${who} attachment not found, not yours or already used`), empty(400);
+			const refused = queue.refusal();
+			if (refused === "max-prompts" || refused === "queue-full") return decide(429, what, `${who} ${refused}`), empty(429);
+			if (refused === "stopped") return decide(503, what, `${who} shutting down`), empty(503);
+			const isNew = conversation === undefined;
+			conversation ??= conversations.create(userId, body.prompt);
+			const record = queue.create(userId, body.prompt, body.context, { conversation, attachments: used });
+			if (typeof record === "string") {
+				if (isNew) conversations.discard(conversation.id);
+				return decide(record === "stopped" ? 503 : 429, what, `${who} ${record}`), empty(record === "stopped" ? 503 : 429);
+			}
+			conversations.touch(conversation);
+			const extra = [isNew ? "new conversation" : `conversation ${conversation.id.slice(0, 8)}`, used.length ? `${used.length} attachment(s)` : ""].filter(Boolean).join(", ");
+			decide(200, what, `${who} queued ${record.id.slice(0, 8)} (${extra})`);
+			return json({ id: record.id, state: record.state, conversationId: conversation.id });
+		}
+
+		if (route.kind === "attach") {
+			if (!isJson(req)) return decide(400, what, `${who} content-type`), empty(400);
+			if (attachments.count(userId) >= ATTACHMENT_LIMITS.perUser) return decide(429, what, `${who} attachment quota (${ATTACHMENT_LIMITS.perUser})`), empty(429);
+			const text = await readBody(req, ATTACHMENT_LIMITS.maxBodyBytes);
+			if (text === TOO_LARGE) return decide(413, what, `${who} body too large`), empty(413);
+			if (text === undefined) return decide(400, what, `${who} body encoding`), empty(400);
+			const body = parseAttachmentRequest(parseJson(text));
+			if (!body) return decide(400, what, `${who} body schema`), empty(400);
+			const saved = attachments.add(userId, body);
+			if (saved === "quota") return decide(429, what, `${who} attachment quota`), empty(429);
+			if (typeof saved === "string") return decide(400, what, `${who} ${saved}`), empty(400);
+			decide(200, what, `${who} ${saved.width}x${saved.height} → ${saved.relPath} (${saved.pngBytes} bytes)`);
+			return json({ id: saved.id, width: saved.width, height: saved.height });
+		}
+
+		if (route.kind === "conversations") {
+			const list = conversations.forUser(userId).slice(0, CONVERSATIONS_LISTED).map(conversationSummary);
+			return json({ conversations: list });
+		}
+
+		if (route.kind === "conversation") {
+			if (!CONVERSATION_ID_PATTERN.test(route.id)) return decide(404, what, who), empty(404);
+			const conversation = conversations.owned(route.id, userId);
+			if (!conversation) return decide(404, what, `${who} not found or not theirs`), empty(404);
+			const records = conversation.promptIds.slice(-MESSAGES_RETURNED).map((id) => queue.get(id)).filter((r): r is PromptRecord => r !== undefined);
+			return json({ ...conversationSummary(conversation), messages: records.map(message), truncated: conversation.promptIds.length > MESSAGES_RETURNED });
 		}
 
 		if (!PROMPT_ID_PATTERN.test(route.id)) return decide(404, what, who), empty(404);
 		const record = queue.get(route.id);
 		if (!record) return decide(404, what, who), empty(404);
-		if (route.kind === "get") return json(queue.view(record));
+		if (route.kind === "get") {
+			const since = url.searchParams.get("since");
+			if (since !== null && !SINCE_PATTERN.test(since)) return decide(400, what, `${who} bad since`), empty(400);
+			return json(queue.view(record, since === null ? undefined : Number(since)));
+		}
 
 		// Cancel (no body or Content-Type expected; a body is ignored): only the requester (or the dev at the terminal).
 		if (record.userId !== userId) return decide(403, what, `${who} not the requester`), empty(403);
@@ -267,13 +415,14 @@ export function createRemoteClaudeServer(options: RemoteClaudeServerOptions): Re
 		hostname: "127.0.0.1",
 		port: options.port ?? 0,
 		development: false,
-		maxRequestBodySize: 64 * 1024,
+		// The attachment body is the largest; every route still enforces its own cap while reading.
+		maxRequestBodySize: ATTACHMENT_LIMITS.maxBodyBytes + 64 * 1024,
 		async fetch(req: Request): Promise<Response> {
 			const url = new URL(req.url);
 			const route = matchRoute(req.method, url.pathname);
 			if (!route) return empty(404);
 			if (headersTooLarge(req)) return decide(431, `${req.method} ${url.pathname.slice(0, 40)}`, "headers too large"), empty(431);
-			return route.kind === "token" ? handleToken(req) : handlePrompts(req, route);
+			return route.kind === "token" ? handleToken(req) : handleAuthed(req, url, route);
 		},
 		error(error: Error): Response {
 			logger.error(`request failed: ${error.message}`);
@@ -286,6 +435,8 @@ export function createRemoteClaudeServer(options: RemoteClaudeServerOptions): Re
 		auth,
 		queue,
 		pairing,
+		conversations,
+		attachments,
 		port,
 		localUrl: `http://127.0.0.1:${port}`,
 		rotateAll() {
@@ -296,6 +447,9 @@ export function createRemoteClaudeServer(options: RemoteClaudeServerOptions): Re
 			pairing.dispose();
 			await queue.stop();
 			await server.stop(true);
+			attachments.clear();
 		},
 	};
 }
+
+export { ATTACHMENT_ID_PATTERN };

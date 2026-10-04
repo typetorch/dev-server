@@ -6,10 +6,12 @@
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { Announcer, closedMessage, registrationMessage } from "./announce";
+import { ATTACHMENT_DIR } from "./attachments";
+import { checkSubscriptionAuth } from "./billing";
 import { branchChannel, branchFromGit, loadGameConfig } from "./config";
 import { API_KEY_VARS, Settings, childEnv } from "./env";
 import { branchExists, currentBranch, ensureIgnored, ensureWorktree, repoRoot, type Worktree } from "./git";
-import { addSecret, consoleLogger, type Logger } from "./log";
+import { addEventSecret, addSecret, consoleLogger, type Logger } from "./log";
 import { run } from "./proc";
 import type { Runner } from "./prompts";
 import { createClaudeRunner, protectedGlobs, resolveCli } from "./runner";
@@ -41,12 +43,15 @@ export interface RemoteClaudeOptions {
 	/** Read terminal commands from stdin (default true). */
 	terminal?: boolean;
 	model?: string;
+	/** A cap on Claude Code's own cost estimate per run (runs always use the Claude subscription). */
 	maxBudgetUsd?: number;
 	/** Extra globs Claude may not edit and whose change blocks the deploy (files your build script executes). */
 	protect?: string[];
 	logger?: Logger;
 	/** Replaces the Claude runner (tests). */
 	runner?: Runner;
+	/** The claude command (default: `claude` on PATH); tests pass [bun, fake-claude.ts]. */
+	claudeCommand?: string[];
 	/** Copy the pairing code to the clipboard (default true). */
 	clipboard?: boolean;
 	/** Lifetime of each pairing code in minutes (default 180). Refresh tokens never outlive it. */
@@ -96,16 +101,26 @@ export async function startRemoteClaude(options: RemoteClaudeOptions): Promise<R
 	const announce = options.announce !== false;
 	const apiKey = settings.first(API_KEY_VARS);
 	addSecret(apiKey?.value);
+	// No .env value may reach a game client through prompt events.
+	for (const value of settings.fileValues()) addEventSecret(value);
 	const universeId = config.universeId ?? (Number(settings.get("UNIVERSE_ID")?.value) || undefined);
 	if (announce && !apiKey) throw new Error(`no Open Cloud API key (${API_KEY_VARS.join(", ")}); it is needed to announce the session to game servers`);
 	if (announce && !universeId) throw new Error(`no universe id: set "universeId" in ${config.path} or UNIVERSE_ID`);
 
-	// 3. Tools.
-	if (!options.runner) {
-		const claude = Bun.which("claude");
-		if (!claude) throw new Error("the claude CLI is not installed (https://claude.com/claude-code)");
-		const version = await run([claude, "--version"], { cwd: repo, env: childEnv({ forClaude: true }), timeoutMs: 30_000 });
+	// 3. Tools. Claude Code must be logged in with a Claude subscription: API billing is refused (billing.ts).
+	let claudeCommand = options.claudeCommand;
+	let subscriptionVerified = false;
+	if (!options.runner || options.claudeCommand) {
+		if (!claudeCommand) {
+			const claude = Bun.which("claude");
+			if (!claude) throw new Error("the claude CLI is not installed (https://claude.com/claude-code)");
+			claudeCommand = [claude];
+		}
+		const version = await run([...claudeCommand, "--version"], { cwd: repo, env: childEnv({ forClaude: true }), timeoutMs: 30_000 });
 		if (version.code !== 0) throw new Error("`claude --version` failed; is Claude Code installed and logged in?");
+		await checkSubscriptionAuth(claudeCommand, repo);
+		subscriptionVerified = true;
+		logger.info("claude: logged in with a Claude subscription (API billing is refused)");
 	}
 	const cloudflared = options.tunnel === false ? undefined : await findCloudflared(logger, options.installCloudflared !== false);
 
@@ -115,6 +130,10 @@ export async function startRemoteClaude(options: RemoteClaudeOptions): Promise<R
 	if (worktree.workBranch !== gitBranch) {
 		logger.info(`"${gitBranch}" is checked out elsewhere, so commits go to ${worktree.workBranch} (git merge ${worktree.workBranch})`);
 	}
+	// Attachments: <worktree>/.typetorch/attachments, git-ignored, emptied now and deleted when the session ends.
+	const attachmentsDir = join(worktree.path, ...ATTACHMENT_DIR.split("/"));
+	await ensureIgnored(worktree.path, `${ATTACHMENT_DIR}/`);
+	rmSync(attachmentsDir, { recursive: true, force: true });
 	if (options.installDeps !== false && existsSync(join(worktree.path, "package.json")) && !existsSync(join(worktree.path, "node_modules"))) {
 		logger.info("installing dependencies in the worktree (bun install)…");
 		const installed = await run([process.execPath, "install"], { cwd: worktree.path, env: childEnv(), timeoutMs: 10 * 60_000 });
@@ -152,6 +171,8 @@ export async function startRemoteClaude(options: RemoteClaudeOptions): Promise<R
 			deploy,
 			cli,
 			deployEnv: apiKey ? { [apiKey.name]: apiKey.value } : undefined,
+			claudeCommand,
+			subscriptionVerified,
 			model: options.model,
 			maxBudgetUsd: options.maxBudgetUsd,
 			protect: options.protect,
@@ -165,6 +186,7 @@ export async function startRemoteClaude(options: RemoteClaudeOptions): Promise<R
 		logger,
 		codeTtlMs: codeTtlMs,
 		now: options.now,
+		attachmentsDir,
 		onPairingCode: (formatted, reason, expiresAt) => {
 			if (reason === "auto") logger.warn("pairing code rotated automatically after 30 wrong attempts; paired servers keep working");
 			if (reason === "expired") logger.info("pairing code expired; new code below (paired servers keep working until their refresh token expires)");
@@ -190,7 +212,8 @@ export async function startRemoteClaude(options: RemoteClaudeOptions): Promise<R
 			exe: cloudflared,
 			port: server.port,
 			logger,
-			onUrl: () => {
+			onUrl: (url) => {
+				addEventSecret(url);
 				// A restart: re-announce the new URL as soon as it is reachable.
 				if (started) void tunnel?.waitReachable().then(() => announcer?.announce());
 			},

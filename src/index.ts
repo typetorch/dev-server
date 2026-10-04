@@ -15,6 +15,9 @@ Usage:
 It prints a pairing code (also copied to the clipboard and saved to <repo>/.typetorch/remote-claude.code).
 Paste it into DEV > Claude in game to pair the server you are in.
 
+remote-claude only runs on your Claude subscription (claude auth login with your Claude.ai account); API keys,
+ANTHROPIC_* variables, Bedrock, Vertex and Foundry are refused.
+
 Options:
   --users <ids>          Roblox user ids allowed to prompt (required; no default, no wildcard)
   --repo <dir>           the game repo (default: current directory)
@@ -24,7 +27,7 @@ Options:
   --no-deploy            stop after the commit
   --cli <path>           TypeTorch CLI entry used for "deploy" (default: ../cli/src/index.ts, then typetorch on PATH)
   --model <name>         Claude model for the runs (default: your Claude Code default)
-  --max-budget-usd <n>   per-run spend cap passed to claude
+  --max-budget-usd <n>   per-run cap on Claude Code's cost estimate (runs always use your subscription)
   --protect <globs>      extra comma-separated globs Claude may not edit (e.g. files your build script runs);
                          a change to one is committed but not deployed
   --code-ttl <minutes>   lifetime of each pairing code (default 180); a new one is printed when it expires,

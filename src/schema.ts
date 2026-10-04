@@ -1,4 +1,6 @@
 /** Strict request body validation: exact shapes, size caps, unknown fields rejected. */
+import { ATTACHMENT_ID_PATTERN, ATTACHMENT_LIMITS, type AttachmentRequest } from "./attachments";
+import { CONVERSATION_ID_PATTERN } from "./conversations";
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value) && Object.getPrototypeOf(value) === Object.prototype;
@@ -65,15 +67,33 @@ export interface PromptContext {
 export interface PromptRequest {
 	prompt: string;
 	context?: PromptContext;
+	/** Continue this conversation (resume its Claude session); absent = a new conversation. */
+	conversationId?: string;
+	/** Attachment ids from POST /v1/attachments (owned by the requester, unused). */
+	attachments?: string[];
 }
 
-/** `{prompt: string ≤4000, context?: {path?, errors?: string[], artifact?}}`, nothing else. */
+/**
+ * `{prompt: string ≤4000, context?: {path?, errors?: string[], artifact?}, conversationId?: string,
+ * attachments?: string[] (≤4, distinct)}`, nothing else.
+ */
 export function parsePromptRequest(raw: unknown): PromptRequest | undefined {
-	if (!isPlainObject(raw) || !onlyKeys(raw, ["prompt", "context"])) return undefined;
-	const { prompt, context } = raw;
+	if (!isPlainObject(raw) || !onlyKeys(raw, ["prompt", "context", "conversationId", "attachments"])) return undefined;
+	const { prompt, context, conversationId, attachments } = raw;
 	if (typeof prompt !== "string" || prompt.trim().length === 0 || prompt.length > LIMITS.promptChars) return undefined;
 	if (prompt.includes("\u0000")) return undefined;
-	if (context === undefined) return { prompt };
+	const request: PromptRequest = { prompt };
+	if (conversationId !== undefined) {
+		if (typeof conversationId !== "string" || !CONVERSATION_ID_PATTERN.test(conversationId)) return undefined;
+		request.conversationId = conversationId;
+	}
+	if (attachments !== undefined) {
+		if (!Array.isArray(attachments) || attachments.length > ATTACHMENT_LIMITS.perMessage) return undefined;
+		for (const id of attachments) if (typeof id !== "string" || !ATTACHMENT_ID_PATTERN.test(id)) return undefined;
+		if (new Set(attachments).size !== attachments.length) return undefined;
+		if (attachments.length > 0) request.attachments = attachments as string[];
+	}
+	if (context === undefined) return request;
 	if (!isPlainObject(context) || !onlyKeys(context, ["path", "errors", "artifact"])) return undefined;
 	const out: PromptContext = {};
 	if (context.path !== undefined) {
@@ -89,8 +109,22 @@ export function parsePromptRequest(raw: unknown): PromptRequest | undefined {
 		if (typeof context.artifact !== "string" || context.artifact.length > LIMITS.contextArtifactChars) return undefined;
 		out.artifact = context.artifact;
 	}
-	return { prompt, context: out };
+	request.context = out;
+	return request;
+}
+
+/** `{width, height: 1..1024, format: "rgba8", compression: "zstd"|"none", data: base64}`, nothing else. */
+export function parseAttachmentRequest(raw: unknown): AttachmentRequest | undefined {
+	if (!isPlainObject(raw) || !onlyKeys(raw, ["width", "height", "format", "compression", "data"])) return undefined;
+	const { width, height, format, compression, data } = raw;
+	const side = (value: unknown) => typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= ATTACHMENT_LIMITS.maxSide;
+	if (!side(width) || !side(height)) return undefined;
+	if (format !== "rgba8" || (compression !== "zstd" && compression !== "none")) return undefined;
+	if (typeof data !== "string" || data.length === 0) return undefined;
+	return { width: width as number, height: height as number, format, compression, data };
 }
 
 export const NONCE_PATTERN = /^[A-Za-z0-9._:{}-]{8,128}$/;
 export const PROMPT_ID_PATTERN = /^[A-Za-z0-9_-]{22}$/;
+/** ?since=<n> on GET /v1/prompts/:id. */
+export const SINCE_PATTERN = /^\d{1,7}$/;
