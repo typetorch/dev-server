@@ -677,14 +677,11 @@ export function createClaudeRunner(options: ClaudeRunnerOptions): Runner {
 		ctx.log(`deploying: typetorch deploy --branch ${options.ttBranch}`);
 		// --json: stdout carries one JSON document (deployment.artifactId, or proposal.id); human lines go to stderr.
 		// --message: Claude's SUMMARY line, the first "what changed" line of the artifact (an argv element, no shell).
-		// --proposed-by: the dev approves and signs every deploy on their PC (`typetorch approve`); the dev-server only
-		// prepares it (build, upload, moderation, proposal). The CLI never signs for this proposer.
+		// --proposed-by: the dev approves every deploy on their PC (`typetorch approve`); the dev-server only prepares it
+		// (build, upload, moderation, proposal).
 		const message = summary ? ["--message", oneLine(summary.replace(/[\u0000-\u001f\u007f]+/g, " "), 200)] : [];
 		const stateDir = options.stateDir ?? join(wt.repo, ".typetorch");
 		const env = childEnv({ extra: { ...options.deployEnv, TYPETORCH_STATE_DIR: stateDir } });
-		// Defense in depth: the deploy never gets a plaintext signing key or the CI opt-in.
-		delete env.TYPETORCH_SIGNING_KEY;
-		delete env.TYPETORCH_ALLOW_ENV_SIGNING_KEY;
 		const deploy = Bun.spawn([...cli.cmd, "deploy", "--branch", options.ttBranch, "--json", "--proposed-by", "dev-server/claude", ...message], {
 			cwd: wt.path,
 			// The main repo's state dir, passed explicitly: one deployments.jsonl and one seq for every checkout.
@@ -720,14 +717,15 @@ export function createClaudeRunner(options: ClaudeRunnerOptions): Runner {
 		// the terminal gets the command ("deploy: " lines stay at the terminal).
 		ctx.log(`Waiting for your approval on your PC (proposal ${proposalId})`);
 		ctx.log(`deploy: approve it in a terminal on this PC: typetorch approve ${proposalId}   (or: typetorch reject ${proposalId})`);
+		ctx.awaitingApproval?.(proposalId);
 		const decision = await waitForProposal(stateDir, proposalId, signal);
 		if (decision === "cancelled") return { ok: false, error: "cancelled", artifactId };
 		if (decision.status === "approved") {
 			ctx.log(`approved on your PC${decision.seq !== undefined ? `: deploy #${decision.seq}` : ""}`);
 			return { ok: true, artifactId: decision.artifactId ?? artifactId };
 		}
-		if (decision.status === "rejected") return { ok: false, error: "rejected on your PC", artifactId };
-		return { ok: false, error: "the approval expired (24 h)", artifactId };
+		if (decision.status === "rejected") return { ok: false, error: "rejected on your PC", artifactId, approval: "rejected" };
+		return { ok: false, error: "the approval expired (24 h)", artifactId, approval: "expired" };
 	};
 
 	return async (ctx: RunContext): Promise<RunOutcome> => {

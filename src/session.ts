@@ -105,7 +105,7 @@ export async function startRemoteClaude(options: RemoteClaudeOptions): Promise<R
 	const announce = options.announce !== false;
 	const apiKey = settings.first(API_KEY_VARS);
 	addSecret(apiKey?.value);
-	// What the deploy (the TypeTorch CLI) gets: the shared key, any per-job keys, the signing key, and the CLI's own
+	// What the deploy (the TypeTorch CLI) gets: the shared key, any per-job keys, and the CLI's own
 	// env file path. Claude never sees any of them (childEnv allowlist).
 	const deployEnv: Record<string, string> = {};
 	if (apiKey) deployEnv[apiKey.name] = apiKey.value;

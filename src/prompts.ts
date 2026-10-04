@@ -84,9 +84,15 @@ export interface PromptEvent {
 	tiles?: ToolboxTile[];
 }
 
-/** What the queue keeps of a deploy proposal; `actions` are the runner's (never serialized). */
+/**
+ * What the queue keeps of a deploy proposal; `actions` are the runner's (never serialized). After the dev's Deploy tap:
+ * "deploying", then "awaiting_approval" while the CLI's proposal waits for `typetorch approve` on the dev's PC
+ * (`approvalId`: its short id), then "deployed", "rejected", "approval_expired" (24 h) or "failed".
+ */
 export interface Proposal {
-	status: "pending" | "deploying" | "deployed" | "discarded" | "expired" | "failed";
+	status: "pending" | "deploying" | "awaiting_approval" | "deployed" | "discarded" | "expired" | "rejected" | "approval_expired" | "failed";
+	/** The CLI proposal id (8 hex) while it waits for approval on the dev's PC. */
+	approvalId?: string;
 	commit: string;
 	base: string;
 	files: FileChange[];
@@ -100,12 +106,16 @@ export interface Proposal {
 export interface DeployContext {
 	log(line: string): void;
 	signal: AbortSignal;
+	/** The deploy is built and uploaded and now waits for `typetorch approve <id>` on the dev's PC. */
+	awaitingApproval?(id: string): void;
 }
 
 export interface DeployOutcome {
 	ok: boolean;
 	artifactId?: string;
 	error?: string;
+	/** Not deployed because the dev rejected the approval, or it expired. */
+	approval?: "rejected" | "expired";
 }
 
 /** The runner's half of a proposal: deploy or discard the commit (both refuse when the worktree moved since). */
@@ -183,6 +193,7 @@ export interface AttachmentView {
 
 export interface ProposalView {
 	status: Proposal["status"];
+	approvalId?: string;
 	commit: string;
 	expiresAt: number;
 	files: FileChange[];
@@ -434,11 +445,18 @@ export class PromptQueue {
 		this.options.logger.info(`prompt ${record.id.slice(0, 8)} deploy approved by roblox:${record.userId}`);
 		const abort = new AbortController();
 		record.abort = abort;
+		const awaitingApproval = (id: string) => {
+			if (!/^[0-9a-f]{8}$/.test(id) || proposal.status !== "deploying") return;
+			proposal.status = "awaiting_approval";
+			proposal.approvalId = id;
+			this.pushEvent(record, { kind: "status", text: `waiting for approval on your PC (${id})`, state: "building" });
+			this.options.logger.info(`prompt ${record.id.slice(0, 8)} waits for approval: typetorch approve ${id}`);
+		};
 		void proposal.actions
-			.deploy({ log: (line) => this.pushLog(record, line), signal: abort.signal })
+			.deploy({ log: (line) => this.pushLog(record, line), signal: abort.signal, awaitingApproval })
 			.catch((error: Error): DeployOutcome => ({ ok: false, error: error.message }))
 			.then((outcome) => {
-				proposal.status = outcome.ok ? "deployed" : "failed";
+				proposal.status = outcome.ok ? "deployed" : outcome.approval === "rejected" ? "rejected" : outcome.approval === "expired" ? "approval_expired" : "failed";
 				if (!outcome.ok) proposal.error = outcome.error;
 				this.settle(record, outcome.ok ? { state: "deployed", artifactId: outcome.artifactId } : { state: "failed", error: outcome.error ?? "deploy failed", artifactId: outcome.artifactId });
 			});
@@ -521,7 +539,7 @@ export class PromptQueue {
 		}
 		for (const record of this.records.values()) {
 			if (record.proposal?.status === "pending") await this.discardProposal(record, "discarded", "shutdown");
-			else if (record.proposal?.status === "deploying") record.abort.abort();
+			else if (record.proposal?.status === "deploying" || record.proposal?.status === "awaiting_approval") record.abort.abort();
 		}
 	}
 
@@ -531,6 +549,7 @@ export class PromptQueue {
 		const proposal = record.proposal;
 		if (proposal) {
 			view.proposal = { status: proposal.status, commit: proposal.commit, expiresAt: proposal.expiresAt, files: proposal.files };
+			if (proposal.approvalId !== undefined) view.proposal.approvalId = proposal.approvalId;
 			if (proposal.error !== undefined) view.proposal.error = redactEvent(oneLine(proposal.error, 200));
 		}
 		if (record.summary !== undefined) view.summary = record.summary;
