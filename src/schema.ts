@@ -12,12 +12,15 @@ function onlyKeys(value: Record<string, unknown>, allowed: readonly string[]): b
 
 export const LIMITS = {
 	tokenBodyBytes: 1024,
-	promptBodyBytes: 32 * 1024,
+	/** Room for two attached log texts (64 KB each, JSON-escaped). */
+	promptBodyBytes: 320 * 1024,
 	promptChars: 4000,
 	contextPathChars: 1024,
 	contextErrors: 50,
 	contextErrorChars: 4000,
 	contextArtifactChars: 128,
+	/** Each attached log text ("My logs", "Server logs"): about 64 KB, newest lines kept by the game. */
+	contextLogChars: 66_000,
 	/** Non-proxy request headers, total bytes (plans/11: headers over 2 KB are rejected before parsing). */
 	headerBytes: 2048,
 	/** Every header including those Cloudflare adds. */
@@ -58,10 +61,19 @@ export function parseTokenGrant(raw: unknown): TokenGrant | undefined {
 	return undefined;
 }
 
+export interface PromptLogs {
+	/** The requesting developer's client log history. */
+	client?: string;
+	/** The game server's log history. */
+	server?: string;
+}
+
 export interface PromptContext {
 	path?: string;
 	errors?: string[];
 	artifact?: string;
+	/** Untrusted; written to files for the run and dropped (prompts.ts). */
+	logs?: PromptLogs;
 }
 
 export interface PromptRequest {
@@ -71,18 +83,24 @@ export interface PromptRequest {
 	conversationId?: string;
 	/** Attachment ids from POST /v1/attachments (owned by the requester, unused). */
 	attachments?: string[];
+	/** "live" (default) or "code": which tools the run gets (runner.ts). */
+	mode?: "live" | "code";
 }
 
 /**
- * `{prompt: string ≤4000, context?: {path?, errors?: string[], artifact?}, conversationId?: string,
- * attachments?: string[] (≤4, distinct)}`, nothing else.
+ * `{prompt: string ≤4000, mode?: "live"|"code", context?: {path?, errors?: string[], artifact?, logs?: {client?, server?}},
+ * conversationId?: string, attachments?: string[] (≤4, distinct)}`, nothing else.
  */
 export function parsePromptRequest(raw: unknown): PromptRequest | undefined {
-	if (!isPlainObject(raw) || !onlyKeys(raw, ["prompt", "context", "conversationId", "attachments"])) return undefined;
-	const { prompt, context, conversationId, attachments } = raw;
+	if (!isPlainObject(raw) || !onlyKeys(raw, ["prompt", "context", "conversationId", "attachments", "mode"])) return undefined;
+	const { prompt, context, conversationId, attachments, mode } = raw;
 	if (typeof prompt !== "string" || prompt.trim().length === 0 || prompt.length > LIMITS.promptChars) return undefined;
 	if (prompt.includes("\u0000")) return undefined;
 	const request: PromptRequest = { prompt };
+	if (mode !== undefined) {
+		if (mode !== "live" && mode !== "code") return undefined;
+		request.mode = mode;
+	}
 	if (conversationId !== undefined) {
 		if (typeof conversationId !== "string" || !CONVERSATION_ID_PATTERN.test(conversationId)) return undefined;
 		request.conversationId = conversationId;
@@ -94,7 +112,7 @@ export function parsePromptRequest(raw: unknown): PromptRequest | undefined {
 		if (attachments.length > 0) request.attachments = attachments as string[];
 	}
 	if (context === undefined) return request;
-	if (!isPlainObject(context) || !onlyKeys(context, ["path", "errors", "artifact"])) return undefined;
+	if (!isPlainObject(context) || !onlyKeys(context, ["path", "errors", "artifact", "logs"])) return undefined;
 	const out: PromptContext = {};
 	if (context.path !== undefined) {
 		if (typeof context.path !== "string" || context.path.length > LIMITS.contextPathChars) return undefined;
@@ -108,6 +126,18 @@ export function parsePromptRequest(raw: unknown): PromptRequest | undefined {
 	if (context.artifact !== undefined) {
 		if (typeof context.artifact !== "string" || context.artifact.length > LIMITS.contextArtifactChars) return undefined;
 		out.artifact = context.artifact;
+	}
+	if (context.logs !== undefined) {
+		const logs = context.logs;
+		if (!isPlainObject(logs) || !onlyKeys(logs, ["client", "server"])) return undefined;
+		const parsed: PromptLogs = {};
+		for (const realm of ["client", "server"] as const) {
+			const text = logs[realm];
+			if (text === undefined) continue;
+			if (typeof text !== "string" || text.length > LIMITS.contextLogChars || text.includes("\u0000")) return undefined;
+			parsed[realm] = text;
+		}
+		if (parsed.client !== undefined || parsed.server !== undefined) out.logs = parsed;
 	}
 	request.context = out;
 	return request;
@@ -128,3 +158,9 @@ export const NONCE_PATTERN = /^[A-Za-z0-9._:{}-]{8,128}$/;
 export const PROMPT_ID_PATTERN = /^[A-Za-z0-9_-]{22}$/;
 /** ?since=<n> on GET /v1/prompts/:id. */
 export const SINCE_PATTERN = /^\d{1,7}$/;
+
+/** `{decision: "deploy" | "discard"}` for POST /v1/prompts/:id/deploy, nothing else. */
+export function parseDeployDecision(raw: unknown): "deploy" | "discard" | undefined {
+	if (!isPlainObject(raw) || !onlyKeys(raw, ["decision"])) return undefined;
+	return raw.decision === "deploy" || raw.decision === "discard" ? raw.decision : undefined;
+}

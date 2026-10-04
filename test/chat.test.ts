@@ -548,7 +548,7 @@ describe("real runner with a fake claude (stream mapping, resume, answered, bill
 		await waitDone(server, jwt, first.id);
 		const sessionId = server.conversations.owned(first.conversationId!, USERS[31])!.claudeSessionId!;
 		expect(sessionId).toMatch(/^[0-9a-f-]{36}$/);
-		const second = (await (await post(server, jwt, "/v1/prompts", { prompt: "EDIT: use it", conversationId: first.conversationId })).json()) as View;
+		const second = (await (await post(server, jwt, "/v1/prompts", { prompt: "EDIT: use it", conversationId: first.conversationId, mode: "code" })).json()) as View;
 		const done = await waitDone(server, jwt, second.id);
 		expect(runs()[runs().length - 1].resume).toBe(sessionId);
 		expect(done.state).toBe("committed");

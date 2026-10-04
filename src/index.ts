@@ -13,7 +13,11 @@ Usage:
   typetorch-dev-server remote-claude --users <id,id,...> [options]
 
 It prints a pairing code (also copied to the clipboard and saved to <repo>/.typetorch/remote-claude.code).
-Paste it into DEV > Claude in game to pair the server you are in.
+Paste it into DEV > Claude in game to pair the server you are in. Each code pairs one user on one server once;
+the next code is printed as soon as one is used.
+
+In game, Live mode (default) acts on your running server (run_luau with your approval); Code mode edits the branch,
+and you deploy or discard each change from the chat.
 
 remote-claude only runs on your Claude subscription (claude auth login with your Claude.ai account); API keys,
 ANTHROPIC_* variables, Bedrock, Vertex and Foundry are refused.

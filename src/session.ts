@@ -12,7 +12,7 @@ import { checkSubscriptionAuth } from "./billing";
 import { branchChannel, branchFromGit, loadGameConfig } from "./config";
 import { API_KEY_VARS, Settings, childEnv } from "./env";
 import { branchExists, currentBranch, ensureIgnored, ensureWorktree, repoRoot, type Worktree } from "./git";
-import { addEventSecret, addSecret, consoleLogger, type Logger } from "./log";
+import { addEventSecret, addSecret, consoleLogger, setEventPaths, type Logger } from "./log";
 import { run } from "./proc";
 import type { Runner } from "./prompts";
 import { createClaudeRunner, protectedGlobs, resolveCli } from "./runner";
@@ -128,6 +128,8 @@ export async function startRemoteClaude(options: RemoteClaudeOptions): Promise<R
 	// 4. Worktree.
 	const worktree = await ensureWorktree(repo, gitBranch);
 	logger.info(`worktree ${worktree.path} on ${worktree.workBranch}`);
+	// Text relayed to game servers names files relative to the worktree, and never the repo, home folder or username.
+	setEventPaths({ worktree: worktree.path, repo });
 	if (worktree.workBranch !== gitBranch) {
 		logger.info(`"${gitBranch}" is checked out elsewhere, so commits go to ${worktree.workBranch} (git merge ${worktree.workBranch})`);
 	}
@@ -191,22 +193,31 @@ export async function startRemoteClaude(options: RemoteClaudeOptions): Promise<R
 		// Game tools: a wake message per request (no code in it); game servers also poll GET /v1/game/pending.
 		publishWake: apiKey && universeId ? (message) => publishMessage(universeId, apiKey.value, GAME_TOPIC, message, logger) : undefined,
 		onPairingCode: (formatted, reason, expiresAt) => {
-			if (reason === "auto") logger.warn("pairing code rotated automatically after 30 wrong attempts; paired servers keep working");
+			if (reason === "used") logger.info("pairing code used (each code pairs one user on one game server); the next code is below");
 			if (reason === "expired") logger.info("pairing code expired; new code below (paired servers keep working until their refresh token expires)");
+			if (reason === "tunnel") logger.warn("the tunnel restarted with a new URL: every game server must pair again with the code below");
 			publishCode(formatted, expiresAt);
 		},
 	});
 	const { auth } = server;
 
-	// 7. Tunnel + registration.
+	// 7. Tunnel + registration. Pairing is bound to the tunnel URL: the code's fingerprint, the refresh tokens and the
+	// session id all change with it (security audit H1).
 	let tunnel: QuickTunnel | undefined;
+	/** The URL the current session was announced with (the closed message must carry it). */
+	let announcedUrl: string | undefined;
 	const announcer =
 		announce && apiKey && universeId
 			? new Announcer({
 					universeId,
 					apiKey: apiKey.value,
 					logger,
-					current: () => (tunnel?.url ? registrationMessage(auth.sessionId, branch, auth.allowedUsers(), tunnel.url) : undefined),
+					current: () => {
+						const url = tunnel?.url;
+						if (!url || url !== auth.tunnelUrl) return undefined;
+						announcedUrl = url;
+						return registrationMessage(auth.sessionId, branch, auth.allowedUsers(), url);
+					},
 				})
 			: undefined;
 	let started = false;
@@ -217,12 +228,19 @@ export async function startRemoteClaude(options: RemoteClaudeOptions): Promise<R
 			logger,
 			onUrl: (url) => {
 				addEventSecret(url);
-				// A restart: re-announce the new URL as soon as it is reachable.
-				if (started) void tunnel?.waitReachable().then(() => announcer?.announce());
+				if (!started) return;
+				// A restart: a new session bound to the new URL. Close the old session on game servers (with its own URL), then
+				// announce the new one as soon as it is reachable.
+				const oldUrl = announcedUrl;
+				const previous = server.setTunnelUrl(url);
+				if (previous && oldUrl && announcer) void announcer.publish(closedMessage(previous, oldUrl));
+				void tunnel?.waitReachable().then(() => announcer?.announce());
 			},
 		});
 		try {
-			await tunnel.start();
+			const url = await tunnel.start();
+			// Before the code is first shown: its fingerprint covers this URL.
+			server.setTunnelUrl(url);
 			if (!(await tunnel.waitReachable())) logger.warn("the tunnel URL is not reachable yet; announcing anyway");
 		} catch (error) {
 			await server.stop();
@@ -240,7 +258,9 @@ export async function startRemoteClaude(options: RemoteClaudeOptions): Promise<R
 	let closing: Promise<void> | undefined;
 
 	const session: RemoteClaudeSession = {
-		sessionId: auth.sessionId,
+		get sessionId() {
+			return auth.sessionId;
+		},
 		branch,
 		worktree,
 		server,
@@ -270,14 +290,14 @@ export async function startRemoteClaude(options: RemoteClaudeOptions): Promise<R
 				`session ${auth.sessionId.slice(0, 8)}  branch ${branch} (git ${gitBranch}, worktree on ${worktree.workBranch})`,
 				`tunnel ${tunnel?.url ?? (cloudflared ? "(down)" : "(disabled)")}  announce ${announcer ? "on" : "off"}  deploy ${deploy ? (cli ? "on" : "no CLI") : "off"}`,
 				`users ${auth.allowedUsers().join(", ") || "(none)"}  prompts ${q.createdCount}/${options.maxPrompts ?? 50}  queued ${q.queued.length}  running ${active ? `${active.id.slice(0, 8)} (${active.state})` : "-"}`,
-				`pairing code valid for ${formatDuration(server.pairing.expiresAt - clock())} (until ${formatClock(server.pairing.expiresAt, clock())})  code attempts ${server.pairing.isBlocked() ? "blocked (too many failures)" : "open"}  refresh tokens ${auth.refreshTokenCount()}`,
+				`pairing code valid for ${formatDuration(server.pairing.expiresAt - clock())} (until ${formatClock(server.pairing.expiresAt, clock())}, single use)  wrong codes ${server.lockout.total} (${server.lockout.lockedCount()} user+server pairs locked)  paired servers ${auth.refreshTokenCount()}`,
 			].join("\n");
 		},
 		close() {
 			closing ??= (async () => {
 				logger.info("closing session…");
 				announcer?.stop();
-				const closedSent = announcer ? announcer.publish(closedMessage(auth.sessionId)) : Promise.resolve(false);
+				const closedSent = announcer && announcedUrl ? announcer.publish(closedMessage(auth.sessionId, announcedUrl)) : Promise.resolve(false);
 				await server.stop();
 				tunnel?.stop();
 				rmSync(codeFile, { force: true });

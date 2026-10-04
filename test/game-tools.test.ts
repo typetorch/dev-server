@@ -69,8 +69,8 @@ const postHeaders = (jwt: string, job = JOB) => ({
 });
 const get = (jwt: string, path: string, job = JOB) => fetch(`${srv.localUrl}${path}`, { headers: { authorization: `Bearer ${jwt}`, "x-tt-job": job } });
 
-async function prompt(jwt: string, calls: unknown[]): Promise<string> {
-	const res = await fetch(`${srv.localUrl}/v1/prompts`, { method: "POST", headers: postHeaders(jwt), body: JSON.stringify({ prompt: JSON.stringify(calls) }) });
+async function prompt(jwt: string, calls: unknown[], mode?: "live" | "code"): Promise<string> {
+	const res = await fetch(`${srv.localUrl}/v1/prompts`, { method: "POST", headers: postHeaders(jwt), body: JSON.stringify({ prompt: JSON.stringify(calls), mode }) });
 	expect(res.status).toBe(200);
 	return ((await res.json()) as { id: string }).id;
 }
@@ -150,6 +150,21 @@ describe("game tools over MCP", () => {
 		const wake = JSON.parse(wakes[wakes.length - 1]);
 		expect(wake).toEqual({ v: 1, s: srv.auth.sessionId, j: JOB, x: handled[0].id, u: USERS[0] });
 		expect(wakes[wakes.length - 1]).not.toContain("print");
+	});
+
+	test("code mode: the MCP server lists no run_luau and refuses it, whatever the run's tool rules say", async () => {
+		const jwt = await pair(USERS[7]);
+		const id = await prompt(jwt, [{ name: "run_luau", arguments: { code: "return 1" } }, { name: "game_status", arguments: {} }], "code");
+		const handled = await fakeGame(jwt, () => ({ ok: true, data: "{}" }));
+		await waitDone(jwt, id);
+		const replies = seen.get(id)!;
+		const tools = (replies[1] as { result: { tools: { name: string }[] } }).result.tools.map((t) => t.name);
+		expect(tools).toEqual(["game_logs", "inspect", "find", "game_status", "screenshot"]);
+		const refused = toolText(replies[2]);
+		expect(refused.isError).toBe(true);
+		expect(refused.content[0].text).toContain("only available in Live mode");
+		expect(handled.map((h) => h.tool)).toEqual(["game_status"]); // run_luau never reached the game server
+		expect(toolText(replies[3]).isError).toBe(false);
 	});
 
 	test("read tools: arguments validated and forwarded; game data can't close its untrusted block", async () => {
@@ -286,10 +301,19 @@ describe("helpers", () => {
 		const without = claudeArgs({}, "sys");
 		expect(without).not.toContain("--mcp-config");
 		expect(without[without.indexOf("--allowedTools") + 1]).not.toContain("mcp__");
-		const withMcp = claudeArgs({}, "sys", undefined, "C:/tmp/mcp.json");
+		const withMcp = claudeArgs({}, "sys", { mcpConfigFile: "C:/tmp/mcp.json" });
 		expect(withMcp[withMcp.indexOf("--mcp-config") + 1]).toBe("C:/tmp/mcp.json");
 		expect(withMcp[withMcp.indexOf("--allowedTools") + 1]).toContain("mcp__typetorch-game__run_luau");
 		expect(withMcp).toContain("--strict-mcp-config");
+		// Live (the default): no Edit/Write/Bash at all. Code: file tools and exactly `bun run build`, no run_luau.
+		const value = (args: string[], flag: string) => args[args.indexOf(flag) + 1];
+		expect(value(withMcp, "--tools")).toBe("Read,Glob,Grep");
+		expect(value(withMcp, "--allowedTools")).not.toMatch(/Edit|Write|Bash/);
+		const code = claudeArgs({}, "sys", { mode: "code", mcpConfigFile: "C:/tmp/mcp.json" });
+		expect(value(code, "--tools")).toBe("Read,Edit,Write,Glob,Grep,Bash");
+		expect(value(code, "--allowedTools").split(",").filter((rule) => rule.startsWith("Bash"))).toEqual(["Bash(bun run build)"]);
+		expect(value(code, "--allowedTools")).not.toContain("run_luau");
+		expect(value(code, "--allowedTools")).toContain("mcp__typetorch-game__inspect");
 		expect(toolTarget("mcp__typetorch-game__run_luau", { code: "print(1)", description: "Say one" }, "C:/w")).toBe("Say one");
 		expect(toolTarget("mcp__typetorch-game__inspect", { path: "Workspace.Map", realm: "client" }, "C:/w")).toBe("client Workspace.Map");
 		expect(summarizeToolResult("mcp__typetorch-game__run_luau", { content: [{ type: "text", text: "ok (4 ms)\n<untrusted-game-data>..." }] })).toBe("ok (4 ms)");

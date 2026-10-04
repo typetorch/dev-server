@@ -7,7 +7,7 @@
  * never printed; only variable names and file paths are.
  */
 import { existsSync, readFileSync, readdirSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { delimiter, dirname, join, resolve } from "node:path";
 
 export function parseDotEnv(text: string): Record<string, string> {
 	const values: Record<string, string> = {};
@@ -227,5 +227,16 @@ export function childEnv(options: { forClaude?: boolean; extra?: Record<string, 
 		env[key] = value;
 	}
 	env.GIT_TERMINAL_PROMPT = "0";
+	// Claude's one allowed command is `bun run build`: make sure `bun` resolves to the Bun running this server.
+	if (options.forClaude) prependPath(env, dirname(process.execPath));
 	return { ...env, ...(options.extra ?? {}) };
+}
+
+/** Puts `dir` first on PATH (whatever case the variable has, as on Windows), unless it is already there. */
+export function prependPath(env: Record<string, string>, dir: string): void {
+	const key = Object.keys(env).find((name) => name.toUpperCase() === "PATH") ?? "PATH";
+	const parts = (env[key] ?? "").split(delimiter).filter(Boolean);
+	const same = (a: string) => (process.platform === "win32" ? a.toLowerCase() === dir.toLowerCase() : a === dir);
+	if (parts.some(same)) return;
+	env[key] = [dir, ...parts].join(delimiter);
 }

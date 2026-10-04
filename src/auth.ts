@@ -2,10 +2,23 @@
  * Credentials:
  *   - the pairing code (see pairing.ts) is exchanged at POST /v1/token for an access token plus a refresh token;
  *   - refresh tokens are 32 random bytes (base64url), kept server-side only as SHA-256 hashes, bound to one user, one
- *     game server (JobId), this session and the user's token version; they last 12 hours (or until the session ends);
+ *     game server (JobId), this session, the tunnel URL they were issued through and the user's token version. They
+ *     rotate on every use: a refresh grant returns a new refresh token and the old one stops working. Presenting an
+ *     already-rotated token again (reuse) revokes the whole family, so a copied token dies the moment either copy is
+ *     used after the other (security audit M5). A family lives at most 12 hours from pairing (or the code lifetime);
+ *     rotation never extends it. A new pairing of the same (user, job) replaces the old family;
  *   - access tokens are HS256 JWTs (jose), 5 minutes, bound to one user, one game server (JobId), this session and
  *     this branch, signed with a 256-bit key generated in memory at session start (never written or logged).
  * Claims are re-checked against the live session on every use, so `revoke` and `rotate` take effect immediately.
+ *
+ * What "bound to a JobId" means: the dev server can't verify a game server's JobId on its own (Roblox doesn't sign or
+ * attest outgoing HttpService requests). The job is fixed when the single-use code is redeemed, every refresh must
+ * present the same job, the JWT carries it, and every request's X-TT-Job header must equal it. So a token works for
+ * one job only, but whoever holds a valid refresh token can claim that job. Tokens never leave the game server's
+ * memory, and rotation with reuse detection turns a copied token into a revoked pairing as soon as both copies are used.
+ *
+ * A tunnel restart (new URL) re-keys the session (`rekey`): a new session id and signing key, and every refresh token
+ * dies, so each game server pairs again with the new code (whose fingerprint covers the new URL).
  */
 import { createHash } from "node:crypto";
 import { SignJWT, jwtVerify, type JWTPayload } from "jose";
@@ -32,13 +45,21 @@ export function newSigningKey(): Uint8Array {
 
 const hashToken = (token: string) => createHash("sha256").update(token, "utf8").digest("hex");
 
-interface RefreshRecord {
+/** One pairing: the chain of refresh tokens issued to (user, job) since the code was redeemed. */
+interface RefreshFamily {
+	id: string;
 	userId: number;
 	job: string;
 	sid: string;
+	/** The tunnel URL the pairing came through ("" without a tunnel). */
+	url: string;
 	ver: number;
-	/** Unix seconds. */
+	/** Unix seconds; fixed at pairing (rotation never extends it). */
 	expiresAt: number;
+	/** Hash of the one token that works now. */
+	current: string;
+	/** Hashes of every token rotated out (reuse detection). */
+	used: Set<string>;
 }
 
 interface UserState {
@@ -60,13 +81,19 @@ export type VerifyResult =
 	| { ok: true; userId: number; claims: Claims }
 	| { ok: false; status: 401 | 403; reason: string; userId?: number; jti?: string };
 
+export type RefreshResult =
+	| { ok: true; token: string; expiresIn: number }
+	| { ok: false; reason: "unknown" | "expired" | "binding" | "reuse" | "limited"; userId?: number; job?: string };
+
 export class SessionAuth {
-	readonly sessionId: string;
+	private sid: string;
 	readonly branch: string;
 	private key: Uint8Array;
+	private url = "";
 	private readonly users = new Map<number, UserState>();
-	/** SHA-256(refresh token) → binding. The tokens themselves are never stored. */
-	private readonly refresh = new Map<string, RefreshRecord>();
+	private readonly families = new Map<string, RefreshFamily>();
+	/** SHA-256(refresh token, current or rotated out) → family id. The tokens themselves are never stored. */
+	private readonly tokenIndex = new Map<string, string>();
 	/** Refresh token lifetime: 12 h at most, and never longer than a pairing code lives (the server passes that in). */
 	readonly refreshTtlSeconds: number;
 	private readonly clock: () => number;
@@ -74,14 +101,29 @@ export class SessionAuth {
 	constructor(options: { branch: string; users: number[]; sessionId?: string; signingKey?: Uint8Array; refreshTtlSeconds?: number; now?: () => number }) {
 		this.refreshTtlSeconds = Math.min(REFRESH_TTL_SECONDS, Math.max(1, Math.floor(options.refreshTtlSeconds ?? REFRESH_TTL_SECONDS)));
 		this.clock = options.now ?? Date.now;
-		this.sessionId = options.sessionId ?? newSessionId();
+		this.sid = options.sessionId ?? newSessionId();
 		this.branch = options.branch;
 		this.key = options.signingKey ?? newSigningKey();
 		for (const id of options.users) this.users.set(id, { ver: 1, revoked: false });
 	}
 
+	/** Random 128-bit hex; changes when the tunnel URL changes (`rekey`). */
+	get sessionId(): string {
+		return this.sid;
+	}
+
 	get audience(): string {
-		return `${ISSUER}/${this.sessionId}`;
+		return `${ISSUER}/${this.sid}`;
+	}
+
+	/** The tunnel URL refresh tokens are bound to ("" before there is a tunnel). */
+	get tunnelUrl(): string {
+		return this.url;
+	}
+
+	/** The first tunnel URL (startup): binds the tokens issued from now on. Use `rekey` when it changes. */
+	bindUrl(url: string): void {
+		this.url = url;
 	}
 
 	/** Allowed and not revoked. */
@@ -104,44 +146,95 @@ export class SessionAuth {
 		if (!state) return false;
 		state.revoked = true;
 		state.ver += 1;
-		for (const [hash, record] of this.refresh) if (record.userId === userId) this.refresh.delete(hash);
+		for (const family of [...this.families.values()]) if (family.userId === userId) this.dropFamily(family);
 		return true;
 	}
 
 	/** A new signing key and no refresh tokens: every token issued so far stops working. */
 	rotate(): void {
 		this.key = newSigningKey();
-		this.refresh.clear();
+		this.families.clear();
+		this.tokenIndex.clear();
 	}
 
-	/** A new refresh token for (user, job, this session, the user's current token version). */
+	/**
+	 * The tunnel URL changed: a new session id and signing key, and no refresh tokens. Game servers see a new session
+	 * and pair again (the old session id stays bound to the old URL there). Returns the previous session id.
+	 */
+	rekey(url: string): string {
+		const previous = this.sid;
+		this.sid = newSessionId();
+		this.url = url;
+		this.rotate();
+		return previous;
+	}
+
+	/** A new refresh token family for (user, job, this session, this URL, the user's current token version). */
 	issueRefresh(userId: number, job: string): { token: string; expiresIn: number } {
 		const state = this.users.get(userId);
 		if (!state || state.revoked) throw new Error("user not allowed");
 		const now = Math.floor(this.clock() / 1000);
-		for (const [hash, record] of this.refresh) if (record.expiresAt <= now) this.refresh.delete(hash);
+		for (const family of [...this.families.values()]) {
+			// Expired families go; so does an earlier pairing of the same user on the same game server.
+			if (family.expiresAt <= now || (family.userId === userId && family.job === job)) this.dropFamily(family);
+		}
 		const token = randomId(32);
-		this.refresh.set(hashToken(token), { userId, job, sid: this.sessionId, ver: state.ver, expiresAt: now + this.refreshTtlSeconds });
+		const family: RefreshFamily = {
+			id: randomId(),
+			userId,
+			job,
+			sid: this.sid,
+			url: this.url,
+			ver: state.ver,
+			expiresAt: now + this.refreshTtlSeconds,
+			current: hashToken(token),
+			used: new Set(),
+		};
+		this.families.set(family.id, family);
+		this.tokenIndex.set(family.current, family.id);
 		return { token, expiresIn: this.refreshTtlSeconds };
 	}
 
-	/** Seconds left on a refresh token that matches (user, job, session, current version), or undefined. */
-	checkRefresh(token: string, userId: number, job: string): number | undefined {
-		const record = this.refresh.get(hashToken(token));
+	/**
+	 * Redeems a refresh token: on success it is rotated out and a new one returned (same family, same expiry). A token
+	 * that was already rotated out revokes its family ("reuse").
+	 */
+	redeemRefresh(token: string, userId: number, job: string, admit: () => boolean = () => true): RefreshResult {
+		const hash = hashToken(token);
+		const familyId = this.tokenIndex.get(hash);
+		const family = familyId !== undefined ? this.families.get(familyId) : undefined;
+		if (!family) return { ok: false, reason: "unknown" };
+		if (hash !== family.current) {
+			this.dropFamily(family);
+			return { ok: false, reason: "reuse", userId: family.userId, job: family.job };
+		}
 		const now = Math.floor(this.clock() / 1000);
-		if (!record) return undefined;
-		if (record.expiresAt <= now) {
-			this.refresh.delete(hashToken(token));
-			return undefined;
+		if (family.expiresAt <= now) {
+			this.dropFamily(family);
+			return { ok: false, reason: "expired" };
 		}
 		const state = this.users.get(userId);
-		if (!state || state.revoked || record.ver !== state.ver) return undefined;
-		if (record.userId !== userId || record.job !== job || record.sid !== this.sessionId) return undefined;
-		return record.expiresAt - now;
+		if (!state || state.revoked || family.ver !== state.ver) return { ok: false, reason: "binding" };
+		if (family.userId !== userId || family.job !== job || family.sid !== this.sid || family.url !== this.url) return { ok: false, reason: "binding" };
+		// Rate limits run here: after the checks (bad tokens can't use up a user's budget), before the rotation (a refused
+		// request never leaves the game holding a token that was rotated out).
+		if (!admit()) return { ok: false, reason: "limited" };
+		const next = randomId(32);
+		family.used.add(family.current);
+		family.current = hashToken(next);
+		this.tokenIndex.set(family.current, family.id);
+		return { ok: true, token: next, expiresIn: family.expiresAt - now };
 	}
 
+	/** Live pairings (refresh token families). */
 	refreshTokenCount(): number {
-		return this.refresh.size;
+		return this.families.size;
+	}
+
+	private dropFamily(family: RefreshFamily): void {
+		this.families.delete(family.id);
+		this.tokenIndex.delete(family.current);
+		for (const hash of family.used) this.tokenIndex.delete(hash);
 	}
 
 	async issue(userId: number, job: string): Promise<{ token: string; jti: string; exp: number }> {
@@ -151,7 +244,7 @@ export class SessionAuth {
 		const jti = randomId();
 		const exp = iat + TOKEN_TTL_SECONDS;
 		const token = await new SignJWT({
-			sid: this.sessionId,
+			sid: this.sid,
 			job,
 			branch: this.branch,
 			scope: SCOPES.join(" "),
@@ -201,7 +294,7 @@ export class SessionAuth {
 		) {
 			return { ok: false, status: 401, reason: "claim types", jti };
 		}
-		if (claims.sid !== this.sessionId) return { ok: false, status: 401, reason: "sid", jti };
+		if (claims.sid !== this.sid) return { ok: false, status: 401, reason: "sid", jti };
 		const match = /^roblox:([1-9]\d{0,18})$/.exec(claims.sub);
 		const userId = match ? Number(match[1]) : NaN;
 		if (!Number.isSafeInteger(userId)) return { ok: false, status: 401, reason: "sub", jti };

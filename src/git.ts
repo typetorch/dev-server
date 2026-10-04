@@ -142,6 +142,44 @@ export async function syncWorktree(wt: Worktree): Promise<string> {
 	return git(wt.path, ["rev-parse", "HEAD"]);
 }
 
+/** Drops uncommitted changes and untracked files only (no merge): live runs while a deploy proposal is pending. */
+export async function resetWorktree(wt: Worktree): Promise<string> {
+	await git(wt.path, ["reset", "--hard", "--quiet"]);
+	await git(wt.path, ["clean", "-fd", "--quiet"]);
+	return git(wt.path, ["rev-parse", "HEAD"]);
+}
+
+/** The worktree's HEAD commit. */
+export function worktreeHead(wt: Worktree): Promise<string> {
+	return git(wt.path, ["rev-parse", "HEAD"]);
+}
+
+/** Moves the work branch back to `commit` (a discarded deploy proposal); the dropped commit stays in the reflog. */
+export async function resetWorktreeTo(wt: Worktree, commit: string): Promise<void> {
+	if (!/^[0-9a-f]{40}$/.test(commit)) throw new GitError("bad commit");
+	await git(wt.path, ["reset", "--hard", "--quiet", commit]);
+	await git(wt.path, ["clean", "-fd", "--quiet"]);
+}
+
+export interface FileChange {
+	path: string;
+	/** Lines added and removed (-1 for binary files). */
+	added: number;
+	removed: number;
+}
+
+/** Changed files between two commits with their line counts (`git diff --numstat`). */
+export async function diffStat(wt: Worktree, from: string, to: string): Promise<FileChange[]> {
+	const out = await git(wt.path, ["diff", "--numstat", "-z", "--no-renames", from, to]);
+	const changes: FileChange[] = [];
+	for (const entry of out.split("\0")) {
+		const m = /^(-|\d+)\t(-|\d+)\t(.+)$/s.exec(entry.trim());
+		if (!m) continue;
+		changes.push({ path: m[3], added: m[1] === "-" ? -1 : Number(m[1]), removed: m[2] === "-" ? -1 : Number(m[2]) });
+	}
+	return changes;
+}
+
 export async function changedFiles(wt: Worktree): Promise<string[]> {
 	await git(wt.path, ["add", "-A"]);
 	const out = await git(wt.path, ["diff", "--cached", "--name-only", "-z"]);

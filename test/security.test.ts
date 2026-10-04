@@ -8,10 +8,10 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SignJWT, decodeJwt, decodeProtectedHeader } from "jose";
-import { ISSUER, REFRESH_TTL_SECONDS } from "../src/auth";
+import { ISSUER, REFRESH_TTL_SECONDS, SessionAuth } from "../src/auth";
 import { closedMessage, registrationMessage } from "../src/announce";
 import { silentLogger } from "../src/log";
-import { CODE_ALPHABET, DEFAULT_CODE_TTL_MS, PairingCode, generateCode, normalizeCode } from "../src/pairing";
+import { CODE_ALPHABET, DEFAULT_CODE_TTL_MS, PairingCode, PairingLockout, codeMatchesHost, fingerprint, formatCode, generateCode, normalizeCode, tunnelHost } from "../src/pairing";
 import type { Runner } from "../src/prompts";
 import { isProtectedPath, wrapPrompt } from "../src/runner";
 import { createRemoteClaudeServer, type RemoteClaudeServer } from "../src/server";
@@ -24,6 +24,8 @@ const JOB = "6f1c2b9e-3d4a-4b8c-9e7f-0a1b2c3d4e5f";
 const BRANCH = "dev";
 const USERS = Array.from({ length: 60 }, (_, i) => 1000 + i);
 const OUTSIDER = 999;
+/** fingerprint("ABCDEFGHJKLMNPQRSTUV", "abc-def.trycloudflare.com"); framework/src/devtools/sha256.ts must agree. */
+const FINGERPRINT_VECTOR = "T4SP";
 let nextUser = 2;
 /** A fresh allowed user per test, so the 6-tokens-per-minute limit never couples tests. */
 const user = () => USERS[nextUser++];
@@ -143,6 +145,7 @@ describe("startup", () => {
 		expect(CODE_ALPHABET).toHaveLength(32);
 		for (const ambiguous of ["0", "O", "1", "I"]) expect(CODE_ALPHABET).not.toContain(ambiguous);
 		expect(srv.pairing.formatted).toMatch(/^([A-Z2-9]{4}-){5}[A-Z2-9]{4}$/);
+		expect(codeMatchesHost(srv.pairing.raw, "")).toBe(true); // no tunnel yet: the fingerprint covers ""
 		expect(normalizeCode(" abcd-efgh ijkl ")).toBe("ABCDEFGHIJKL");
 	});
 
@@ -262,13 +265,13 @@ describe("POST /v1/token: code grant", () => {
 		expect((await tokenRequest(srv, { ...legacy, grant: "password", code: srv.pairing.formatted })).status).toBe(401);
 	});
 
-	test("wrong code → 401 and the session's failure counter goes up", async () => {
+	test("wrong code → 401 and the (user, job) failure counter goes up", async () => {
 		const own = newServer();
 		try {
 			expect((await tokenRequest(own, codeGrant(own, USERS[0], { code: generateCode() }))).status).toBe(401);
 			expect((await tokenRequest(own, codeGrant(own, USERS[0], { code: "" }))).status).toBe(401); // schema, not counted
 			expect((await tokenRequest(own, codeGrant(own, USERS[0], { code: own.pairing.raw.slice(0, 23) }))).status).toBe(401);
-			expect(own.pairing.failureCount).toBe(2);
+			expect(own.lockout.total).toBe(2);
 		} finally {
 			await own.stop();
 		}
@@ -281,7 +284,26 @@ describe("POST /v1/token: code grant", () => {
 			expect((await tokenRequest(own, codeGrant(own, USERS[0], { sid: "0".repeat(32), code: generateCode() }))).status).toBe(401);
 			expect((await tokenRequest(own, codeGrant(own, USERS[0], { branch: "prod", code: generateCode() }))).status).toBe(401);
 			expect((await tokenRequest(own, codeGrant(own, OUTSIDER, { code: generateCode() }))).status).toBe(401);
-			expect(own.pairing.failureCount).toBe(0);
+			expect(own.lockout.total).toBe(0);
+		} finally {
+			await own.stop();
+		}
+	});
+
+	test("single use: a redeemed code never works again; the next code is printed and works", async () => {
+		const rotated: string[] = [];
+		const own = newServer({ onPairingCode: (code, reason) => rotated.push(`${reason}:${code}`) });
+		try {
+			const first = own.pairing.formatted;
+			expect((await tokenRequest(own, codeGrant(own, USERS[0], { code: first }))).status).toBe(200);
+			const second = own.pairing.formatted;
+			expect(second).not.toBe(first);
+			expect(rotated).toEqual([`used:${second}`]);
+			// The same code again: another user, another server, the same pair — all refused.
+			expect((await tokenRequest(own, codeGrant(own, USERS[1], { code: first }))).status).toBe(401);
+			expect((await tokenRequest(own, codeGrant(own, USERS[0], { code: first, job: "another-job" }))).status).toBe(401);
+			expect((await tokenRequest(own, codeGrant(own, USERS[0], { code: first }))).status).toBe(401);
+			expect((await tokenRequest(own, codeGrant(own, USERS[1], { code: second }))).status).toBe(200);
 		} finally {
 			await own.stop();
 		}
@@ -298,66 +320,128 @@ describe("POST /v1/token: code grant", () => {
 
 	test("at most 6 tokens per user per minute (code and refresh grants together)", async () => {
 		const u = user();
-		const first = await pair(srv, u);
-		for (let i = 0; i < 4; i++) expect((await tokenRequest(srv, codeGrant(srv, u))).status).toBe(200);
-		expect((await tokenRequest(srv, refreshGrant(srv, u, first.refresh_token))).status).toBe(200);
+		let last = await pair(srv, u);
+		for (let i = 0; i < 4; i++) last = await pair(srv, u);
+		const refreshed = await tokenRequest(srv, refreshGrant(srv, u, last.refresh_token));
+		expect(refreshed.status).toBe(200);
+		const next = ((await refreshed.json()) as TokenResponse).refresh_token;
+		const codeBefore = srv.pairing.formatted;
 		expect((await tokenRequest(srv, codeGrant(srv, u))).status).toBe(429);
-		expect((await tokenRequest(srv, refreshGrant(srv, u, first.refresh_token))).status).toBe(429);
+		expect(srv.pairing.formatted).toBe(codeBefore); // a rate-limited code grant doesn't spend the code
+		expect((await tokenRequest(srv, refreshGrant(srv, u, next))).status).toBe(429);
+		// A rate-limited refresh doesn't rotate the token: it is still the family's current one (not a reuse).
+		expect(srv.auth.redeemRefresh(next, u, JOB).ok).toBe(true);
 	});
 
-	test("brute force: more than 10 wrong codes in a minute → 429 for code grants (even the right code); refresh still works", async () => {
+	test("lockout per (user, job): 5 wrong codes lock that pair only; the code is not rotated; others pair fine", async () => {
 		const own = newServer();
 		try {
 			const paired = await pair(own, USERS[1]);
-			for (let i = 0; i < 10; i++) expect((await tokenRequest(own, codeGrant(own, USERS[0], { code: generateCode() }))).status).toBe(401);
-			expect(own.pairing.isBlocked()).toBe(false);
-			expect((await tokenRequest(own, codeGrant(own, USERS[0], { code: generateCode() }))).status).toBe(401); // the 11th trips the block
-			expect(own.pairing.isBlocked()).toBe(true);
+			const code = own.pairing.formatted;
+			for (let i = 0; i < 4; i++) expect((await tokenRequest(own, codeGrant(own, USERS[0], { code: generateCode() }))).status).toBe(401);
+			expect(own.lockout.isLocked(USERS[0], JOB)).toBe(false);
+			expect((await tokenRequest(own, codeGrant(own, USERS[0], { code: generateCode() }))).status).toBe(401); // the 5th locks
+			expect(own.lockout.isLocked(USERS[0], JOB)).toBe(true);
+			// Locked: even the right code is refused for that pair, without being checked or spent.
 			expect((await tokenRequest(own, codeGrant(own, USERS[0]))).status).toBe(429);
-			expect((await tokenRequest(own, codeGrant(own, USERS[0], { code: generateCode() }))).status).toBe(429);
+			expect(own.pairing.formatted).toBe(code);
+			// No global effect: the same user on another server, and another user on this server, still pair.
+			expect((await tokenRequest(own, codeGrant(own, USERS[0], { job: "other-server" }))).status).toBe(200);
+			expect((await tokenRequest(own, codeGrant(own, USERS[2]))).status).toBe(200);
 			expect((await tokenRequest(own, refreshGrant(own, USERS[1], paired.refresh_token))).status).toBe(200);
 		} finally {
 			await own.stop();
 		}
 	});
 
-	test("the block lasts 60 s; more than 30 failures in total rotate the code automatically", () => {
-		const rotations: string[] = [];
-		const pairing = new PairingCode((_, reason) => rotations.push(reason));
-		const original = pairing.raw;
-		let t = 1_000_000;
-		for (let i = 0; i < 11; i++) pairing.fail(t);
-		expect(pairing.isBlocked(t)).toBe(true);
-		expect(pairing.isBlocked(t + 59_999)).toBe(true);
-		expect(pairing.isBlocked(t + 60_000)).toBe(false);
-		// Spread the rest out so the per-minute block is not what stops them.
-		for (let i = 0; i < 19; i++) pairing.fail((t += 10_000));
-		expect(pairing.failureCount).toBe(30);
-		expect(rotations).toEqual([]);
-		const last = pairing.fail((t += 10_000));
-		expect(last.rotated).toBe(true);
-		expect(rotations).toEqual(["auto"]);
-		expect(pairing.raw).not.toBe(original);
-		expect(pairing.matches(original)).toBe(false);
-		expect(pairing.matches(pairing.formatted)).toBe(true);
-		expect(pairing.failureCount).toBe(0);
+	test("many wrong codes from many jobs never rotate the code or block anyone else", async () => {
+		const rotated: string[] = [];
+		const own = newServer({ onPairingCode: (_, reason) => rotated.push(reason) });
+		try {
+			const code = own.pairing.formatted;
+			for (let i = 0; i < 40; i++) expect((await tokenRequest(own, codeGrant(own, USERS[0], { job: `job-${i}`, code: generateCode() }))).status).toBe(401);
+			expect(own.lockout.total).toBe(40);
+			expect(rotated).toEqual([]);
+			expect(own.pairing.formatted).toBe(code);
+			expect((await tokenRequest(own, codeGrant(own, USERS[0]))).status).toBe(200);
+		} finally {
+			await own.stop();
+		}
 	});
 
-	test("auto-rotation over HTTP: the old code stops working, the new one works, paired servers keep refreshing", async () => {
+	test("PairingLockout: the lock lasts 15 min; failures spread over more than 10 min don't lock", () => {
+		const lockout = new PairingLockout();
+		let t = 1_000_000;
+		for (let i = 0; i < 4; i++) expect(lockout.fail(1, "a", (t += 1000)).locked).toBe(false);
+		expect(lockout.fail(1, "a", (t += 1000)).locked).toBe(true);
+		expect(lockout.isLocked(1, "a", t + 15 * 60_000 - 1)).toBe(true);
+		expect(lockout.isLocked(1, "a", t + 15 * 60_000)).toBe(false);
+		expect(lockout.isLocked(1, "b", t)).toBe(false);
+		expect(lockout.isLocked(2, "a", t)).toBe(false);
+		// One failure every 3 minutes: never 5 within 10 minutes.
+		for (let i = 0; i < 10; i++) expect(lockout.fail(3, "a", (t += 3 * 60_000)).locked).toBe(false);
+		// A good code clears the pair.
+		lockout.fail(4, "a", t);
+		lockout.clear(4, "a");
+		for (let i = 0; i < 4; i++) lockout.fail(4, "a", t);
+		expect(lockout.isLocked(4, "a", t)).toBe(false);
+		// A flood of distinct keys stays bounded.
+		const small = new PairingLockout({ maxKeys: 50 });
+		for (let i = 0; i < 500; i++) small.fail(1, `job-${i}`, t);
+		expect(small.total).toBe(500);
+	});
+});
+
+describe("tunnel binding (audit H1)", () => {
+	test("the last 4 code characters are an HMAC fingerprint of the tunnel hostname", () => {
+		const host = "able-baker-charlie.trycloudflare.com";
+		const code = generateCode(host);
+		expect(code).toHaveLength(24);
+		expect(code.slice(20)).toBe(fingerprint(code.slice(0, 20), host));
+		expect(codeMatchesHost(formatCode(code).toLowerCase(), host)).toBe(true);
+		expect(codeMatchesHost(code, "evil-twin-host.trycloudflare.com")).toBe(false);
+		expect(tunnelHost("https://Able-Baker-Charlie.trycloudflare.com/")).toBe(host);
+		// Known answer (the game's Luau implementation is checked against the same vector).
+		expect(fingerprint("ABCDEFGHJKLMNPQRSTUV", "abc-def.trycloudflare.com")).toBe(FINGERPRINT_VECTOR);
+	});
+
+	test("startup binds silently; a new URL re-keys the session: new sid and code, old tokens dead", async () => {
 		const rotated: string[] = [];
 		const own = newServer({ onPairingCode: (code, reason) => rotated.push(`${reason}:${code}`) });
 		try {
-			const paired = await pair(own, USERS[1]);
-			const old = own.pairing.formatted;
-			for (let i = 0; i < 30; i++) own.pairing.fail(Date.now() - 3_600_000 + i * 61_000); // 30 failures, spread out (no block)
-			expect((await tokenRequest(own, codeGrant(own, USERS[0], { code: generateCode() }))).status).toBe(401); // the 31st
-			expect(rotated).toEqual([`auto:${own.pairing.formatted}`]);
-			expect((await tokenRequest(own, codeGrant(own, USERS[0], { code: old }))).status).toBe(401);
+			const first = "https://first-tunnel-name.trycloudflare.com";
+			expect(own.setTunnelUrl(first)).toBeUndefined();
+			expect(rotated).toEqual([]);
+			expect(codeMatchesHost(own.pairing.raw, tunnelHost(first))).toBe(true);
+			expect(own.setTunnelUrl(first)).toBeUndefined(); // same URL: nothing changes
+			const sid = own.auth.sessionId;
+			const paired = await pair(own, USERS[0]);
+			const second = "https://second-tunnel-name.trycloudflare.com";
+			expect(own.setTunnelUrl(second)).toBe(sid);
+			expect(own.auth.sessionId).not.toBe(sid);
+			expect(rotated[rotated.length - 1]).toBe(`tunnel:${own.pairing.formatted}`);
+			expect(codeMatchesHost(own.pairing.raw, tunnelHost(second))).toBe(true);
+			expect(codeMatchesHost(own.pairing.raw, tunnelHost(first))).toBe(false);
+			// The old refresh token (old session, old URL) and the old JWT (old audience) are dead.
+			expect((await tokenRequest(own, refreshGrant(own, USERS[0], paired.refresh_token))).status).toBe(401);
+			expect((await tokenRequest(own, refreshGrant(own, USERS[0], paired.refresh_token, { sid }))).status).toBe(401);
+			expect((await getPrompt(paired.access_token, UNKNOWN_ID, JOB, own)).status).toBe(401);
+			// Pairing again with the new code works.
 			expect((await tokenRequest(own, codeGrant(own, USERS[0]))).status).toBe(200);
-			expect((await tokenRequest(own, refreshGrant(own, USERS[1], paired.refresh_token))).status).toBe(200);
 		} finally {
 			await own.stop();
 		}
+	});
+
+	test("refresh tokens are bound to the URL they were issued through", () => {
+		const auth = new SessionAuth({ branch: BRANCH, users: [1] });
+		auth.bindUrl("https://a-tunnel.trycloudflare.com");
+		const { token } = auth.issueRefresh(1, JOB);
+		// Simulate a URL change without a re-key: the family's URL no longer matches.
+		auth.bindUrl("https://b-tunnel.trycloudflare.com");
+		expect(auth.redeemRefresh(token, 1, JOB)).toEqual({ ok: false, reason: "binding" });
+		auth.bindUrl("https://a-tunnel.trycloudflare.com");
+		expect(auth.redeemRefresh(token, 1, JOB).ok).toBe(true);
 	});
 });
 
@@ -399,27 +483,34 @@ describe("pairing code lifetime (injectable clock)", () => {
 		}
 	});
 
-	test("over HTTP: the old code stops at expiry, the new one works; refresh tokens die at most ttl after pairing", async () => {
+	test("over HTTP: an unused code stops at expiry, the new one works; refresh tokens die at most ttl after pairing", async () => {
 		let clock = Date.now();
 		const events: string[] = [];
 		const ttlMs = 60 * 60_000;
 		const own = newServer({ codeTtlMs: ttlMs, now: () => clock, onPairingCode: (_, reason, expiresAt) => events.push(`${reason}@${expiresAt - clock}`) });
 		try {
-			const early = await pair(own, USERS[0]);
+			const early = await pair(own, USERS[0]); // t = 0; the next code is issued now
 			expect(early.refresh_expires_in).toBe(3600);
-			const oldCode = own.pairing.formatted;
+			expect(events).toEqual([`used@${ttlMs}`]);
+			const unused = own.pairing.formatted;
 			clock += 40 * 60_000;
-			const later = await pair(own, USERS[1]); // paired 40 min into the code's life
-			expect((await tokenRequest(own, refreshGrant(own, USERS[0], early.refresh_token))).status).toBe(200);
-			clock += 20 * 60_000; // the code's hour is up
-			expect((await tokenRequest(own, codeGrant(own, USERS[2], { code: oldCode }))).status).toBe(401);
-			expect(events).toEqual([`expired@${ttlMs}`]);
+			const refreshed = await tokenRequest(own, refreshGrant(own, USERS[0], early.refresh_token));
+			expect(refreshed.status).toBe(200);
+			const rotated = (await refreshed.json()) as TokenResponse;
+			expect(rotated.refresh_expires_in).toBe(20 * 60); // rotation never extends the pairing's lifetime
+			const later = await pair(own, USERS[1], { code: unused }); // t = 40 min, still valid
+			const fresh = own.pairing.formatted; // issued at t = 40 min
+			clock += 20 * 60_000; // t = 60 min
+			// USERS[0] paired an hour ago: its (rotated) refresh token is gone. USERS[1] paired 20 min ago: still fine.
+			expect((await tokenRequest(own, refreshGrant(own, USERS[0], rotated.refresh_token))).status).toBe(401);
+			const laterRefreshed = await tokenRequest(own, refreshGrant(own, USERS[1], later.refresh_token));
+			expect(laterRefreshed.status).toBe(200);
+			const laterNext = ((await laterRefreshed.json()) as TokenResponse).refresh_token;
+			clock += 40 * 60_000; // t = 100 min: `fresh` expired unused at t = 100 min
+			expect((await tokenRequest(own, codeGrant(own, USERS[2], { code: fresh }))).status).toBe(401);
+			expect(events[events.length - 1]).toBe(`expired@${ttlMs}`);
 			expect((await tokenRequest(own, codeGrant(own, USERS[2]))).status).toBe(200);
-			// USERS[0] paired an hour ago: its refresh token is gone. USERS[1] paired 20 min ago: still fine.
-			expect((await tokenRequest(own, refreshGrant(own, USERS[0], early.refresh_token))).status).toBe(401);
-			expect((await tokenRequest(own, refreshGrant(own, USERS[1], later.refresh_token))).status).toBe(200);
-			clock += 40 * 60_000;
-			expect((await tokenRequest(own, refreshGrant(own, USERS[1], later.refresh_token))).status).toBe(401);
+			expect((await tokenRequest(own, refreshGrant(own, USERS[1], laterNext))).status).toBe(401);
 		} finally {
 			await own.stop();
 		}
@@ -446,20 +537,58 @@ describe("pairing code lifetime (injectable clock)", () => {
 });
 
 describe("POST /v1/token: refresh grant", () => {
-	test("good refresh token → a new access token and the same refresh token", async () => {
+	test("good refresh token → a new access token and a new (rotated) refresh token", async () => {
 		const u = user();
 		const paired = await pair(srv, u);
 		const res = await tokenRequest(srv, refreshGrant(srv, u, paired.refresh_token));
 		expect(res.status).toBe(200);
 		const body = (await res.json()) as TokenResponse;
-		expect(body.refresh_token).toBe(paired.refresh_token);
+		expect(body.refresh_token).toMatch(/^[A-Za-z0-9_-]{43}$/);
+		expect(body.refresh_token).not.toBe(paired.refresh_token);
 		expect(body.expires_in).toBe(300);
 		expect(body.refresh_expires_in).toBeGreaterThan(DEFAULT_CODE_TTL_MS / 1000 - 5);
 		expect(body.access_token).not.toBe(paired.access_token);
 		expect((await getPrompt(body.access_token, UNKNOWN_ID)).status).toBe(404);
+		// The new one works once more; the chain goes on.
+		expect((await tokenRequest(srv, refreshGrant(srv, u, body.refresh_token))).status).toBe(200);
 	});
 
-	test("refresh token bound to user + job + session: wrong job / user / sid / branch → 401", async () => {
+	test("reuse detection: presenting a rotated-out refresh token revokes the whole pairing", async () => {
+		const warnings: string[] = [];
+		const own = newServer({ logger: { ...silentLogger, warn: (line) => warnings.push(line) } });
+		try {
+			const paired = await pair(own, USERS[0]);
+			const other = await pair(own, USERS[1]);
+			const first = await tokenRequest(own, refreshGrant(own, USERS[0], paired.refresh_token));
+			const next = ((await first.json()) as TokenResponse).refresh_token;
+			// Someone replays the old token (a copy): refused, and the family dies with it.
+			expect((await tokenRequest(own, refreshGrant(own, USERS[0], paired.refresh_token))).status).toBe(401);
+			expect(warnings.some((line) => line.includes("refresh token reuse") && line.includes(`roblox:${USERS[0]}`))).toBe(true);
+			expect((await tokenRequest(own, refreshGrant(own, USERS[0], next))).status).toBe(401);
+			// Other pairings are untouched; the user can pair again with the next code.
+			expect((await tokenRequest(own, refreshGrant(own, USERS[1], other.refresh_token))).status).toBe(200);
+			expect((await tokenRequest(own, codeGrant(own, USERS[0]))).status).toBe(200);
+		} finally {
+			await own.stop();
+		}
+	});
+
+	test("a new pairing of the same user on the same server replaces the old one", async () => {
+		const own = newServer();
+		try {
+			const a = await pair(own, USERS[0]);
+			const b = await pair(own, USERS[0]);
+			const c = await pair(own, USERS[0], { job: "other-server" });
+			expect(own.auth.refreshTokenCount()).toBe(2);
+			expect((await tokenRequest(own, refreshGrant(own, USERS[0], a.refresh_token))).status).toBe(401);
+			expect((await tokenRequest(own, refreshGrant(own, USERS[0], b.refresh_token))).status).toBe(200);
+			expect((await tokenRequest(own, refreshGrant(own, USERS[0], c.refresh_token, { job: "other-server" }))).status).toBe(200);
+		} finally {
+			await own.stop();
+		}
+	});
+
+	test("refresh token bound to user + job + session: wrong job / user / sid / branch → 401 (without killing it)", async () => {
 		const u = user();
 		const other = user();
 		const paired = await pair(srv, u);
@@ -470,6 +599,8 @@ describe("POST /v1/token: refresh grant", () => {
 		expect((await tokenRequest(srv, refreshGrant(srv, u, paired.refresh_token, { branch: "prod" }))).status).toBe(401);
 		expect((await tokenRequest(srv, refreshGrant(srv, u, "x".repeat(43)))).status).toBe(401);
 		expect((await tokenRequest(srv, refreshGrant(srv, u, "short"))).status).toBe(401);
+		// The right binding still works: a mismatch is refused, not treated as a reuse.
+		expect((await tokenRequest(srv, refreshGrant(srv, u, paired.refresh_token))).status).toBe(200);
 		// A refresh token from another session is unknown here.
 		const otherSession = newServer();
 		try {
@@ -608,7 +739,8 @@ describe("POST /v1/prompts", () => {
 		const jwt = await tokenFor(user());
 		expect((await createPrompt(jwt, { prompt: "x" }, { "x-padding": "p".repeat(2100) })).status).toBe(431);
 		expect((await tokenRequest(srv, codeGrant(srv, user()), { "x-padding": "p".repeat(2100) })).status).toBe(431);
-		expect((await createPrompt(jwt, { prompt: "x", context: { errors: "abcdefghijkl".split("").map((c) => c.repeat(3000)) } })).status).toBe(413);
+		expect((await createPrompt(jwt, { prompt: "x", context: { errors: Array.from({ length: 50 }, () => "e".repeat(4000)), logs: { client: "c".repeat(66_000), server: "s".repeat(66_000) } } })).status).toBe(413);
+		expect((await createPrompt(jwt, { prompt: "x", context: { logs: { client: "c".repeat(66_001) } } })).status).toBe(400);
 		expect((await createPrompt(jwt, { prompt: "p".repeat(4001) })).status).toBe(400);
 		expect((await tokenRequest(srv, { ...codeGrant(srv, user()), pad: "x".repeat(2000) })).status).toBe(401); // token body cap 1 KB
 	});
@@ -683,8 +815,10 @@ describe("ownership, Studio, ids", () => {
 		const u = user();
 		const paired = await pair(srv, u, { job: "" });
 		expect(decodeJwt(paired.access_token).job).toBe("");
-		expect((await tokenRequest(srv, refreshGrant(srv, u, paired.refresh_token, { job: "" }))).status).toBe(200);
-		expect((await tokenRequest(srv, refreshGrant(srv, u, paired.refresh_token, { job: JOB }))).status).toBe(401);
+		const refreshed = await tokenRequest(srv, refreshGrant(srv, u, paired.refresh_token, { job: "" }));
+		expect(refreshed.status).toBe(200);
+		const next = ((await refreshed.json()) as TokenResponse).refresh_token;
+		expect((await tokenRequest(srv, refreshGrant(srv, u, next, { job: JOB }))).status).toBe(401);
 		const headers = promptHeaders(paired.access_token);
 		delete headers["x-tt-job"];
 		const created = await fetch(`${base}/v1/prompts`, { method: "POST", headers, body: JSON.stringify({ prompt: "studio", context: { artifact: "dev-abc1234" } }) });
@@ -734,7 +868,7 @@ describe("helpers", () => {
 		const msg = JSON.parse(registrationMessage("a".repeat(32), "dev", [1, 2, 56], "https://abc-def.trycloudflare.com"));
 		expect(Object.keys(msg)).toEqual(["v", "s", "b", "u", "url", "exp"]);
 		expect(msg.exp - Math.floor(Date.now() / 1000)).toBeGreaterThanOrEqual(119);
-		expect(JSON.parse(closedMessage("a".repeat(32)))).toEqual({ v: 1, s: "a".repeat(32), closed: true });
+		expect(JSON.parse(closedMessage("a".repeat(32), "https://abc-def.trycloudflare.com"))).toEqual({ v: 1, s: "a".repeat(32), url: "https://abc-def.trycloudflare.com", closed: true });
 		const many = registrationMessage("a".repeat(32), "dev", Array.from({ length: 40 }, (_, i) => 1_000_000_000 + i), "https://abc-def-ghi-jkl.trycloudflare.com");
 		expect(Buffer.byteLength(many)).toBeLessThanOrEqual(1024);
 	});

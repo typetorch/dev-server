@@ -3,7 +3,8 @@
  *   POST /v1/token                  pairing code or refresh token → 5-minute JWT
  *   POST /v1/prompts                JWT → {id, state:"queued", conversationId}
  *   GET  /v1/prompts/:id[?since=n]  JWT → status (+ events i >= n)
- *   POST /v1/prompts/:id/cancel     JWT → {ok:true}
+ *   POST /v1/prompts/:id/cancel     JWT → {ok:true}   (a pending deploy proposal is discarded)
+ *   POST /v1/prompts/:id/deploy     JWT → {ok:true}   {decision: "deploy" | "discard"}: the requester's answer to a proposal
  *   POST /v1/attachments            JWT → {id, width, height}   (RGBA8 screenshot → PNG in the worktree)
  *   GET  /v1/conversations          JWT → the caller's conversations, latest first
  *   GET  /v1/conversations/:id      JWT → one of the caller's conversations with its messages
@@ -16,6 +17,7 @@
  * Errors are bare status codes with no body; the reason is only logged locally (never a token or code).
  */
 import type { Server } from "bun";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ATTACHMENT_ID_PATTERN, ATTACHMENT_LIMITS, AttachmentStore } from "./attachments";
@@ -24,11 +26,13 @@ import { CONVERSATION_ID_PATTERN, ConversationStore, type Conversation } from ".
 import { NonceCache, SlidingWindow } from "./limits";
 import { addSecret, consoleLogger, oneLine, type Logger } from "./log";
 import { GameFeeds, requestPayload } from "./feed";
-import { DEFAULT_CODE_TTL_MS, PairingCode, type RotateReason } from "./pairing";
+import { DEFAULT_CODE_TTL_MS, PairingCode, PairingLockout, type RotateReason } from "./pairing";
 import {
 	GAME_LIMITS,
 	GAME_MCP_SERVER,
 	GAME_TOOL_DEFS,
+	GAME_TOOLS,
+	READ_ONLY_GAME_TOOLS,
 	GameRequestStore,
 	REQUEST_ID_PATTERN,
 	formatGameResult,
@@ -44,6 +48,7 @@ import {
 	PROMPT_ID_PATTERN,
 	SINCE_PATTERN,
 	parseAttachmentRequest,
+	parseDeployDecision,
 	parsePromptRequest,
 	parseTokenGrant,
 } from "./schema";
@@ -73,6 +78,7 @@ type Route =
 	| { kind: "create" }
 	| { kind: "get"; id: string }
 	| { kind: "cancel"; id: string }
+	| { kind: "deploy"; id: string }
 	| { kind: "attach" }
 	| { kind: "conversations" }
 	| { kind: "conversation"; id: string }
@@ -98,6 +104,8 @@ function matchRoute(method: string, path: string): Route | undefined {
 	if (m && method === "GET") return { kind: "get", id: m[1] };
 	m = /^\/v1\/prompts\/([^/]{1,128})\/cancel$/.exec(path);
 	if (m && method === "POST") return { kind: "cancel", id: m[1] };
+	m = /^\/v1\/prompts\/([^/]{1,128})\/deploy$/.exec(path);
+	if (m && method === "POST") return { kind: "deploy", id: m[1] };
 	m = /^\/v1\/conversations\/([^/]{1,128})$/.exec(path);
 	if (m && method === "GET") return { kind: "conversation", id: m[1] };
 	m = /^\/v1\/game\/requests\/([^/]{1,128})$/.exec(path);
@@ -114,6 +122,7 @@ const SCOPE_FOR: Record<AuthedRoute["kind"], Scope> = {
 	conversations: "prompt:read",
 	conversation: "prompt:read",
 	cancel: "prompt:cancel",
+	deploy: "prompt:create",
 	gamePending: "prompt:read",
 	gamePoll: "prompt:read",
 	gameToolResult: "prompt:create",
@@ -185,7 +194,7 @@ export interface RemoteClaudeServerOptions {
 	/** 0 (default) = a random free port. Always bound to 127.0.0.1. */
 	port?: number;
 	logger?: Logger;
-	/** Called with the new pairing code after every rotation (manual, brute force or expiry). */
+	/** Called with the new pairing code after every rotation (manual, used, expired, tunnel restart). */
 	onPairingCode?: (formatted: string, reason: RotateReason, expiresAt: number) => void;
 	/** Lifetime of each pairing code (default 3 hours); refresh tokens never outlive it (counted from pairing). */
 	codeTtlMs?: number;
@@ -201,6 +210,8 @@ export interface RemoteClaudeServerOptions {
 	 * publisher). Without it, game servers still find requests through GET /v1/game/pending.
 	 */
 	publishWake?: (message: string) => Promise<boolean>;
+	/** How long a deploy proposal waits for the dev (default 15 minutes; tests shorten it). */
+	proposalTtlMs?: number;
 	/** Tests: long-poll hold and coalescing (defaults 20 s and 250 ms). */
 	feedTiming?: { holdMs?: number; coalesceMs?: number };
 	/** Tests: how long a tool call waits for the game (default: approval + timeout + grace). */
@@ -213,6 +224,8 @@ export interface RemoteClaudeServer {
 	readonly auth: SessionAuth;
 	readonly queue: PromptQueue;
 	readonly pairing: PairingCode;
+	/** Wrong pairing codes per (user, job). */
+	readonly lockout: PairingLockout;
 	readonly conversations: ConversationStore;
 	readonly attachments: AttachmentStore;
 	readonly gameRequests: GameRequestStore;
@@ -221,6 +234,12 @@ export interface RemoteClaudeServer {
 	readonly localUrl: string;
 	/** New signing key, no refresh tokens, new pairing code: every credential issued so far dies. */
 	rotateAll(): void;
+	/**
+	 * Binds pairing to the tunnel URL (security audit H1). The first call (startup) binds silently. A different URL
+	 * later (a tunnel restart) re-keys the session: new session id, signing key and pairing code (printed through
+	 * onPairingCode, reason "tunnel"); every refresh token dies. Returns the previous session id when it re-keyed.
+	 */
+	setTunnelUrl(url: string): string | undefined;
 	/** Stops the server and deletes the attachment files. */
 	stop(): Promise<void>;
 }
@@ -249,6 +268,7 @@ export function createRemoteClaudeServer(options: RemoteClaudeServerOptions): Re
 	);
 	addSecret(pairing.raw);
 	addSecret(pairing.formatted);
+	const lockout = new PairingLockout();
 	const gameRequests = new GameRequestStore();
 	const feeds = new GameFeeds(options.feedTiming);
 	let localUrl = "";
@@ -257,6 +277,7 @@ export function createRemoteClaudeServer(options: RemoteClaudeServerOptions): Re
 		maxQueued: options.maxQueued ?? 5,
 		maxPrompts: options.maxPrompts ?? 50,
 		logger,
+		proposalTtlMs: options.proposalTtlMs,
 		onEvent: (record, event) => feeds.promptEvent(record, event, () => queue.view(record)),
 		// Each run gets the game tools over MCP with its own bearer token, valid only while it runs.
 		runTools: (record) => {
@@ -298,26 +319,42 @@ export function createRemoteClaudeServer(options: RemoteClaudeServerOptions): Re
 		if (grant.branch !== auth.branch) return decide(401, what, `${label} wrong branch`), empty(401);
 		if (!auth.isAllowed(grant.user)) return decide(401, what, `${label} not allowed`), empty(401);
 
+		const onJob = `on job ${grant.job.slice(0, 8) || "(studio)"}`;
+
 		if (grant.grant === "code") {
-			if (pairing.isBlocked()) return decide(429, what, `${label} code attempts blocked (too many failures)`), empty(429);
+			// Wrong codes count per (user, job) only: no global block, no rotation (audit L1).
+			if (lockout.isLocked(grant.user, grant.job)) return decide(429, what, `${label} ${onJob} locked (too many wrong codes)`), empty(429);
 			if (!pairing.matches(grant.code)) {
-				const { blocked, rotated } = pairing.fail();
-				const notes = [blocked && "code attempts blocked for 60 s", rotated && "pairing code rotated after 30 failures"].filter(Boolean).join("; ");
-				return decide(401, what, `${label} wrong code${notes ? ` (${notes})` : ""}`), empty(401);
+				const { failures, locked } = lockout.fail(grant.user, grant.job);
+				const note = locked ? `locked for ${Math.round(lockout.lockMs / 60_000)} min` : `${failures}/${lockout.maxFailures}`;
+				return decide(401, what, `${label} ${onJob} wrong, used or expired code (${note})`), empty(401);
 			}
+			// Rate-limited before the code is consumed, so a 429 doesn't waste it.
 			if (!tokenLimiter.take(String(grant.user))) return decide(429, what, `${label} token rate limit`), empty(429);
+			lockout.clear(grant.user, grant.job);
 			const issued = await auth.issue(grant.user, grant.job);
 			const refresh = auth.issueRefresh(grant.user, grant.job);
-			decide(200, what, `${label} jti=${issued.jti.slice(0, 8)} paired`);
+			decide(200, what, `${label} ${onJob} jti=${issued.jti.slice(0, 8)} paired`);
+			// Single use: the code is spent and the next one is printed (audit M5).
+			pairing.consume();
 			return json({ access_token: issued.token, expires_in: 300, refresh_token: refresh.token, refresh_expires_in: refresh.expiresIn });
 		}
 
-		const left = auth.checkRefresh(grant.refresh_token, grant.user, grant.job);
-		if (left === undefined) return decide(401, what, `${label} refresh token not valid for this user/job/session`), empty(401);
-		if (!tokenLimiter.take(String(grant.user))) return decide(429, what, `${label} token rate limit`), empty(429);
+		// The rate limit is checked after the token checks and before the rotation (auth.ts), so a 429 never leaves the
+		// game holding a rotated-out token, and bad tokens can't use up a user's budget.
+		const redeemed = auth.redeemRefresh(grant.refresh_token, grant.user, grant.job, () => tokenLimiter.take(String(grant.user)));
+		if (!redeemed.ok && redeemed.reason === "limited") return decide(429, what, `${label} token rate limit`), empty(429);
+		if (!redeemed.ok) {
+			if (redeemed.reason === "reuse") {
+				logger.warn(
+					`refresh token reuse for roblox:${redeemed.userId} on job ${redeemed.job?.slice(0, 8) || "(studio)"}: a rotated-out token was presented again, so that pairing is revoked (the game server must pair again)`,
+				);
+			}
+			return decide(401, what, `${label} ${onJob} refresh token ${redeemed.reason}`), empty(401);
+		}
 		const issued = await auth.issue(grant.user, grant.job);
-		decide(200, what, `${label} jti=${issued.jti.slice(0, 8)} refreshed`);
-		return json({ access_token: issued.token, expires_in: 300, refresh_token: grant.refresh_token, refresh_expires_in: left });
+		decide(200, what, `${label} ${onJob} jti=${issued.jti.slice(0, 8)} refreshed`);
+		return json({ access_token: issued.token, expires_in: 300, refresh_token: redeemed.token, refresh_expires_in: redeemed.expiresIn });
 	}
 
 	const describeRoute = (route: AuthedRoute): string => {
@@ -334,6 +371,8 @@ export function createRemoteClaudeServer(options: RemoteClaudeServerOptions): Re
 				return `GET /v1/prompts/${oneLine(route.id, 12)}`;
 			case "cancel":
 				return `POST /v1/prompts/${oneLine(route.id, 12)}/cancel`;
+			case "deploy":
+				return `POST /v1/prompts/${oneLine(route.id, 12)}/deploy`;
 			case "gamePending":
 				return "GET /v1/game/pending";
 			case "gamePoll":
@@ -423,18 +462,31 @@ export function createRemoteClaudeServer(options: RemoteClaudeServerOptions): Re
 			}
 			const used = attachments.check(body.attachments ?? [], userId);
 			if (!used) return decide(400, what, `${who} attachment not found, not yours or already used`), empty(400);
-			const refused = queue.refusal();
+			const mode = body.mode ?? "live";
+			const refused = queue.refusal(mode);
 			if (refused === "max-prompts" || refused === "queue-full") return decide(429, what, `${who} ${refused}`), empty(429);
 			if (refused === "stopped") return decide(503, what, `${who} shutting down`), empty(503);
+			// Code runs take turns on the worktree, and wait while a deploy proposal is undecided.
+			if (refused === "code-busy") return decide(423, what, `${who} code mode busy (a code run or deploy proposal is pending)`), empty(423);
 			const isNew = conversation === undefined;
 			conversation ??= conversations.create(userId, body.prompt);
-			const record = queue.create(userId, body.prompt, body.context, { conversation, attachments: used, job: claims.job });
+			const record = queue.create(userId, body.prompt, body.context, { conversation, attachments: used, job: claims.job, mode });
 			if (typeof record === "string") {
 				if (isNew) conversations.discard(conversation.id);
-				return decide(record === "stopped" ? 503 : 429, what, `${who} ${record}`), empty(record === "stopped" ? 503 : 429);
+				const status = record === "stopped" ? 503 : record === "code-busy" ? 423 : 429;
+				return decide(status, what, `${who} ${record}`), empty(status);
 			}
 			conversations.touch(conversation);
-			const extra = [isNew ? "new conversation" : `conversation ${conversation.id.slice(0, 8)}`, used.length ? `${used.length} attachment(s)` : ""].filter(Boolean).join(", ");
+			// Attached logs are counted, never printed (they can hold other players' names and chat).
+			const logs = body.context?.logs;
+			const extra = [
+				mode,
+				isNew ? "new conversation" : `conversation ${conversation.id.slice(0, 8)}`,
+				used.length ? `${used.length} attachment(s)` : "",
+				logs ? `${[logs.client !== undefined && "client", logs.server !== undefined && "server"].filter(Boolean).join(" + ")} logs attached` : "",
+			]
+				.filter(Boolean)
+				.join(", ");
 			decide(200, what, `${who} queued ${record.id.slice(0, 8)} (${extra})`);
 			return json({ id: record.id, state: record.state, conversationId: conversation.id });
 		}
@@ -540,6 +592,22 @@ export function createRemoteClaudeServer(options: RemoteClaudeServerOptions): Re
 			return json(queue.view(record, since === null ? undefined : Number(since)));
 		}
 
+		// A deploy decision: only the requester, only while the proposal waits.
+		if (route.kind === "deploy") {
+			if (!isJson(req)) return decide(400, what, `${who} content-type`), empty(400);
+			const text = await readBody(req, 256);
+			if (typeof text !== "string") return decide(400, what, `${who} body`), empty(400);
+			const decision = parseDeployDecision(parseJson(text));
+			if (!decision) return decide(400, what, `${who} body schema`), empty(400);
+			const result = await queue.decide(record.id, userId, decision);
+			if (result === "not_yours") return decide(403, what, `${who} not the requester`), empty(403);
+			if (result === "missing") return decide(404, what, `${who} no proposal`), empty(404);
+			if (result === "not_pending") return decide(409, what, `${who} proposal already ${record.proposal?.status}`), empty(409);
+			if (result === "failed") return decide(500, what, `${who} ${decision} failed: ${record.proposal?.error ?? "?"}`), json({ ok: false, error: "failed" }, 500);
+			decide(200, what, `${who} ${decision}`);
+			return json({ ok: true, state: record.state });
+		}
+
 		// Cancel (no body or Content-Type expected; a body is ignored): only the requester (or the dev at the terminal).
 		if (record.userId !== userId) return decide(403, what, `${who} not the requester`), empty(403);
 		const result = queue.cancel(record.id, `roblox:${userId}`);
@@ -553,6 +621,10 @@ export function createRemoteClaudeServer(options: RemoteClaudeServerOptions): Re
 	async function callGameTool(record: PromptRecord, name: unknown, args: unknown): Promise<{ text: string; isError: boolean }> {
 		const call = parseToolCall(name, args);
 		if (typeof call === "string") return { text: call, isError: true };
+		// Modes are enforced here too, not only by the run's tool allowlist: code runs never run Luau on the server.
+		if (!(record.mode === "live" ? GAME_TOOLS : READ_ONLY_GAME_TOOLS).includes(call.tool as never)) {
+			return { text: `${call.tool} is only available in Live mode. Tell the developer to switch to Live mode for this.`, isError: true };
+		}
 		if (call.tool === "screenshot") return { text: "Screenshots are not available yet.", isError: true };
 		if (gameRequests.countFor(record.id) >= GAME_LIMITS.perPrompt) return { text: "Too many game tool calls in this prompt.", isError: true };
 		queue.flush(record);
@@ -566,7 +638,9 @@ export function createRemoteClaudeServer(options: RemoteClaudeServerOptions): Re
 			description: call.description,
 			timeoutSeconds: call.timeoutSeconds,
 		});
-		logger.info(`game tool ${call.tool} ${request.id.slice(0, 8)} for roblox:${record.userId} on job ${record.job.slice(0, 8) || "(studio)"}: "${oneLine(call.description, 60)}"`);
+		// run_luau: the code's SHA-256 matches the game's durable audit record (audit/<date>/<job>/<n>), which never holds the code.
+		const codeHash = call.tool === "run_luau" && typeof call.args.code === "string" ? `  code sha256 ${createHash("sha256").update(call.args.code, "utf8").digest("hex").slice(0, 16)}` : "";
+		logger.info(`game tool ${call.tool} ${request.id.slice(0, 8)} for roblox:${record.userId} on job ${record.job.slice(0, 8) || "(studio)"}: "${oneLine(call.description, 60)}"${codeHash}`);
 		// The game server's long-poll picks it up at once; a wake message only when no poll is open.
 		feeds.requestAdded(record.userId, record.job);
 		if (options.publishWake && !feeds.isPolling(record.userId, record.job)) void options.publishWake(wakeMessage(auth.sessionId, record.job, request.id, record.userId));
@@ -603,7 +677,10 @@ export function createRemoteClaudeServer(options: RemoteClaudeServerOptions): Re
 				const version = typeof params?.protocolVersion === "string" ? params.protocolVersion : "2025-06-18";
 				reply({ protocolVersion: version, capabilities: { tools: { listChanged: false } }, serverInfo: { name: GAME_MCP_SERVER, version: "0.1.0" } });
 			} else if (method === "ping") reply({});
-			else if (method === "tools/list") reply({ tools: GAME_TOOL_DEFS });
+			else if (method === "tools/list") {
+				const allowed: readonly string[] = record.mode === "live" ? GAME_TOOLS : READ_ONLY_GAME_TOOLS;
+				reply({ tools: GAME_TOOL_DEFS.filter((def) => allowed.includes(def.name)) });
+			}
 			else if (method === "tools/call") {
 				const result = await callGameTool(record, params?.name, params?.arguments);
 				reply({ content: [{ type: "text", text: result.text }], isError: result.isError });
@@ -641,6 +718,7 @@ export function createRemoteClaudeServer(options: RemoteClaudeServerOptions): Re
 		auth,
 		queue,
 		pairing,
+		lockout,
 		conversations,
 		attachments,
 		gameRequests,
@@ -649,6 +727,18 @@ export function createRemoteClaudeServer(options: RemoteClaudeServerOptions): Re
 		rotateAll() {
 			auth.rotate();
 			pairing.rotate("manual");
+		},
+		setTunnelUrl(url) {
+			if (auth.tunnelUrl === "") {
+				auth.bindUrl(url);
+				pairing.bindUrl(url);
+				return undefined;
+			}
+			if (url === auth.tunnelUrl) return undefined;
+			const previous = auth.rekey(url);
+			pairing.bindUrl(url, "tunnel");
+			logger.warn(`tunnel URL changed: new session ${auth.sessionId.slice(0, 8)} (was ${previous.slice(0, 8)}); every game server must pair again`);
+			return previous;
 		},
 		async stop() {
 			pairing.dispose();

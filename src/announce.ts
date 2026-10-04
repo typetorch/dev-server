@@ -1,8 +1,12 @@
 /**
  * Registration with game servers over Open Cloud MessagingService (plans/11 §1.5), topic `TypeTorch/remote-claude`:
  *   {"v":1,"s":<sessionId>,"b":<branch>,"u":[<userIds>],"url":<tunnel URL>,"exp":<unix now+120>}  every 60 s
- *   {"v":1,"s":<sessionId>,"closed":true}                                                       on exit
+ *   {"v":1,"s":<sessionId>,"url":<tunnel URL>,"closed":true}       on exit (and for the old session after a tunnel restart)
  * Messages are at most 1 KiB. The API key is sent only in the x-api-key header and never logged.
+ *
+ * Game servers bind a session id to the first URL they hear for it and ignore later messages that change it; a closed
+ * message only counts when both its session id and its URL match (security audit H1). After a tunnel restart the dev
+ * server therefore announces a new session id (auth.ts `rekey`) and closes the old one.
  */
 import type { Logger } from "./log";
 
@@ -25,8 +29,9 @@ export function registrationMessage(sessionId: string, branch: string, users: nu
 	return JSON.stringify(body);
 }
 
-export function closedMessage(sessionId: string): string {
-	return JSON.stringify({ v: 1, s: sessionId, closed: true });
+/** Ends a session on game servers; they only accept it with the URL the session was announced with. */
+export function closedMessage(sessionId: string, url: string): string {
+	return JSON.stringify({ v: 1, s: sessionId, url, closed: true });
 }
 
 /** One Open Cloud MessagingService publish (at most 1 KiB). The key goes only in the x-api-key header. */

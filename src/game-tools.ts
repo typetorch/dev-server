@@ -23,6 +23,8 @@ export const GAME_MCP_SERVER = "typetorch-game";
 export const GAME_TOPIC = "TypeTorch/tool";
 export const REQUEST_ID_PATTERN = /^[0-9a-f]{32}$/;
 export const GAME_TOOLS = ["run_luau", "game_logs", "inspect", "find", "game_status", "screenshot"] as const;
+/** What code-mode runs may call: everything except run_luau (live mode only). */
+export const READ_ONLY_GAME_TOOLS = ["game_logs", "inspect", "find", "game_status", "screenshot"] as const;
 export type GameToolName = (typeof GAME_TOOLS)[number];
 /** As Claude Code names MCP tools: mcp__<server>__<tool>. */
 export const fullToolName = (tool: GameToolName) => `mcp__${GAME_MCP_SERVER}__${tool}`;
@@ -250,7 +252,7 @@ export const GAME_TOOL_DEFS = [
 	{
 		name: "run_luau",
 		description:
-			"Run a Luau snippet on the requesting developer's live dev game server (server realm; the server that sent this prompt). The developer sees the code and approves it before it runs. In the snippet: `player` is the requesting Player, `kernel` the TypeTorch server kernel, `persist(key)` the kernel persist store; `game`, `workspace` and the usual globals work. print/warn output and returned values come back. Default timeout 10 s (max 30). Prefer small, reversible snippets that touch only the requester (their character, their data).",
+			"Run a Luau snippet on the requesting developer's live dev game server (server realm; the server that sent this prompt). The developer sees the code and approves it before it runs, and every run is audited. In the snippet: `player` is the requesting Player; `game`, `workspace` and the usual globals work, but game:GetService refuses MessagingService, DataStoreService, MemoryStoreService and HttpService, and the TypeTorch kernel and its modules are not available. print/warn output and returned values come back. Default timeout 10 s (max 30). Prefer small, reversible snippets that touch only the requester (their character, their data).",
 		inputSchema: {
 			type: "object",
 			properties: {
