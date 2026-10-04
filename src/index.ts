@@ -2,18 +2,18 @@
 /**
  * typetorch-dev-server remote-claude --users 1,2,56 [--repo <dir>] [--branch <name>] [--port <n>]
  *                                    [--max-prompts 50] [--no-deploy] [--cli <path>]
- * typetorch-dev-server remote-claude --init-secret [--env-file <path>]
+ * Prints a pairing code; a dev pastes it into DEV > Claude in game to pair that game server with this session.
  */
-import { resolve } from "node:path";
 import { consoleLogger } from "./log";
-import { CREATOR_HUB_STEPS, defaultEnvFile, initSecret } from "./secret";
 import { startRemoteClaude } from "./session";
 
 const USAGE = `typetorch-dev-server remote-claude: prompt Claude Code on this machine from inside a live Roblox dev server.
 
 Usage:
   typetorch-dev-server remote-claude --users <id,id,...> [options]
-  typetorch-dev-server remote-claude --init-secret [--env-file <path>]
+
+It prints a pairing code (also copied to the clipboard and saved to <repo>/.typetorch/remote-claude.code).
+Paste it into DEV > Claude in game to pair the server you are in.
 
 Options:
   --users <ids>          Roblox user ids allowed to prompt (required; no default, no wildcard)
@@ -29,17 +29,16 @@ Options:
                          a change to one is committed but not deployed
   --no-announce          do not publish the session to game servers (local testing)
   --no-install           do not bun install in a fresh worktree
-  --init-secret          add TYPETORCH_REMOTE_CLAUDE_SECRET to a .env (never printed) and show the Roblox steps
-  --env-file <path>      the .env --init-secret writes (default: the nearest .env above the current directory)
 
-Terminal commands while running: revoke <userId>, users, rotate, status, cancel <promptId>, quit (or Ctrl+C).`;
+Terminal commands while running: code (show the pairing code again), revoke <userId>, users, rotate (new pairing code;
+every token dies), status, cancel <promptId>, quit (or Ctrl+C).`;
 
 interface Parsed {
 	command?: string;
 	flags: Map<string, string | true>;
 }
 
-const VALUE_FLAGS = new Set(["users", "repo", "branch", "port", "max-prompts", "cli", "env-file", "model", "max-budget-usd", "protect"]);
+const VALUE_FLAGS = new Set(["users", "repo", "branch", "port", "max-prompts", "cli", "model", "max-budget-usd", "protect"]);
 
 function parseArgs(argv: string[]): Parsed {
 	const flags = new Map<string, string | true>();
@@ -79,29 +78,17 @@ function positive(flags: Map<string, string | true>, name: string): number | und
 	return n;
 }
 
-const KNOWN = new Set([...VALUE_FLAGS, "no-deploy", "no-announce", "no-install", "init-secret", "help"]);
+const KNOWN = new Set([...VALUE_FLAGS, "no-deploy", "no-announce", "no-install", "help"]);
 
 async function main(argv: string[]): Promise<number> {
 	const { command, flags } = parseArgs(argv);
 	for (const name of flags.keys()) if (!KNOWN.has(name)) throw new Error(`unknown option --${name}`);
-	if (flags.has("help") || (!command && !flags.has("init-secret"))) {
+	if (flags.has("help") || !command) {
 		console.log(USAGE);
 		return 0;
 	}
 	if (command && command !== "remote-claude") throw new Error(`unknown command "${command}"`);
 
-	if (flags.has("init-secret")) {
-		const envFile = typeof flags.get("env-file") === "string" ? resolve(flags.get("env-file") as string) : defaultEnvFile();
-		const result = initSecret(envFile);
-		if (result.status === "added") console.log(`Added TYPETORCH_REMOTE_CLAUDE_SECRET (48 random bytes, base64url) to ${result.file}.`);
-		else {
-			console.log(`TYPETORCH_REMOTE_CLAUDE_SECRET is already set (${result.file}); nothing changed.`);
-			if (result.weakness) console.log(`Warning: ${result.weakness}`);
-		}
-		console.log("");
-		console.log(CREATOR_HUB_STEPS);
-		return 0;
-	}
 
 	const usersFlag = flags.get("users");
 	if (typeof usersFlag !== "string") throw new Error("--users is required, e.g. --users 1,2,56 (no default, no wildcard)");

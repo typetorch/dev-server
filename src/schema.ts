@@ -22,22 +22,38 @@ export const LIMITS = {
 	allHeaderBytes: 8192,
 } as const;
 
-export interface TokenRequest {
+interface GrantBase {
 	sid: string;
 	user: number;
 	job: string;
 	branch: string;
 }
 
-/** `{sid, user, job, branch}`, nothing else. `job` may be "" (Studio servers have an empty JobId). */
-export function parseTokenRequest(raw: unknown): TokenRequest | undefined {
-	if (!isPlainObject(raw) || !onlyKeys(raw, ["sid", "user", "job", "branch"])) return undefined;
-	const { sid, user, job, branch } = raw;
+export type TokenGrant = (GrantBase & { grant: "code"; code: string }) | (GrantBase & { grant: "refresh"; refresh_token: string });
+
+/**
+ * `{grant:"code", sid, user, job, branch, code}` or `{grant:"refresh", sid, user, job, branch, refresh_token}`, nothing
+ * else. `job` may be "" (Studio servers have an empty JobId).
+ */
+export function parseTokenGrant(raw: unknown): TokenGrant | undefined {
+	if (!isPlainObject(raw)) return undefined;
+	const { grant, sid, user, job, branch } = raw;
 	if (typeof sid !== "string" || !/^[0-9a-f]{32}$/.test(sid)) return undefined;
 	if (typeof user !== "number" || !Number.isSafeInteger(user) || user <= 0) return undefined;
 	if (typeof job !== "string" || !/^[A-Za-z0-9._:{}-]{0,64}$/.test(job)) return undefined;
 	if (typeof branch !== "string" || branch.length === 0 || branch.length > 64) return undefined;
-	return { sid, user, job, branch };
+	const base = { sid, user, job, branch };
+	if (grant === "code") {
+		if (!onlyKeys(raw, ["grant", "sid", "user", "job", "branch", "code"])) return undefined;
+		if (typeof raw.code !== "string" || raw.code.length === 0 || raw.code.length > 64) return undefined;
+		return { grant, ...base, code: raw.code };
+	}
+	if (grant === "refresh") {
+		if (!onlyKeys(raw, ["grant", "sid", "user", "job", "branch", "refresh_token"])) return undefined;
+		if (typeof raw.refresh_token !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(raw.refresh_token)) return undefined;
+		return { grant, ...base, refresh_token: raw.refresh_token };
+	}
+	return undefined;
 }
 
 export interface PromptContext {

@@ -1,6 +1,6 @@
 /**
  * Terminal logging. Every line goes through `redact`, which removes the values registered with `addSecret` (the
- * exchange secret, the Open Cloud API key) and anything shaped like a JWT, so a token or key can never reach the
+ * pairing code, the Open Cloud API key) and anything shaped like a JWT, so a token or key can never reach the
  * terminal, a prompt's `log` or a file even by accident.
  */
 

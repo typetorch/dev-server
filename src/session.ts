@@ -3,17 +3,16 @@
  * registration every 60 s → terminal controls. Ctrl+C (or `quit`) publishes the closed message, stops the tunnel and
  * exits; the in-memory signing key dies with the process, so every token dies too.
  */
-import { existsSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
 import { Announcer, closedMessage, registrationMessage } from "./announce";
 import { branchChannel, branchFromGit, loadGameConfig } from "./config";
-import { API_KEY_VARS, SECRET_VAR, Settings, childEnv } from "./env";
-import { branchExists, currentBranch, ensureWorktree, repoRoot, type Worktree } from "./git";
+import { API_KEY_VARS, Settings, childEnv } from "./env";
+import { branchExists, currentBranch, ensureIgnored, ensureWorktree, repoRoot, type Worktree } from "./git";
 import { addSecret, consoleLogger, type Logger } from "./log";
 import { run } from "./proc";
 import type { Runner } from "./prompts";
 import { createClaudeRunner, protectedGlobs, resolveCli } from "./runner";
-import { secretStrengthError } from "./secret";
 import { createRemoteClaudeServer, type RemoteClaudeServer } from "./server";
 import { attachTerminal } from "./terminal";
 import { QuickTunnel, findCloudflared } from "./tunnel";
@@ -48,6 +47,8 @@ export interface RemoteClaudeOptions {
 	logger?: Logger;
 	/** Replaces the Claude runner (tests). */
 	runner?: Runner;
+	/** Copy the pairing code to the clipboard (default true). */
+	clipboard?: boolean;
 }
 
 export interface RemoteClaudeSession {
@@ -58,6 +59,10 @@ export interface RemoteClaudeSession {
 	url(): string | undefined;
 	revoke(userId: number): boolean;
 	rotate(): void;
+	/** Prints the pairing code again (and re-copies it to the clipboard). */
+	showCode(): void;
+	/** Where the pairing code is saved. */
+	readonly codeFile: string;
 	status(): string;
 	/** Publishes the closed message, stops the tunnel and the server. Idempotent. */
 	close(): Promise<void>;
@@ -82,12 +87,8 @@ export async function startRemoteClaude(options: RemoteClaudeOptions): Promise<R
 		throw new Error(`branch "${branch}" (git "${gitBranch}") is on the ${channel} channel; remote-claude only runs on dev-channel branches (no override)`);
 	}
 
-	// 2. Secrets (never printed).
+	// 2. Settings (the API key is never printed).
 	const settings = new Settings([process.cwd(), repo]);
-	const secret = settings.get(SECRET_VAR);
-	const weakness = secretStrengthError(secret?.value);
-	if (weakness) throw new Error(weakness);
-	addSecret(secret!.value);
 	const announce = options.announce !== false;
 	const apiKey = settings.first(API_KEY_VARS);
 	addSecret(apiKey?.value);
@@ -116,7 +117,22 @@ export async function startRemoteClaude(options: RemoteClaudeOptions): Promise<R
 		if (installed.code !== 0) logger.warn(`bun install failed in the worktree (exit ${installed.code}); builds may fail`);
 	}
 
-	// 5. Runner + HTTP server.
+	// 5. Pairing code output: one terminal line, the clipboard and <repo>/.typetorch/remote-claude.code (git-ignored).
+	// Nowhere else: it is redacted from every other log line and never announced or committed.
+	const codeFile = join(repo, ".typetorch", "remote-claude.code");
+	await ensureIgnored(repo, ".typetorch/remote-claude.code");
+	const publishCode = (formatted: string) => {
+		try {
+			mkdirSync(dirname(codeFile), { recursive: true });
+			writeFileSync(codeFile, `${formatted}\n`, { mode: 0o600 });
+		} catch (error) {
+			logger.warn(`could not save the pairing code to ${codeFile}: ${(error as Error).message}`);
+		}
+		if (options.clipboard !== false) void copyToClipboard(formatted);
+		process.stdout.write(`pairing code: ${formatted}  (paste it into DEV > Claude in game)\n`);
+	};
+
+	// 6. Runner + HTTP server.
 	const cli = resolveCli(options.cli);
 	const deploy = options.deploy !== false;
 	if (deploy && !cli) logger.warn("TypeTorch CLI not found; prompts will stop at \"committed\" (pass --cli <path>)");
@@ -133,17 +149,20 @@ export async function startRemoteClaude(options: RemoteClaudeOptions): Promise<R
 			protect: options.protect,
 		});
 	const server = createRemoteClaudeServer({
-		secret: secret!.value,
 		branch,
 		users,
 		runner,
 		maxPrompts: options.maxPrompts ?? 50,
 		port: options.port,
 		logger,
+		onPairingCode: (formatted, reason) => {
+			if (reason === "auto") logger.warn("pairing code rotated automatically after 30 wrong attempts; paired servers keep working");
+			publishCode(formatted);
+		},
 	});
 	const { auth } = server;
 
-	// 6. Tunnel + registration.
+	// 7. Tunnel + registration.
 	let tunnel: QuickTunnel | undefined;
 	const announcer =
 		announce && apiKey && universeId
@@ -199,9 +218,13 @@ export async function startRemoteClaude(options: RemoteClaudeOptions): Promise<R
 			}
 			return ok;
 		},
+		codeFile,
 		rotate() {
-			auth.rotate();
-			logger.info("signing key rotated: every issued token is now invalid");
+			logger.info("rotating the signing key, refresh tokens and pairing code: every issued token is now invalid");
+			server.rotateAll(); // prints the new pairing code through onPairingCode
+		},
+		showCode() {
+			publishCode(server.pairing.formatted);
 		},
 		status() {
 			const q = server.queue;
@@ -210,7 +233,7 @@ export async function startRemoteClaude(options: RemoteClaudeOptions): Promise<R
 				`session ${auth.sessionId.slice(0, 8)}  branch ${branch} (git ${gitBranch}, worktree on ${worktree.workBranch})`,
 				`tunnel ${tunnel?.url ?? (cloudflared ? "(down)" : "(disabled)")}  announce ${announcer ? "on" : "off"}  deploy ${deploy ? (cli ? "on" : "no CLI") : "off"}`,
 				`users ${auth.allowedUsers().join(", ") || "(none)"}  prompts ${q.createdCount}/${options.maxPrompts ?? 50}  queued ${q.queued.length}  running ${active ? `${active.id.slice(0, 8)} (${active.state})` : "-"}`,
-				`blocked IPs ${server.lockout.blockedCount()}`,
+				`refresh tokens ${auth.refreshTokenCount()}  code attempts ${server.pairing.isBlocked() ? "blocked (too many failures)" : "open"}`,
 			].join("\n");
 		},
 		close() {
@@ -220,6 +243,7 @@ export async function startRemoteClaude(options: RemoteClaudeOptions): Promise<R
 				const closedSent = announcer ? announcer.publish(closedMessage(auth.sessionId)) : Promise.resolve(false);
 				await server.stop();
 				tunnel?.stop();
+				rmSync(codeFile, { force: true });
 				if (await closedSent) logger.info("announced closed session");
 				resolveClosed();
 			})();
@@ -229,5 +253,18 @@ export async function startRemoteClaude(options: RemoteClaudeOptions): Promise<R
 
 	logger.info(`remote-claude session ${auth.sessionId.slice(0, 8)} on ${branch} for roblox users ${users.join(", ")}`);
 	if (options.terminal !== false) attachTerminal(session, logger);
+	publishCode(server.pairing.formatted);
 	return session;
+}
+
+/** Copies text to the clipboard (Windows clip.exe, macOS pbcopy; elsewhere nothing). */
+export async function copyToClipboard(text: string): Promise<boolean> {
+	const cmd = process.platform === "win32" ? ["clip"] : process.platform === "darwin" ? ["pbcopy"] : undefined;
+	if (!cmd) return false;
+	try {
+		const proc = Bun.spawn(cmd, { stdin: new TextEncoder().encode(text), stdout: "ignore", stderr: "ignore", windowsHide: true });
+		return (await proc.exited) === 0;
+	} catch {
+		return false;
+	}
 }

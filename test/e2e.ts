@@ -4,12 +4,11 @@
  *
  *   bun test/e2e.ts ["prompt text"]      (E2E_FAKE_CLI=1: deploy through a stand-in CLI; E2E_INJECT=1: hostile context)
  *
- * A throwaway exchange secret is generated for the run (set in this process's env only; never printed).
+ * Pairs with the session's pairing code the way the game does (code grant), then uses the access token.
  */
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { consoleLogger } from "../src/log";
-import { generateSecret } from "../src/secret";
 import { startRemoteClaude } from "../src/session";
 import { ensureFixture } from "./fixture";
 
@@ -29,7 +28,6 @@ if (process.env.E2E_FAKE_CLI === "1") {
 			"const [cmd, flag, branch] = process.argv.slice(2);",
 			"console.log(`fake typetorch ${cmd} ${flag} ${branch} in ${process.cwd()}`);",
 			"console.log(`api key passed to deploy: ${Boolean(process.env.OPENCLOUD_API_KEY || process.env.TYPETORCH_API_KEY || process.env.ROBLOX_API_KEY)}`);",
-			"console.log(`exchange secret visible to deploy: ${Boolean(process.env.TYPETORCH_REMOTE_CLAUDE_SECRET)}`);",
 			'console.log("deployed artifact dev-1234abc");',
 			"",
 		].join("\n"),
@@ -46,8 +44,6 @@ const context =
 				artifact: "dev-0000000",
 			}
 		: { path: "Workspace.Baseplate", errors: ["(fixture) no errors"], artifact: "dev-0000000" };
-const secret = generateSecret();
-process.env.TYPETORCH_REMOTE_CLAUDE_SECRET = secret;
 
 const session = await startRemoteClaude({
 	users: [USER],
@@ -56,6 +52,7 @@ const session = await startRemoteClaude({
 	cli,
 	announce: false,
 	terminal: false,
+	clipboard: false,
 	logger: consoleLogger(),
 });
 
@@ -66,8 +63,8 @@ try {
 		try {
 			tokenRes = await fetch(`${url}/v1/token`, {
 				method: "POST",
-				headers: { authorization: `Bearer ${secret}`, "content-type": "application/json" },
-				body: JSON.stringify({ sid: session.sessionId, user: USER, job: JOB, branch: session.branch }),
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({ grant: "code", sid: session.sessionId, user: USER, job: JOB, branch: session.branch, code: session.server.pairing.formatted }),
 				signal: AbortSignal.timeout(10_000),
 			});
 			if (tokenRes.status === 200) break;
@@ -76,7 +73,7 @@ try {
 	}
 	if (tokenRes?.status !== 200) throw new Error(`token exchange through the tunnel failed (${tokenRes?.status})`);
 	const jwt = ((await tokenRes.json()) as { access_token: string }).access_token;
-	console.log(`[e2e] token exchanged through ${url}`);
+	console.log(`[e2e] paired (code grant) through ${url}`);
 
 	const created = await fetch(`${url}/v1/prompts`, {
 		method: "POST",

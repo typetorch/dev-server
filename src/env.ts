@@ -3,7 +3,7 @@
  * (the nearest file wins; real environment variables win over every file).
  *
  * Unlike the TypeTorch CLI, values are NOT copied into process.env: they stay in this private map, so child processes
- * (Claude Code, git, build tools) never inherit the exchange secret or the Open Cloud API key by accident. Values are
+ * (Claude Code, git, build tools) never inherit the Open Cloud API key or other local secrets by accident. Values are
  * never printed; only variable names and file paths are.
  */
 import { existsSync, readFileSync, readdirSync } from "node:fs";
@@ -87,10 +87,9 @@ export class Settings {
 
 /** Open Cloud API key variables, in the TypeTorch CLI's priority order. */
 export const API_KEY_VARS = ["TYPETORCH_API_KEY", "OPENCLOUD_API_KEY", "ROBLOX_API_KEY"] as const;
-export const SECRET_VAR = "TYPETORCH_REMOTE_CLAUDE_SECRET";
 
 /** Variables never passed to Claude Code or git (they would be readable by anything those processes run). */
-export const SCRUBBED_VARS = [SECRET_VAR, ...API_KEY_VARS];
+export const SCRUBBED_VARS: readonly string[] = [...API_KEY_VARS];
 
 /**
  * Variables that tie a process to the Claude Code session that launched this server (set when the dev server itself
@@ -134,7 +133,7 @@ function autoLoadedDotEnv(): Map<string, Set<string>> {
 }
 
 /**
- * process.env for a child process: without the secret variables, without anything Bun auto-loaded from a `.env` file,
+ * process.env for a child process: without the API key variables, without anything Bun auto-loaded from a `.env` file,
  * and (for Claude) without parent-session variables. `extra` is added last (the deploy gets the API key this way).
  */
 export function childEnv(options: { forClaude?: boolean; extra?: Record<string, string> } = {}): Record<string, string> {

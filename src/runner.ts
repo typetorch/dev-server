@@ -10,7 +10,7 @@
  *   - edits to build/tool configuration (package.json, lockfiles, tsconfig, project files, scripts, hooks...) are
  *     denied, because `bun run build` and the deploy would execute them; if such a file changes anyway, the commit is
  *     kept but nothing is deployed;
- *   - Claude, git and the build never inherit the exchange secret or the API key.
+ *   - Claude, git and the build never inherit the API key or values from .env files.
  */
 import { existsSync } from "node:fs";
 import { relative, resolve } from "node:path";

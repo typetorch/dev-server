@@ -1,8 +1,8 @@
-/** Terminal controls on stdin: revoke <id>, users, rotate, status, cancel <id>, quit (and Ctrl+C). */
+/** Terminal controls on stdin: code, revoke <id>, users, rotate, status, cancel <id>, quit (and Ctrl+C). */
 import type { Logger } from "./log";
 import type { RemoteClaudeSession } from "./session";
 
-export const HELP = "commands: revoke <userId> | users | rotate | status | cancel <promptId> | quit   (Ctrl+C also quits)";
+export const HELP = "commands: code | revoke <userId> | users | rotate | status | cancel <promptId> | quit   (Ctrl+C also quits)";
 
 export function handleCommand(session: RemoteClaudeSession, line: string, logger: Logger): "quit" | void {
 	const [command = "", arg] = line.trim().split(/\s+/);
@@ -20,6 +20,9 @@ export function handleCommand(session: RemoteClaudeSession, line: string, logger
 			return;
 		case "rotate":
 			session.rotate();
+			return;
+		case "code":
+			session.showCode();
 			return;
 		case "status":
 			for (const line of session.status().split("\n")) logger.info(line);

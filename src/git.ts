@@ -9,9 +9,9 @@
  *     merged) to the branch head before every run; the dev merges it back with `git merge remote-claude/<branch>`.
  * Every commit made here runs with hooks disabled, because hook scripts are files Claude could have edited.
  */
-import { existsSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { childEnv } from "./env";
 import { run } from "./proc";
 
@@ -156,4 +156,16 @@ export async function commitStaged(wt: Worktree, subject: string, trailer: strin
 	});
 	if (result.code !== 0) throw new GitError(`git commit failed: ${result.stderr.trim() || result.stdout.trim()}`);
 	return git(wt.path, ["rev-parse", "HEAD"]);
+}
+
+/** Makes sure `relPath` is git-ignored in `repo`, adding it to the local `.git/info/exclude` (never a tracked file). */
+export async function ensureIgnored(repo: string, relPath: string): Promise<void> {
+	const rel = relPath.replace(/\\/g, "/");
+	const checked = await run(["git", "check-ignore", "-q", rel], { cwd: repo, env: childEnv() });
+	if (checked.code === 0) return;
+	const exclude = resolve(repo, await git(repo, ["rev-parse", "--git-path", "info/exclude"]));
+	mkdirSync(dirname(exclude), { recursive: true });
+	const current = existsSync(exclude) ? readFileSync(exclude, "utf8") : "";
+	const line = `/${rel}`;
+	if (!current.split(/\r?\n/).includes(line)) appendFileSync(exclude, `${current && !current.endsWith("\n") ? "\n" : ""}${line}\n`);
 }

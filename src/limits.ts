@@ -1,4 +1,4 @@
-/** Rate limits, the per-IP failure lockout and the nonce replay cache. All in memory, for one session. */
+/** Rate limits and the nonce replay cache. All in memory, for one session. */
 
 /** At most `limit` hits per key in a sliding window of `windowMs`. */
 export class SlidingWindow {
@@ -31,36 +31,6 @@ export class SlidingWindow {
 		list.push(now);
 		this.hits.set(key, list);
 		return list.length;
-	}
-}
-
-/** After `limit` failures from one IP within `windowMs`, the IP is blocked for the rest of the session. */
-export class Lockout {
-	private readonly failures: SlidingWindow;
-	private readonly blocked = new Set<string>();
-
-	constructor(
-		private readonly limit = 5,
-		windowMs = 60_000,
-	) {
-		this.failures = new SlidingWindow(Number.MAX_SAFE_INTEGER, windowMs);
-	}
-
-	isBlocked(ip: string): boolean {
-		return this.blocked.has(ip);
-	}
-
-	/** Records a failure; returns true when this one blocked the IP. */
-	fail(ip: string): boolean {
-		if (this.failures.record(ip) >= this.limit && !this.blocked.has(ip)) {
-			this.blocked.add(ip);
-			return true;
-		}
-		return false;
-	}
-
-	blockedCount(): number {
-		return this.blocked.size;
 	}
 }
 

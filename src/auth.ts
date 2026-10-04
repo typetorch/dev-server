@@ -1,15 +1,18 @@
 /**
- * Credentials (plans/11 §3):
- *   - the exchange secret (Roblox Secrets Store value) is accepted only by POST /v1/token, compared in constant time;
+ * Credentials:
+ *   - the pairing code (see pairing.ts) is exchanged at POST /v1/token for an access token plus a refresh token;
+ *   - refresh tokens are 32 random bytes (base64url), kept server-side only as SHA-256 hashes, bound to one user, one
+ *     game server (JobId), this session and the user's token version; they last 12 hours (or until the session ends);
  *   - access tokens are HS256 JWTs (jose), 5 minutes, bound to one user, one game server (JobId), this session and
  *     this branch, signed with a 256-bit key generated in memory at session start (never written or logged).
  * Claims are re-checked against the live session on every use, so `revoke` and `rotate` take effect immediately.
  */
-import { createHash, timingSafeEqual } from "node:crypto";
+import { createHash } from "node:crypto";
 import { SignJWT, jwtVerify, type JWTPayload } from "jose";
 
 export const ISSUER = "typetorch-remote-claude";
 export const TOKEN_TTL_SECONDS = 300;
+export const REFRESH_TTL_SECONDS = 12 * 60 * 60;
 export const SCOPES = ["prompt:create", "prompt:read", "prompt:cancel"] as const;
 export type Scope = (typeof SCOPES)[number];
 
@@ -27,18 +30,15 @@ export function newSigningKey(): Uint8Array {
 	return crypto.getRandomValues(new Uint8Array(32));
 }
 
-/** Constant-time comparison of a presented secret with the configured one (SHA-256 first, so lengths always match). */
-export class ExchangeSecret {
-	private readonly digest: Buffer;
+const hashToken = (token: string) => createHash("sha256").update(token, "utf8").digest("hex");
 
-	constructor(secret: string) {
-		this.digest = createHash("sha256").update(secret, "utf8").digest();
-	}
-
-	matches(presented: string): boolean {
-		const candidate = createHash("sha256").update(presented, "utf8").digest();
-		return timingSafeEqual(candidate, this.digest);
-	}
+interface RefreshRecord {
+	userId: number;
+	job: string;
+	sid: string;
+	ver: number;
+	/** Unix seconds. */
+	expiresAt: number;
 }
 
 interface UserState {
@@ -65,6 +65,8 @@ export class SessionAuth {
 	readonly branch: string;
 	private key: Uint8Array;
 	private readonly users = new Map<number, UserState>();
+	/** SHA-256(refresh token) → binding. The tokens themselves are never stored. */
+	private readonly refresh = new Map<string, RefreshRecord>();
 
 	constructor(options: { branch: string; users: number[]; sessionId?: string; signingKey?: Uint8Array }) {
 		this.sessionId = options.sessionId ?? newSessionId();
@@ -91,18 +93,50 @@ export class SessionAuth {
 		return [...this.users].map(([userId, s]) => ({ userId, ver: s.ver, revoked: s.revoked }));
 	}
 
-	/** Removes the user for this session and bumps their token version. Returns false for unknown users. */
+	/** Removes the user for this session, bumps their token version and deletes their refresh tokens. */
 	revoke(userId: number): boolean {
 		const state = this.users.get(userId);
 		if (!state) return false;
 		state.revoked = true;
 		state.ver += 1;
+		for (const [hash, record] of this.refresh) if (record.userId === userId) this.refresh.delete(hash);
 		return true;
 	}
 
-	/** A new signing key: every token issued so far stops working. */
+	/** A new signing key and no refresh tokens: every token issued so far stops working. */
 	rotate(): void {
 		this.key = newSigningKey();
+		this.refresh.clear();
+	}
+
+	/** A new refresh token for (user, job, this session, the user's current token version). */
+	issueRefresh(userId: number, job: string): { token: string; expiresIn: number } {
+		const state = this.users.get(userId);
+		if (!state || state.revoked) throw new Error("user not allowed");
+		const now = Math.floor(Date.now() / 1000);
+		for (const [hash, record] of this.refresh) if (record.expiresAt <= now) this.refresh.delete(hash);
+		const token = randomId(32);
+		this.refresh.set(hashToken(token), { userId, job, sid: this.sessionId, ver: state.ver, expiresAt: now + REFRESH_TTL_SECONDS });
+		return { token, expiresIn: REFRESH_TTL_SECONDS };
+	}
+
+	/** Seconds left on a refresh token that matches (user, job, session, current version), or undefined. */
+	checkRefresh(token: string, userId: number, job: string): number | undefined {
+		const record = this.refresh.get(hashToken(token));
+		const now = Math.floor(Date.now() / 1000);
+		if (!record) return undefined;
+		if (record.expiresAt <= now) {
+			this.refresh.delete(hashToken(token));
+			return undefined;
+		}
+		const state = this.users.get(userId);
+		if (!state || state.revoked || record.ver !== state.ver) return undefined;
+		if (record.userId !== userId || record.job !== job || record.sid !== this.sessionId) return undefined;
+		return record.expiresAt - now;
+	}
+
+	refreshTokenCount(): number {
+		return this.refresh.size;
 	}
 
 	async issue(userId: number, job: string): Promise<{ token: string; jti: string; exp: number }> {

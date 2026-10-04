@@ -1,22 +1,21 @@
 /**
- * The loopback HTTP server (plans/11 §3). Four endpoints, nothing else:
- *   POST /v1/token                exchange secret → 5-minute JWT
+ * The loopback HTTP server (plans/11 §3, pairing-code variant). Four endpoints, nothing else:
+ *   POST /v1/token                pairing code or refresh token → 5-minute JWT
  *   POST /v1/prompts              JWT → {id, state:"queued"}
  *   GET  /v1/prompts/:id          JWT → status
  *   POST /v1/prompts/:id/cancel   JWT → {ok:true}
- * Errors are bare status codes with no body; the reason is only logged locally (never a token or secret).
+ * Errors are bare status codes with no body; the reason is only logged locally (never a token or code).
  */
 import type { Server } from "bun";
-import { ExchangeSecret, SessionAuth, type Scope } from "./auth";
-import { Lockout, NonceCache, SlidingWindow } from "./limits";
-import { consoleLogger, oneLine, type Logger } from "./log";
+import { SessionAuth, type Scope } from "./auth";
+import { NonceCache, SlidingWindow } from "./limits";
+import { addSecret, consoleLogger, oneLine, type Logger } from "./log";
+import { PairingCode } from "./pairing";
 import { PromptQueue, type Runner } from "./prompts";
-import { LIMITS, NONCE_PATTERN, PROMPT_ID_PATTERN, parsePromptRequest, parseTokenRequest } from "./schema";
-import { secretStrengthError } from "./secret";
+import { LIMITS, NONCE_PATTERN, PROMPT_ID_PATTERN, parsePromptRequest, parseTokenGrant } from "./schema";
 
 export const TIMESTAMP_WINDOW_SECONDS = 300;
 export const TOKENS_PER_USER_PER_MINUTE = 6;
-export const LOCKOUT_FAILURES = 5;
 
 const BASE_HEADERS: Record<string, string> = {
 	"cache-control": "no-store",
@@ -102,13 +101,7 @@ function headersTooLarge(req: Request): boolean {
 	return own > LIMITS.headerBytes || all > LIMITS.allHeaderBytes;
 }
 
-function isLoopback(address: string): boolean {
-	return address === "127.0.0.1" || address === "::1" || address === "::ffff:127.0.0.1";
-}
-
 export interface RemoteClaudeServerOptions {
-	/** The exchange secret (TYPETORCH_REMOTE_CLAUDE_SECRET). Refused when weaker than 32 random bytes. */
-	secret: string;
 	/** The TypeTorch branch this session serves. */
 	branch: string;
 	users: number[];
@@ -118,6 +111,8 @@ export interface RemoteClaudeServerOptions {
 	/** 0 (default) = a random free port. Always bound to 127.0.0.1. */
 	port?: number;
 	logger?: Logger;
+	/** Called with the new pairing code after every rotation (manual or automatic). */
+	onPairingCode?: (formatted: string, reason: "manual" | "auto") => void;
 	/** Tests only (honored only when NODE_ENV=test): a known signing key so tests can forge crafted tokens. */
 	unsafeSigningKey?: Uint8Array;
 }
@@ -125,30 +120,35 @@ export interface RemoteClaudeServerOptions {
 export interface RemoteClaudeServer {
 	readonly auth: SessionAuth;
 	readonly queue: PromptQueue;
-	readonly lockout: Lockout;
+	readonly pairing: PairingCode;
 	readonly port: number;
 	/** http://127.0.0.1:<port> */
 	readonly localUrl: string;
+	/** New signing key, no refresh tokens, new pairing code: every credential issued so far dies. */
+	rotateAll(): void;
 	stop(): Promise<void>;
 }
 
 export function createRemoteClaudeServer(options: RemoteClaudeServerOptions): RemoteClaudeServer {
-	const weakness = secretStrengthError(options.secret);
-	if (weakness) throw new Error(weakness);
 	if (options.users.length === 0) throw new Error("--users is required (no default, no wildcard)");
 	for (const id of options.users) if (!Number.isSafeInteger(id) || id <= 0) throw new Error(`invalid user id ${id}`);
 	if (options.unsafeSigningKey && process.env.NODE_ENV !== "test") throw new Error("unsafeSigningKey is for tests only");
 
 	const logger = options.logger ?? consoleLogger();
-	const secret = new ExchangeSecret(options.secret);
 	const auth = new SessionAuth({ branch: options.branch, users: options.users, signingKey: options.unsafeSigningKey });
+	const pairing = new PairingCode((code, reason) => {
+		addSecret(code);
+		addSecret(pairing.formatted);
+		options.onPairingCode?.(pairing.formatted, reason);
+	});
+	addSecret(pairing.raw);
+	addSecret(pairing.formatted);
 	const queue = new PromptQueue({
 		runner: options.runner,
 		maxQueued: options.maxQueued ?? 5,
 		maxPrompts: options.maxPrompts ?? 50,
 		logger,
 	});
-	const lockout = new Lockout(LOCKOUT_FAILURES, 60_000);
 	const tokenLimiter = new SlidingWindow(TOKENS_PER_USER_PER_MINUTE, 60_000);
 	const nonces = new NonceCache();
 
@@ -158,28 +158,41 @@ export function createRemoteClaudeServer(options: RemoteClaudeServerOptions): Re
 		else logger.info(line);
 	};
 
-	async function handleToken(req: Request, ip: string): Promise<Response> {
+	async function handleToken(req: Request): Promise<Response> {
 		const what = "POST /v1/token";
-		const authz = req.headers.get("authorization") ?? "";
-		const presented = authz.startsWith("Bearer ") ? authz.slice(7) : "";
-		if (!presented || presented.length > 512 || !secret.matches(presented)) {
-			const blocked = lockout.fail(ip);
-			decide(401, what, `bad exchange secret ip=${ip}${blocked ? " (ip now blocked for this session)" : ""}`);
-			return empty(401);
-		}
 		if (!isJson(req)) return decide(401, what, "content-type"), empty(401);
 		const text = await readBody(req, LIMITS.tokenBodyBytes);
 		if (text === TOO_LARGE || text === undefined) return decide(401, what, "body size/encoding"), empty(401);
-		const body = parseTokenRequest(parseJson(text));
-		if (!body) return decide(401, what, "body schema"), empty(401);
-		const sub = `roblox:${body.user}`;
-		if (body.sid !== auth.sessionId) return decide(401, what, `${sub} wrong sid`), empty(401);
-		if (body.branch !== auth.branch) return decide(401, what, `${sub} wrong branch`), empty(401);
-		if (!auth.isAllowed(body.user)) return decide(401, what, `${sub} not allowed`), empty(401);
-		if (!tokenLimiter.take(String(body.user))) return decide(429, what, `${sub} token rate limit`), empty(429);
-		const issued = await auth.issue(body.user, body.job);
-		decide(200, what, `${sub} jti=${issued.jti.slice(0, 8)} issued`);
-		return json({ access_token: issued.token, expires_in: 300 });
+		const grant = parseTokenGrant(parseJson(text));
+		if (!grant) return decide(401, what, "body schema"), empty(401);
+		const sub = `roblox:${grant.user}`;
+		const label = `${grant.grant} grant ${sub}`;
+		// Session, branch and user are checked before the code, so only callers who already know the session id, the
+		// branch and an allowed user id can make code attempts count (or trip the brute-force block).
+		if (grant.sid !== auth.sessionId) return decide(401, what, `${label} wrong sid`), empty(401);
+		if (grant.branch !== auth.branch) return decide(401, what, `${label} wrong branch`), empty(401);
+		if (!auth.isAllowed(grant.user)) return decide(401, what, `${label} not allowed`), empty(401);
+
+		if (grant.grant === "code") {
+			if (pairing.isBlocked()) return decide(429, what, `${label} code attempts blocked (too many failures)`), empty(429);
+			if (!pairing.matches(grant.code)) {
+				const { blocked, rotated } = pairing.fail();
+				const notes = [blocked && "code attempts blocked for 60 s", rotated && "pairing code rotated after 30 failures"].filter(Boolean).join("; ");
+				return decide(401, what, `${label} wrong code${notes ? ` (${notes})` : ""}`), empty(401);
+			}
+			if (!tokenLimiter.take(String(grant.user))) return decide(429, what, `${label} token rate limit`), empty(429);
+			const issued = await auth.issue(grant.user, grant.job);
+			const refresh = auth.issueRefresh(grant.user, grant.job);
+			decide(200, what, `${label} jti=${issued.jti.slice(0, 8)} paired`);
+			return json({ access_token: issued.token, expires_in: 300, refresh_token: refresh.token, refresh_expires_in: refresh.expiresIn });
+		}
+
+		const left = auth.checkRefresh(grant.refresh_token, grant.user, grant.job);
+		if (left === undefined) return decide(401, what, `${label} refresh token not valid for this user/job/session`), empty(401);
+		if (!tokenLimiter.take(String(grant.user))) return decide(429, what, `${label} token rate limit`), empty(429);
+		const issued = await auth.issue(grant.user, grant.job);
+		decide(200, what, `${label} jti=${issued.jti.slice(0, 8)} refreshed`);
+		return json({ access_token: issued.token, expires_in: 300, refresh_token: grant.refresh_token, refresh_expires_in: left });
 	}
 
 	async function handlePrompts(req: Request, route: Exclude<Route, { kind: "token" }>): Promise<Response> {
@@ -241,16 +254,12 @@ export function createRemoteClaudeServer(options: RemoteClaudeServerOptions): Re
 		port: options.port ?? 0,
 		development: false,
 		maxRequestBodySize: 64 * 1024,
-		async fetch(req: Request, srv: Server<undefined>): Promise<Response> {
+		async fetch(req: Request): Promise<Response> {
 			const url = new URL(req.url);
-			const socket = srv.requestIP(req)?.address ?? "unknown";
-			const forwarded = req.headers.get("cf-connecting-ip");
-			const ip = forwarded && isLoopback(socket) && /^[0-9A-Fa-f:.]{2,45}$/.test(forwarded) ? forwarded : socket;
-			if (lockout.isBlocked(ip)) return empty(429);
 			const route = matchRoute(req.method, url.pathname);
 			if (!route) return empty(404);
 			if (headersTooLarge(req)) return decide(431, `${req.method} ${url.pathname.slice(0, 40)}`, "headers too large"), empty(431);
-			return route.kind === "token" ? handleToken(req, ip) : handlePrompts(req, route);
+			return route.kind === "token" ? handleToken(req) : handlePrompts(req, route);
 		},
 		error(error: Error): Response {
 			logger.error(`request failed: ${error.message}`);
@@ -262,9 +271,13 @@ export function createRemoteClaudeServer(options: RemoteClaudeServerOptions): Re
 	return {
 		auth,
 		queue,
-		lockout,
+		pairing,
 		port,
 		localUrl: `http://127.0.0.1:${port}`,
+		rotateAll() {
+			auth.rotate();
+			pairing.rotate("manual");
+		},
 		async stop() {
 			await queue.stop();
 			await server.stop(true);
