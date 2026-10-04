@@ -27,6 +27,8 @@ Options:
   --max-budget-usd <n>   per-run spend cap passed to claude
   --protect <globs>      extra comma-separated globs Claude may not edit (e.g. files your build script runs);
                          a change to one is committed but not deployed
+  --code-ttl <minutes>   lifetime of each pairing code (default 180); a new one is printed when it expires,
+                         and paired servers must pair again at most this long after pairing
   --no-announce          do not publish the session to game servers (local testing)
   --no-install           do not bun install in a fresh worktree
 
@@ -38,7 +40,7 @@ interface Parsed {
 	flags: Map<string, string | true>;
 }
 
-const VALUE_FLAGS = new Set(["users", "repo", "branch", "port", "max-prompts", "cli", "model", "max-budget-usd", "protect"]);
+const VALUE_FLAGS = new Set(["users", "repo", "branch", "port", "max-prompts", "cli", "model", "max-budget-usd", "protect", "code-ttl"]);
 
 function parseArgs(argv: string[]): Parsed {
 	const flags = new Map<string, string | true>();
@@ -105,6 +107,7 @@ async function main(argv: string[]): Promise<number> {
 		installDeps: !flags.has("no-install"),
 		model: flags.get("model") as string | undefined,
 		maxBudgetUsd: positive(flags, "max-budget-usd"),
+		codeTtlMinutes: positive(flags, "code-ttl"),
 		protect: typeof flags.get("protect") === "string" ? (flags.get("protect") as string).split(",").map((g) => g.trim()).filter(Boolean) : undefined,
 		logger: consoleLogger(),
 	});

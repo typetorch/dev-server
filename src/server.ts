@@ -10,7 +10,7 @@ import type { Server } from "bun";
 import { SessionAuth, type Scope } from "./auth";
 import { NonceCache, SlidingWindow } from "./limits";
 import { addSecret, consoleLogger, oneLine, type Logger } from "./log";
-import { PairingCode } from "./pairing";
+import { DEFAULT_CODE_TTL_MS, PairingCode, type RotateReason } from "./pairing";
 import { PromptQueue, type Runner } from "./prompts";
 import { LIMITS, NONCE_PATTERN, PROMPT_ID_PATTERN, parsePromptRequest, parseTokenGrant } from "./schema";
 
@@ -111,8 +111,12 @@ export interface RemoteClaudeServerOptions {
 	/** 0 (default) = a random free port. Always bound to 127.0.0.1. */
 	port?: number;
 	logger?: Logger;
-	/** Called with the new pairing code after every rotation (manual or automatic). */
-	onPairingCode?: (formatted: string, reason: "manual" | "auto") => void;
+	/** Called with the new pairing code after every rotation (manual, brute force or expiry). */
+	onPairingCode?: (formatted: string, reason: RotateReason, expiresAt: number) => void;
+	/** Lifetime of each pairing code (default 3 hours); refresh tokens never outlive it (counted from pairing). */
+	codeTtlMs?: number;
+	/** Clock in ms for code and refresh-token expiry (tests inject one). */
+	now?: () => number;
 	/** Tests only (honored only when NODE_ENV=test): a known signing key so tests can forge crafted tokens. */
 	unsafeSigningKey?: Uint8Array;
 }
@@ -135,12 +139,22 @@ export function createRemoteClaudeServer(options: RemoteClaudeServerOptions): Re
 	if (options.unsafeSigningKey && process.env.NODE_ENV !== "test") throw new Error("unsafeSigningKey is for tests only");
 
 	const logger = options.logger ?? consoleLogger();
-	const auth = new SessionAuth({ branch: options.branch, users: options.users, signingKey: options.unsafeSigningKey });
-	const pairing = new PairingCode((code, reason) => {
-		addSecret(code);
-		addSecret(pairing.formatted);
-		options.onPairingCode?.(pairing.formatted, reason);
+	const codeTtlMs = options.codeTtlMs ?? DEFAULT_CODE_TTL_MS;
+	const auth = new SessionAuth({
+		branch: options.branch,
+		users: options.users,
+		signingKey: options.unsafeSigningKey,
+		refreshTtlSeconds: codeTtlMs / 1000,
+		now: options.now,
 	});
+	const pairing = new PairingCode(
+		(code, reason) => {
+			addSecret(code);
+			addSecret(pairing.formatted);
+			options.onPairingCode?.(pairing.formatted, reason, pairing.expiresAt);
+		},
+		{ ttlMs: codeTtlMs, now: options.now },
+	);
 	addSecret(pairing.raw);
 	addSecret(pairing.formatted);
 	const queue = new PromptQueue({
@@ -279,6 +293,7 @@ export function createRemoteClaudeServer(options: RemoteClaudeServerOptions): Re
 			pairing.rotate("manual");
 		},
 		async stop() {
+			pairing.dispose();
 			await queue.stop();
 			await server.stop(true);
 		},

@@ -6,6 +6,7 @@
  * Brute force (counted per session, not per IP: Roblox servers share egress IPs):
  *   - more than 10 failures within a minute → code grants answer 429 for 60 s (without checking the code);
  *   - more than 30 failures in total → the code is rotated automatically.
+ * Every code also expires `ttlMs` after it is issued (default 3 hours) and is then replaced automatically.
  */
 import { createHash, timingSafeEqual } from "node:crypto";
 
@@ -15,6 +16,7 @@ export const CODE_LENGTH = 24;
 export const CODE_FAILURES_PER_MINUTE = 10;
 export const CODE_BLOCK_MS = 60_000;
 export const CODE_FAILURES_BEFORE_ROTATE = 30;
+export const DEFAULT_CODE_TTL_MS = 3 * 60 * 60 * 1000;
 
 export function generateCode(): string {
 	// 15 random bytes = 120 bits = 24 symbols of 5 bits.
@@ -46,6 +48,14 @@ export function formatCode(code: string): string {
 const digest = (text: string) => createHash("sha256").update(text, "utf8").digest();
 
 export type CodeFailure = { blocked: boolean; rotated: boolean };
+export type RotateReason = "manual" | "auto" | "expired";
+
+export interface PairingCodeOptions {
+	/** Lifetime of each code (default 3 hours). */
+	ttlMs?: number;
+	/** Clock in ms (tests inject one). */
+	now?: () => number;
+}
 
 export class PairingCode {
 	private code = generateCode();
@@ -53,8 +63,22 @@ export class PairingCode {
 	private recentFailures: number[] = [];
 	private totalFailures = 0;
 	private blockedUntil = 0;
+	private issuedAt: number;
+	private timer: ReturnType<typeof setTimeout> | undefined;
+	private disposed = false;
+	readonly ttlMs: number;
+	private readonly now: () => number;
 
-	constructor(private readonly onRotate?: (code: string, reason: "manual" | "auto") => void) {}
+	constructor(
+		private readonly onRotate?: (code: string, reason: RotateReason) => void,
+		options: PairingCodeOptions = {},
+	) {
+		this.ttlMs = options.ttlMs ?? DEFAULT_CODE_TTL_MS;
+		if (!(this.ttlMs > 0)) throw new Error("the pairing code lifetime must be positive");
+		this.now = options.now ?? Date.now;
+		this.issuedAt = this.now();
+		this.schedule();
+	}
 
 	/** XXXX-XXXX-XXXX-XXXX-XXXX-XXXX */
 	get formatted(): string {
@@ -66,22 +90,35 @@ export class PairingCode {
 		return this.code;
 	}
 
+	/** When the current code expires (ms since the epoch). */
+	get expiresAt(): number {
+		return this.issuedAt + this.ttlMs;
+	}
+
 	/** Wrong attempts since the last rotation. */
 	get failureCount(): number {
 		return this.totalFailures;
 	}
 
-	isBlocked(now = Date.now()): boolean {
+	isBlocked(now = this.now()): boolean {
 		return now < this.blockedUntil;
 	}
 
-	/** Constant-time comparison of a normalized attempt. */
+	/** Replaces the code if it has expired. Returns true when it did. */
+	checkExpiry(now = this.now()): boolean {
+		if (now < this.expiresAt) return false;
+		this.rotate("expired");
+		return true;
+	}
+
+	/** Constant-time comparison of a normalized attempt (an expired code is replaced first, so it never matches). */
 	matches(input: string): boolean {
+		this.checkExpiry();
 		return timingSafeEqual(digest(normalizeCode(input)), this.hash);
 	}
 
 	/** Records a wrong code: may start the 60 s block and, past 30 failures, rotate the code. */
-	fail(now = Date.now()): CodeFailure {
+	fail(now = this.now()): CodeFailure {
 		this.totalFailures += 1;
 		this.recentFailures = this.recentFailures.filter((t) => now - t < 60_000);
 		this.recentFailures.push(now);
@@ -99,11 +136,32 @@ export class PairingCode {
 		return { blocked, rotated };
 	}
 
-	rotate(reason: "manual" | "auto" = "manual"): void {
+	rotate(reason: RotateReason = "manual"): void {
 		this.code = generateCode();
 		this.hash = digest(this.code);
+		this.issuedAt = this.now();
 		this.totalFailures = 0;
 		this.recentFailures = [];
+		this.schedule();
 		this.onRotate?.(this.code, reason);
+	}
+
+	/** Stops the expiry timer. */
+	dispose(): void {
+		this.disposed = true;
+		if (this.timer) clearTimeout(this.timer);
+		this.timer = undefined;
+	}
+
+	/** Replaces the code when it expires, even if nobody tries it (so a fresh code is printed right away). */
+	private schedule(): void {
+		if (this.timer) clearTimeout(this.timer);
+		if (this.disposed) return;
+		const delay = Math.min(Math.max(0, this.expiresAt - this.now()), 2_147_000_000);
+		this.timer = setTimeout(() => {
+			this.timer = undefined;
+			if (!this.checkExpiry()) this.schedule();
+		}, delay + 5);
+		(this.timer as { unref?: () => void }).unref?.();
 	}
 }

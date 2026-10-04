@@ -37,11 +37,14 @@ typetorch-dev-server remote-claude --users 1,2,56 [--repo <dir>] [--branch <name
 ```
 At startup it prints one line:
 ```
-pairing code: ABCD-EFGH-JKLM-NPQR-STUV-WXYZ  (paste it into DEV > Claude in game)
+pairing code: ABCD-EFGH-JKLM-NPQR-STUV-WXYZ  (valid until 18:02, paste it into DEV > Claude in game)
 ```
-The code is also copied to the clipboard and saved to `<repo>/.typetorch/remote-claude.code` (git-ignored through
-`.git/info/exclude`, deleted when the session ends). Paste it into **DEV > Claude** in game; that game server is then
-paired for the session and renews its tokens on its own.
+The code is also copied to the clipboard and saved, with its expiry time, to `<repo>/.typetorch/remote-claude.code`
+(git-ignored through `.git/info/exclude`, deleted when the session ends). Paste it into **DEV > Claude** in game; that
+game server is then paired and renews its tokens on its own for up to 3 hours, then asks for a code again.
+
+Each code lives **3 hours** (`--code-ttl <minutes>`). When it expires a new one is printed (and copied and saved) right
+away; servers that already paired keep working until 3 hours after they paired.
 
 - `--users` (required): Roblox user ids allowed to prompt. No default, no wildcard.
 - `--branch`: the git branch (default: the repo's current branch), mapped to a TypeTorch branch by `typetorch.json`
@@ -51,6 +54,7 @@ paired for the session and renews its tokens on its own.
   `../cli/src/index.ts`, then `typetorch` on PATH; without one, prompts stop at `committed`).
 - `--protect <globs>`: extra files Claude may not edit (for example files your build script runs); a change to one is
   committed but not deployed.
+- `--code-ttl <minutes>`: lifetime of each pairing code (default 180). Refresh tokens never outlive it (12 h at most).
 - Also: `--model <name>`, `--max-budget-usd <n>` (passed to `claude`), `--no-announce` (local testing), `--no-install`.
 
 Terminal commands while it runs:
@@ -61,7 +65,7 @@ Terminal commands while it runs:
 | `revoke <userId>` | Removes the user for this session: their access and refresh tokens die and they can't pair again |
 | `users` | Lists users, revoked or not, and their token version |
 | `rotate` | New signing key, no refresh tokens, new pairing code: every game server must pair again |
-| `status` | Session, tunnel, queue, refresh tokens |
+| `status` | Session, tunnel, queue, how long the pairing code is still valid (not the code), refresh tokens |
 | `cancel <promptId>` | Cancels a prompt |
 | `quit` / Ctrl+C | Tells game servers the session closed, stops the tunnel and exits |
 
@@ -74,9 +78,9 @@ The Quick Tunnel URL is public, so the server authenticates everything itself:
 | Layer | What it does |
 |---|---|
 | Loopback bind | The HTTP server listens on `127.0.0.1` only; the LAN can't reach it, only the tunnel |
-| Pairing code | 24 symbols from a 32-symbol alphabet without look-alikes (120 bits), new every session. Shown only on your terminal, your clipboard and a git-ignored file; never announced, logged elsewhere or committed. Compared in constant time |
+| Pairing code | 24 symbols from a 32-symbol alphabet without look-alikes (120 bits), new every session and every 3 hours (`--code-ttl`). Shown only on your terminal, your clipboard and a git-ignored file; never announced, logged elsewhere or committed. Compared in constant time |
 | Brute force | Code attempts only count once `sid`, branch and an allowed user id are right. More than 10 wrong codes in a minute → code grants answer `429` for 60 s; more than 30 in total → the code rotates automatically (the new one is printed). Counted per session, not per IP, because Roblox servers share egress IPs |
-| Refresh token | 32 random bytes, stored only as a SHA-256 hash, bound to one user, one game server (`job`), this session and the user's token version; 12 hours at most, and gone when the session ends |
+| Refresh token | 32 random bytes, stored only as a SHA-256 hash, bound to one user, one game server (`job`), this session and the user's token version; it lasts as long as a code (3 hours by default, 12 hours at most) counted from pairing, and is gone when the session ends |
 | Access token | HS256 JWT (jose), 5 minutes, bound to one user, one game server (`job`), this session (`aud`, `sid`) and this branch, with scopes. Signed with a 256-bit key generated in memory per session (never written or logged); Ctrl+C or `rotate` kills every token |
 | Verification | `algorithms: ["HS256"]` only (so `alg: none` and algorithm confusion fail), issuer, audience, `clockTolerance: 30`, `maxTokenAge: "5m"`, required claims; then **at use time**: `sid`, user still allowed and not revoked, `ver` current, `X-TT-Job` = `job`, branch, scope, prompt ownership |
 | Replay | Every POST to `/v1/prompts*` (create, cancel) needs a unique `X-TT-Nonce` and an `X-TT-Timestamp` within ±300 s |
@@ -97,7 +101,8 @@ No `Authorization` header. `Content-Type: application/json`, body ≤ 1 KB, exac
 - **Refresh:** `{"grant":"refresh","sid","user","job","branch","refresh_token":"<43 chars>"}`
 
 `200` → `{"access_token":"<JWT>","expires_in":300,"refresh_token":"<43 chars>","refresh_expires_in":<seconds>}`
-(a refresh returns the same refresh token and its remaining lifetime).
+(`refresh_expires_in` is at most the code lifetime, 10800 s by default, counted from pairing; a refresh returns the
+same refresh token and its remaining lifetime).
 `401` for every failure (schema, sid, branch, user not allowed or revoked, wrong code, refresh token not valid for
 this user/job/session); `429` when code attempts are blocked or the user hit 6 tokens per minute.
 

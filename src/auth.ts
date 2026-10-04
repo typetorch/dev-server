@@ -67,8 +67,13 @@ export class SessionAuth {
 	private readonly users = new Map<number, UserState>();
 	/** SHA-256(refresh token) → binding. The tokens themselves are never stored. */
 	private readonly refresh = new Map<string, RefreshRecord>();
+	/** Refresh token lifetime: 12 h at most, and never longer than a pairing code lives (the server passes that in). */
+	readonly refreshTtlSeconds: number;
+	private readonly clock: () => number;
 
-	constructor(options: { branch: string; users: number[]; sessionId?: string; signingKey?: Uint8Array }) {
+	constructor(options: { branch: string; users: number[]; sessionId?: string; signingKey?: Uint8Array; refreshTtlSeconds?: number; now?: () => number }) {
+		this.refreshTtlSeconds = Math.min(REFRESH_TTL_SECONDS, Math.max(1, Math.floor(options.refreshTtlSeconds ?? REFRESH_TTL_SECONDS)));
+		this.clock = options.now ?? Date.now;
 		this.sessionId = options.sessionId ?? newSessionId();
 		this.branch = options.branch;
 		this.key = options.signingKey ?? newSigningKey();
@@ -113,17 +118,17 @@ export class SessionAuth {
 	issueRefresh(userId: number, job: string): { token: string; expiresIn: number } {
 		const state = this.users.get(userId);
 		if (!state || state.revoked) throw new Error("user not allowed");
-		const now = Math.floor(Date.now() / 1000);
+		const now = Math.floor(this.clock() / 1000);
 		for (const [hash, record] of this.refresh) if (record.expiresAt <= now) this.refresh.delete(hash);
 		const token = randomId(32);
-		this.refresh.set(hashToken(token), { userId, job, sid: this.sessionId, ver: state.ver, expiresAt: now + REFRESH_TTL_SECONDS });
-		return { token, expiresIn: REFRESH_TTL_SECONDS };
+		this.refresh.set(hashToken(token), { userId, job, sid: this.sessionId, ver: state.ver, expiresAt: now + this.refreshTtlSeconds });
+		return { token, expiresIn: this.refreshTtlSeconds };
 	}
 
 	/** Seconds left on a refresh token that matches (user, job, session, current version), or undefined. */
 	checkRefresh(token: string, userId: number, job: string): number | undefined {
 		const record = this.refresh.get(hashToken(token));
-		const now = Math.floor(Date.now() / 1000);
+		const now = Math.floor(this.clock() / 1000);
 		if (!record) return undefined;
 		if (record.expiresAt <= now) {
 			this.refresh.delete(hashToken(token));

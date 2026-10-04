@@ -49,6 +49,10 @@ export interface RemoteClaudeOptions {
 	runner?: Runner;
 	/** Copy the pairing code to the clipboard (default true). */
 	clipboard?: boolean;
+	/** Lifetime of each pairing code in minutes (default 180). Refresh tokens never outlive it. */
+	codeTtlMinutes?: number;
+	/** Clock in ms for code and refresh-token expiry (tests). */
+	now?: () => number;
 }
 
 export interface RemoteClaudeSession {
@@ -121,15 +125,19 @@ export async function startRemoteClaude(options: RemoteClaudeOptions): Promise<R
 	// Nowhere else: it is redacted from every other log line and never announced or committed.
 	const codeFile = join(repo, ".typetorch", "remote-claude.code");
 	await ensureIgnored(repo, ".typetorch/remote-claude.code");
-	const publishCode = (formatted: string) => {
+	const clock = options.now ?? Date.now;
+	const codeTtlMinutes = options.codeTtlMinutes ?? 180;
+	if (!(codeTtlMinutes > 0)) throw new Error("--code-ttl must be a positive number of minutes");
+	const codeTtlMs = Math.round(codeTtlMinutes * 60_000);
+	const publishCode = (formatted: string, expiresAt: number) => {
 		try {
 			mkdirSync(dirname(codeFile), { recursive: true });
-			writeFileSync(codeFile, `${formatted}\n`, { mode: 0o600 });
+			writeFileSync(codeFile, `${formatted}\nexpires ${new Date(expiresAt).toISOString()}\n`, { mode: 0o600 });
 		} catch (error) {
 			logger.warn(`could not save the pairing code to ${codeFile}: ${(error as Error).message}`);
 		}
 		if (options.clipboard !== false) void copyToClipboard(formatted);
-		process.stdout.write(`pairing code: ${formatted}  (paste it into DEV > Claude in game)\n`);
+		process.stdout.write(`pairing code: ${formatted}  (valid until ${formatClock(expiresAt, clock())}, paste it into DEV > Claude in game)\n`);
 	};
 
 	// 6. Runner + HTTP server.
@@ -155,9 +163,12 @@ export async function startRemoteClaude(options: RemoteClaudeOptions): Promise<R
 		maxPrompts: options.maxPrompts ?? 50,
 		port: options.port,
 		logger,
-		onPairingCode: (formatted, reason) => {
+		codeTtlMs: codeTtlMs,
+		now: options.now,
+		onPairingCode: (formatted, reason, expiresAt) => {
 			if (reason === "auto") logger.warn("pairing code rotated automatically after 30 wrong attempts; paired servers keep working");
-			publishCode(formatted);
+			if (reason === "expired") logger.info("pairing code expired; new code below (paired servers keep working until their refresh token expires)");
+			publishCode(formatted, expiresAt);
 		},
 	});
 	const { auth } = server;
@@ -224,7 +235,7 @@ export async function startRemoteClaude(options: RemoteClaudeOptions): Promise<R
 			server.rotateAll(); // prints the new pairing code through onPairingCode
 		},
 		showCode() {
-			publishCode(server.pairing.formatted);
+			publishCode(server.pairing.formatted, server.pairing.expiresAt);
 		},
 		status() {
 			const q = server.queue;
@@ -233,7 +244,7 @@ export async function startRemoteClaude(options: RemoteClaudeOptions): Promise<R
 				`session ${auth.sessionId.slice(0, 8)}  branch ${branch} (git ${gitBranch}, worktree on ${worktree.workBranch})`,
 				`tunnel ${tunnel?.url ?? (cloudflared ? "(down)" : "(disabled)")}  announce ${announcer ? "on" : "off"}  deploy ${deploy ? (cli ? "on" : "no CLI") : "off"}`,
 				`users ${auth.allowedUsers().join(", ") || "(none)"}  prompts ${q.createdCount}/${options.maxPrompts ?? 50}  queued ${q.queued.length}  running ${active ? `${active.id.slice(0, 8)} (${active.state})` : "-"}`,
-				`refresh tokens ${auth.refreshTokenCount()}  code attempts ${server.pairing.isBlocked() ? "blocked (too many failures)" : "open"}`,
+				`pairing code valid for ${formatDuration(server.pairing.expiresAt - clock())} (until ${formatClock(server.pairing.expiresAt, clock())})  code attempts ${server.pairing.isBlocked() ? "blocked (too many failures)" : "open"}  refresh tokens ${auth.refreshTokenCount()}`,
 			].join("\n");
 		},
 		close() {
@@ -253,8 +264,25 @@ export async function startRemoteClaude(options: RemoteClaudeOptions): Promise<R
 
 	logger.info(`remote-claude session ${auth.sessionId.slice(0, 8)} on ${branch} for roblox users ${users.join(", ")}`);
 	if (options.terminal !== false) attachTerminal(session, logger);
-	publishCode(server.pairing.formatted);
+	publishCode(server.pairing.formatted, server.pairing.expiresAt);
 	return session;
+}
+
+const pad2 = (n: number) => String(n).padStart(2, "0");
+
+/** Local "HH:MM", with the date in front when it is not today. */
+export function formatClock(at: number, now = Date.now()): string {
+	const d = new Date(at);
+	const time = `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+	return d.toDateString() === new Date(now).toDateString() ? time : `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${time}`;
+}
+
+/** "2 h 05 min", "12 min", "40 s". */
+export function formatDuration(ms: number): string {
+	const s = Math.max(0, Math.round(ms / 1000));
+	if (s < 60) return `${s} s`;
+	const m = Math.floor(s / 60);
+	return m < 60 ? `${m} min` : `${Math.floor(m / 60)} h ${pad2(m % 60)} min`;
 }
 
 /** Copies text to the clipboard (Windows clip.exe, macOS pbcopy; elsewhere nothing). */

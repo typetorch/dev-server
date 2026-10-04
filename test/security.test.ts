@@ -11,11 +11,11 @@ import { SignJWT, decodeJwt, decodeProtectedHeader } from "jose";
 import { ISSUER, REFRESH_TTL_SECONDS } from "../src/auth";
 import { closedMessage, registrationMessage } from "../src/announce";
 import { silentLogger } from "../src/log";
-import { CODE_ALPHABET, PairingCode, generateCode, normalizeCode } from "../src/pairing";
+import { CODE_ALPHABET, DEFAULT_CODE_TTL_MS, PairingCode, generateCode, normalizeCode } from "../src/pairing";
 import type { Runner } from "../src/prompts";
 import { isProtectedPath, wrapPrompt } from "../src/runner";
 import { createRemoteClaudeServer, type RemoteClaudeServer } from "../src/server";
-import { startRemoteClaude, type RemoteClaudeSession } from "../src/session";
+import { formatClock, formatDuration, startRemoteClaude, type RemoteClaudeSession } from "../src/session";
 import { handleCommand } from "../src/terminal";
 import { QuickTunnel, locateCloudflared } from "../src/tunnel";
 
@@ -164,6 +164,8 @@ describe("startup", () => {
 			return true;
 		}) as typeof process.stdout.write;
 		let session: RemoteClaudeSession | undefined;
+		let clock = Date.UTC(2026, 9, 4, 12, 0, 0); // fake clock for code expiry
+		const line = (code: string, expiresAt: number) => `pairing code: ${code}  (valid until ${formatClock(expiresAt, clock)}, paste it into DEV > Claude in game)\n`;
 		try {
 			session = await startRemoteClaude({
 				users: [USERS[0]],
@@ -175,25 +177,43 @@ describe("startup", () => {
 				installDeps: false,
 				runner: stubRunner,
 				logger: silentLogger,
+				codeTtlMinutes: 180,
+				now: () => clock,
 			});
-			const code = session.server.pairing.formatted;
-			expect(printed.join("")).toContain(`pairing code: ${code}  (paste it into DEV > Claude in game)`);
-			expect(readFileSync(session.codeFile, "utf8").trim()).toBe(code);
+			const pairing = session.server.pairing;
+			const code = pairing.formatted;
+			expect(pairing.expiresAt).toBe(clock + 3 * 3600_000);
+			expect(printed.join("")).toContain(line(code, pairing.expiresAt));
+			expect(readFileSync(session.codeFile, "utf8")).toBe(`${code}\nexpires ${new Date(pairing.expiresAt).toISOString()}\n`);
 			expect(git("check-ignore", "-q", ".typetorch/remote-claude.code").exitCode).toBe(0);
 			expect(git("status", "--porcelain").stdout.toString()).toBe("");
+			expect(session.status()).toContain("pairing code valid for 3 h 00 min");
+			expect(session.status()).not.toContain(code);
 			// Pairing works with no secret.
 			expect((await tokenRequest(session.server, codeGrant(session.server, USERS[0]))).status).toBe(200);
 			// rotate → a new code is printed and saved; the old one stops working.
 			printed.length = 0;
 			session.rotate();
-			const next = session.server.pairing.formatted;
+			const next = pairing.formatted;
 			expect(next).not.toBe(code);
-			expect(printed.join("")).toContain(`pairing code: ${next}  (paste it into DEV > Claude in game)`);
-			expect(readFileSync(session.codeFile, "utf8").trim()).toBe(next);
+			expect(printed.join("")).toContain(line(next, pairing.expiresAt));
+			expect(readFileSync(session.codeFile, "utf8").split("\n")[0]).toBe(next);
 			// `code` prints it again.
 			printed.length = 0;
 			handleCommand(session, "code", silentLogger);
-			expect(printed.join("")).toContain(`pairing code: ${next}`);
+			expect(printed.join("")).toBe(line(next, pairing.expiresAt));
+			// 2 h 10 min later: status shows what is left.
+			clock += 130 * 60_000;
+			expect(session.status()).toContain("pairing code valid for 50 min");
+			// At expiry a new code is printed, copied and saved with its new expiry.
+			printed.length = 0;
+			clock += 50 * 60_000;
+			expect(pairing.checkExpiry()).toBe(true);
+			const third = pairing.formatted;
+			expect(third).not.toBe(next);
+			expect(pairing.expiresAt).toBe(clock + 3 * 3600_000);
+			expect(printed.join("")).toBe(line(third, pairing.expiresAt));
+			expect(readFileSync(session.codeFile, "utf8")).toBe(`${third}\nexpires ${new Date(pairing.expiresAt).toISOString()}\n`);
 		} finally {
 			process.stdout.write = write;
 			await session?.close();
@@ -212,7 +232,7 @@ describe("POST /v1/token: code grant", () => {
 		const body = (await res.json()) as TokenResponse;
 		expect(Object.keys(body).sort()).toEqual(["access_token", "expires_in", "refresh_expires_in", "refresh_token"]);
 		expect(body.expires_in).toBe(300);
-		expect(body.refresh_expires_in).toBe(REFRESH_TTL_SECONDS);
+		expect(body.refresh_expires_in).toBe(DEFAULT_CODE_TTL_MS / 1000); // 3 h: never longer than a code lives
 		expect(body.refresh_token).toMatch(/^[A-Za-z0-9_-]{43}$/);
 		const jwt = body.access_token;
 		expect(decodeProtectedHeader(jwt)).toEqual({ alg: "HS256", typ: "JWT" });
@@ -341,6 +361,90 @@ describe("POST /v1/token: code grant", () => {
 	});
 });
 
+describe("pairing code lifetime (injectable clock)", () => {
+	test("a code expires ttl after it is issued and is replaced (reason 'expired')", () => {
+		let clock = 5_000_000;
+		const rotations: string[] = [];
+		const pairing = new PairingCode((_, reason) => rotations.push(reason), { ttlMs: 3 * 3600_000, now: () => clock });
+		try {
+			const first = pairing.formatted;
+			expect(pairing.expiresAt).toBe(5_000_000 + 3 * 3600_000);
+			clock += 3 * 3600_000 - 1;
+			expect(pairing.checkExpiry()).toBe(false);
+			expect(pairing.matches(first)).toBe(true);
+			clock += 1;
+			expect(pairing.matches(first)).toBe(false); // expired: replaced before the comparison
+			expect(rotations).toEqual(["expired"]);
+			expect(pairing.expiresAt).toBe(clock + 3 * 3600_000);
+			expect(pairing.matches(pairing.formatted)).toBe(true);
+			// Manual and brute-force rotations start a fresh lifetime too.
+			clock += 3600_000;
+			pairing.rotate("manual");
+			expect(pairing.expiresAt).toBe(clock + 3 * 3600_000);
+		} finally {
+			pairing.dispose();
+		}
+	});
+
+	test("expiry fires on its own (timer), without anyone trying the code", async () => {
+		const rotations: string[] = [];
+		const pairing = new PairingCode((_, reason) => rotations.push(reason), { ttlMs: 150 });
+		try {
+			const first = pairing.raw;
+			await Bun.sleep(450);
+			expect(rotations[0]).toBe("expired");
+			expect(pairing.raw).not.toBe(first);
+		} finally {
+			pairing.dispose();
+		}
+	});
+
+	test("over HTTP: the old code stops at expiry, the new one works; refresh tokens die at most ttl after pairing", async () => {
+		let clock = Date.now();
+		const events: string[] = [];
+		const ttlMs = 60 * 60_000;
+		const own = newServer({ codeTtlMs: ttlMs, now: () => clock, onPairingCode: (_, reason, expiresAt) => events.push(`${reason}@${expiresAt - clock}`) });
+		try {
+			const early = await pair(own, USERS[0]);
+			expect(early.refresh_expires_in).toBe(3600);
+			const oldCode = own.pairing.formatted;
+			clock += 40 * 60_000;
+			const later = await pair(own, USERS[1]); // paired 40 min into the code's life
+			expect((await tokenRequest(own, refreshGrant(own, USERS[0], early.refresh_token))).status).toBe(200);
+			clock += 20 * 60_000; // the code's hour is up
+			expect((await tokenRequest(own, codeGrant(own, USERS[2], { code: oldCode }))).status).toBe(401);
+			expect(events).toEqual([`expired@${ttlMs}`]);
+			expect((await tokenRequest(own, codeGrant(own, USERS[2]))).status).toBe(200);
+			// USERS[0] paired an hour ago: its refresh token is gone. USERS[1] paired 20 min ago: still fine.
+			expect((await tokenRequest(own, refreshGrant(own, USERS[0], early.refresh_token))).status).toBe(401);
+			expect((await tokenRequest(own, refreshGrant(own, USERS[1], later.refresh_token))).status).toBe(200);
+			clock += 40 * 60_000;
+			expect((await tokenRequest(own, refreshGrant(own, USERS[1], later.refresh_token))).status).toBe(401);
+		} finally {
+			await own.stop();
+		}
+	});
+
+	test("refresh tokens are capped at 12 h even with a longer --code-ttl", async () => {
+		const own = newServer({ codeTtlMs: 24 * 3600_000 });
+		try {
+			expect((await pair(own, USERS[0])).refresh_expires_in).toBe(REFRESH_TTL_SECONDS);
+		} finally {
+			await own.stop();
+		}
+	});
+
+	test("time formatting for the code line and status", () => {
+		const now = new Date(2026, 9, 4, 15, 0, 0).getTime();
+		expect(formatClock(new Date(2026, 9, 4, 18, 2, 0).getTime(), now)).toBe("18:02");
+		expect(formatClock(new Date(2026, 9, 5, 1, 30, 0).getTime(), now)).toBe("2026-10-05 01:30");
+		expect(formatDuration(3 * 3600_000)).toBe("3 h 00 min");
+		expect(formatDuration(50 * 60_000)).toBe("50 min");
+		expect(formatDuration(40_000)).toBe("40 s");
+		expect(formatDuration(-5)).toBe("0 s");
+	});
+});
+
 describe("POST /v1/token: refresh grant", () => {
 	test("good refresh token → a new access token and the same refresh token", async () => {
 		const u = user();
@@ -350,7 +454,7 @@ describe("POST /v1/token: refresh grant", () => {
 		const body = (await res.json()) as TokenResponse;
 		expect(body.refresh_token).toBe(paired.refresh_token);
 		expect(body.expires_in).toBe(300);
-		expect(body.refresh_expires_in).toBeGreaterThan(REFRESH_TTL_SECONDS - 5);
+		expect(body.refresh_expires_in).toBeGreaterThan(DEFAULT_CODE_TTL_MS / 1000 - 5);
 		expect(body.access_token).not.toBe(paired.access_token);
 		expect((await getPrompt(body.access_token, UNKNOWN_ID)).status).toBe(404);
 	});
