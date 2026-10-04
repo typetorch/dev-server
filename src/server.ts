@@ -699,7 +699,7 @@ export function createRemoteClaudeServer(options: RemoteClaudeServerOptions): Re
 		// The screenshot the dev's own client just took: Roblox wrote it on this PC (main path), or uploaded it (fallback).
 		if (route.kind === "attachCapture" || route.kind === "attachAsset") {
 			if (!isJson(req)) return decide(400, what, `${who} content-type`), empty(400);
-			// Up to 64 KB: the dev's marks (strokes) travel with the request.
+			// Up to 160 KB: the dev's marks (strokes) travel with the request.
 			const text = await readBody(req, STROKE_LIMITS.bodyBytes);
 			if (text === TOO_LARGE) return decide(413, what, `${who} body too large`), empty(413);
 			if (typeof text !== "string") return decide(400, what, `${who} body`), empty(400);

@@ -289,7 +289,7 @@ describe("endpoints draw the marks before the crop", () => {
 		expect(at(image, 100, 60)).toEqual(WHITE);
 	});
 
-	test("caps over HTTP: malformed or too many strokes → 400, a body over 64 KB → 413, unmarked requests unchanged", async () => {
+	test("caps over HTTP: malformed or too many strokes → 400, a body over 160 KB → 413, unmarked requests unchanged", async () => {
 		const u = user();
 		const jwt = await pair(u);
 		const t = Date.now();
@@ -297,7 +297,7 @@ describe("endpoints draw the marks before the crop", () => {
 		expect((await post(jwt, "/v1/attachments/capture", { captureTime: t, placeId: PLACE, strokes: tooMany })).status).toBe(400);
 		expect((await post(jwt, "/v1/attachments/capture", { captureTime: t, placeId: PLACE, strokes: [{ color: "red", width: 0.01, points: [0.5] }] })).status).toBe(400);
 		expect((await post(jwt, "/v1/attachments/asset", '{"assetId":5,"strokes":[{"color":"red","width":0.01,"points":[0.5,1e999]}]}')).status).toBe(400);
-		const long = Array.from({ length: 20 }, () => ({ color: "red", width: 0.01, points: Array.from({ length: 400 }, () => 0.123456789012345) }));
+		const long = Array.from({ length: 30 }, () => ({ color: "red", width: 0.01, points: Array.from({ length: 800 }, () => 0.123456789012345) }));
 		expect(JSON.stringify(long).length).toBeGreaterThan(STROKE_LIMITS.bodyBytes);
 		expect((await post(jwt, "/v1/attachments/capture", { captureTime: t, placeId: PLACE, strokes: long })).status).toBe(413);
 		writeFileSync(join(captures, `${u}_${PLACE}_${t}.png`), png(solid(400, 200, WHITE)));

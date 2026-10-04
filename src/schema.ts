@@ -201,10 +201,10 @@ export const STROKE_LIMITS = {
 	/** The thickest pen, as a fraction of the capture's height. */
 	maxWidth: 0.04,
 	/**
-	 * The JSON body of a capture or asset request (with its strokes). 3000 points at 4 decimals are about 42 KB; the
-	 * game server refuses drawings over 60 KB of JSON before sending.
+	 * The JSON body of a capture or asset request (with its strokes). 3000 points at 4 decimals are about 42 KB, and
+	 * about 125 KB even if every number were printed with 17 digits, so any drawing within the caps above fits.
 	 */
-	bodyBytes: 64 * 1024,
+	bodyBytes: 160 * 1024,
 } as const;
 
 /**

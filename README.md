@@ -135,7 +135,7 @@ The Quick Tunnel URL is public, so the server authenticates everything itself:
 | Access token | HS256 JWT (jose), 5 minutes, bound to one user, one game server (`job`), this session (`aud`, `sid`) and this branch, with scopes. Signed with a 256-bit key generated in memory per session (never written or logged); Ctrl+C or `rotate` kills every token |
 | Verification | `algorithms: ["HS256"]` only (so `alg: none` and algorithm confusion fail), issuer, audience, `clockTolerance: 30`, `maxTokenAge: "5m"`, required claims; then **at use time**: `sid`, user still allowed and not revoked, `ver` current, `X-TT-Job` = `job`, branch, scope, prompt ownership |
 | Replay | Every POST (create, cancel, deploy, attachments) needs a unique `X-TT-Nonce` and an `X-TT-Timestamp` within ±300 s |
-| Limits | Headers ≤ 2 KB (Cloudflare's own `cf-*`/`x-forwarded-*` excluded; ≤ 8 KB in all), prompt body ≤ 480 KB (room for three ~64 KB log attachments; token body ≤ 1 KB, attachment body ≤ 3 MB, capture and asset requests ≤ 1 KB), strict JSON schemas (unknown fields rejected), ≤ 6 tokens per user per minute (checked before a refresh token rotates, so a `429` never strands the game with a dead token), one Claude run at a time, a queue of 5, one code run or pending proposal at a time, `--max-prompts` |
+| Limits | Headers ≤ 2 KB (Cloudflare's own `cf-*`/`x-forwarded-*` excluded; ≤ 8 KB in all), prompt body ≤ 480 KB (room for three ~64 KB log attachments; token body ≤ 1 KB, attachment body ≤ 3 MB, capture and asset requests ≤ 160 KB with their marks), strict JSON schemas (unknown fields rejected), ≤ 6 tokens per user per minute (checked before a refresh token rotates, so a `429` never strands the game with a dead token), one Claude run at a time, a queue of 5, one code run or pending proposal at a time, `--max-prompts` |
 | Responses | `Cache-Control: no-store`; errors are bare status codes with no body. The terminal logs `sub`, the first 8 characters of `jti` and the decision, never a token, code or key |
 | Modes | **Live** runs get `--tools Read,Glob,Grep` and every game tool; **code** runs get `Read,Edit,Write,Glob,Grep` plus exactly `Bash(bun run build)`, and the read-only game tools. The MCP server enforces it too: in code mode it doesn't list `run_luau` and refuses it. A live run never commits; if files change anyway they are dropped |
 | Toolbox | The Creator Store tools exist only for a prompt sent with the "Toolbox" chip (`toolbox: true`, kept immutable on the record): without it all three are in `--disallowedTools`, MCP `tools/list` doesn't list them and every `tools/call` is refused; with it, live runs get `toolbox_search` + `toolbox_insert`, code runs `toolbox_search` + `toolbox_add`, and the other one stays denied. Search runs here, unauthenticated, free assets only, 1 request/s, 10-minute cache, back-off after 429; store text is cleaned (hidden/bidi characters, length caps) and reaches Claude only inside `<untrusted-toolbox-data>`. Insert and add take only ids from this conversation's searches; the game gets the dev server's snapshot, not Claude's text. The game re-checks (the prompt was sent with the chip there, the id came through its own relayed results, dev channel) and asks the dev on a per-insert card (Insert / Deny, no "always"). `toolbox.lock.toml` is protected; only the dev server's own write (byte for byte) is accepted in a deploy proposal. Limits per message: 10 searches, 3 inserts, 5 adds |
@@ -244,7 +244,7 @@ In Studio `game.JobId` is `""`: send `job: ""`. Roblox may drop an empty header,
   unsent attachments or made 40 this session.
 
 ### `POST /v1/attachments/capture` (main path for screenshots)
-- Headers like every POST; body ≤ 64 KB (`413` above):
+- Headers like every POST; body ≤ 160 KB (`413` above):
   `{"captureTime": <unix ms>, "localId"?: "<Capture.LocalId>", "placeId"?: <game.PlaceId>, "crop"?: {"x", "y", "w", "h"}, "strokes"?: [...]}`.
   `captureTime` is the client's clock (`ScreenshotCapture.CaptureTime.UnixTimestampMillis`, or `DateTime.now()` in the
   `CaptureScreenshot` callback): it is this PC's clock when the dev plays here. `crop` is the dev's selection in
@@ -268,7 +268,7 @@ In Studio `game.JobId` is `""`: send `job: ""`. Roblox may drop an empty header,
   this user, or 10 pickups/downloads this minute.
 
 ### `POST /v1/attachments/asset` (fallback)
-- Headers like every POST; body ≤ 64 KB `{"assetId": <id>, "crop"?: {...}, "strokes"?: [...]}`: the asset id from `CaptureService:UploadCaptureAsync` /
+- Headers like every POST; body ≤ 160 KB `{"assetId": <id>, "crop"?: {...}, "strokes"?: [...]}`: the asset id from `CaptureService:UploadCaptureAsync` /
   `StartUploadCaptureAsync`. Downloaded with the Open Cloud key (`apis.roblox.com/asset-delivery-api`; a Decal is followed
   to its image once), then like a capture.
 - `200` as above; `502` the download failed; `503` the dev server has no Open Cloud key; `422`, `429` as above.
