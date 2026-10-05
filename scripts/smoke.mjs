@@ -120,7 +120,38 @@ if (rt.hasZstd()) {
 const { createRemoteClaudeServer } = await import(dist("server.js"));
 await httpChecks({ createRemoteClaudeServer, backend: "node", check: (name, ok, detail) => check(`http: ${name}`, ok, detail) });
 
-// 4. --pack: the packed file list and contents, then npx on the tarball.
+// 4. A whole session under Node (no tunnel, no announcement, a stub runner instead of Claude): a throwaway game repo on
+// a dev-channel branch, its worktree, the server, the pairing code file; then close.
+if (git) {
+	const dir = mkdtempSync(join(tmpdir(), "tt-smoke-session-"));
+	const repo = join(dir, "game");
+	try {
+		mkdirSync(join(repo, "src"), { recursive: true });
+		writeFileSync(join(repo, "typetorch.json"), JSON.stringify({ project: "smoke", universeId: 1, defaultBranch: "prod", branches: { main: "prod" }, channels: { prod: "prod", dev: "dev" } }));
+		writeFileSync(join(repo, "src", "hello.ts"), "export const x = 1;\n");
+		const g = (...args) => spawnSync("git", args, { cwd: repo, encoding: "utf8", windowsHide: true });
+		g("init", "-q", "-b", "main");
+		g("-c", "user.name=smoke", "-c", "user.email=smoke@example.invalid", "add", "-A");
+		g("-c", "user.name=smoke", "-c", "user.email=smoke@example.invalid", "commit", "-q", "-m", "init");
+		g("checkout", "-q", "-b", "dev");
+		const { startRemoteClaude } = await import(dist("session.js"));
+		const logger = { info() {}, warn() {}, error() {}, debug() {} };
+		const session = await startRemoteClaude({ users: [1], repo, runner: async () => ({ state: "answered", summary: "ok" }), tunnel: false, announce: false, terminal: false, clipboard: false, installDeps: false, logger });
+		const codeFile = join(repo, ".typetorch", "remote-claude.code");
+		check("session: starts under Node (worktree, server, pairing code)", session.server.backend === "node" && existsSync(session.worktree.path) && existsSync(codeFile), `${session.branch}, ${session.server.localUrl}`);
+		await session.close();
+		check("session: closes (code file removed)", !existsSync(codeFile));
+	} catch (error) {
+		check("session: starts under Node", false, String(error?.message ?? error));
+	} finally {
+		spawnSync("git", ["worktree", "prune"], { cwd: repo, windowsHide: true });
+		rmSync(dir, { recursive: true, force: true });
+	}
+}
+const cli = runner.resolveCli();
+console.log(`note: the deploy CLI here: ${cli ? cli.label : "none (code runs stop at committed)"}`);
+
+// 5. --pack: the packed file list and contents, then npx on the tarball.
 if (process.argv.includes("--pack")) {
 	const out = mkdtempSync(join(tmpdir(), "tt-smoke-pack-"));
 	try {
