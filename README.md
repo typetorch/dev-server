@@ -57,7 +57,8 @@ bun src/index.ts remote-claude --users ...   # from a checkout of this repo
 
 `typetorch remote-claude` finds this package installed next to the CLI (globally, in the game repo's
 `node_modules`, or both in one `npx -p @typetorch/cli -p @typetorch/dev-server typetorch remote-claude ...`) or a
-sibling `../dev-server` checkout.
+sibling `../dev-server` checkout. The [template](https://github.com/typetorch/template) has both packages in its
+devDependencies, so in a game made from it `bun install` is enough: `bun run typetorch remote-claude --users ...`.
 
 **Bun is still needed for Code mode:** the game repo is a Bun project, so the worktree install (`bun install`), Claude's
 one allowed command (`bun run build`) and the deploy's build run Bun. Under Node the dev-server puts the `bun` on PATH
