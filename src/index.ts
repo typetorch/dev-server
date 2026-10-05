@@ -6,6 +6,9 @@
  */
 import { consoleLogger } from "./log.ts";
 import { isMainModule } from "./runtime.ts";
+import { resolve } from "node:path";
+import { ensureIgnored, repoRoot } from "./git.ts";
+import { readRememberedUsers, rememberUsers } from "./remembered-users.ts";
 import { startRemoteClaude } from "./session.ts";
 
 const USAGE = `typetorch-dev-server remote-claude: prompt Claude Code on this machine from inside a live Roblox dev server.
@@ -24,7 +27,8 @@ remote-claude only runs on your Claude subscription (claude auth login with your
 ANTHROPIC_* variables, Bedrock, Vertex and Foundry are refused.
 
 Options:
-  --users <ids>          Roblox user ids allowed to prompt (required; no default, no wildcard)
+  --users <ids>          Roblox user ids allowed to prompt (no default, no wildcard). Required the first time in a
+                         repo; remembered in .typetorch/remote-claude.json and reused when omitted
   --repo <dir>           the game repo (default: current directory)
   --branch <name>        git branch (default: the current branch); must map to a dev-channel branch
   --port <n>             local port (default: a random free port; always bound to 127.0.0.1)
@@ -102,11 +106,23 @@ async function main(argv: string[]): Promise<number> {
 	if (command && command !== "remote-claude") throw new Error(`unknown command "${command}"`);
 
 
+	// --users once per game repo: the list is remembered in <repo>/.typetorch/remote-claude.json and reused next time.
+	const repo = await repoRoot(resolve((flags.get("repo") as string | undefined) ?? process.cwd()));
 	const usersFlag = flags.get("users");
-	if (typeof usersFlag !== "string") throw new Error("--users is required, e.g. --users 1,2,56 (no default, no wildcard)");
+	let users: number[];
+	if (typeof usersFlag === "string") {
+		users = parseUsers(usersFlag);
+		rememberUsers(repo, users);
+		await ensureIgnored(repo, ".typetorch/remote-claude.json");
+	} else {
+		const remembered = readRememberedUsers(repo);
+		if (!remembered) throw new Error("--users is required the first time in this repo, e.g. --users 1,2,56 (no default, no wildcard; it's remembered after that)");
+		users = remembered;
+		console.log(`users ${users.join(",")} (remembered; pass --users to change)`);
+	}
 	const port = positive(flags, "port");
 	const session = await startRemoteClaude({
-		users: parseUsers(usersFlag),
+		users,
 		repo: flags.get("repo") as string | undefined,
 		branch: flags.get("branch") as string | undefined,
 		port,
