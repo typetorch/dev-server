@@ -76,11 +76,20 @@ export class Announcer {
 	}
 
 	/** Publishes the current registration now. */
+	/** When the last announcement went out (ms), or undefined before the first. */
+	lastAnnouncedAt: number | undefined;
+	private failing = false;
+
 	async announce(): Promise<boolean> {
 		const message = this.options.current();
 		if (!message) return false;
 		const ok = await this.publish(message);
-		if (ok) this.options.logger.info(`announced on ${TOPIC} (universe ${this.options.universeId}, expires in ${ANNOUNCE_TTL_SECONDS} s)`);
+		if (ok) {
+			// The session's own "announced to game servers" line covers the first one; log recoveries, not every refresh.
+			if (this.failing) this.options.logger.info(`announcing to game servers again (${TOPIC}, universe ${this.options.universeId})`);
+			this.lastAnnouncedAt = Date.now();
+		}
+		this.failing = !ok;
 		return ok;
 	}
 

@@ -284,15 +284,27 @@ export async function startRemoteClaude(options: RemoteClaudeOptions): Promise<R
 			const url = await tunnel.start();
 			// Before the code is first shown: its fingerprint covers this URL.
 			server.setTunnelUrl(url);
-			if (!(await tunnel.waitReachable())) logger.warn("the tunnel URL is not reachable yet; announcing anyway");
 		} catch (error) {
 			await server.stop();
 			throw error;
 		}
 	}
+	// The code goes out as soon as the URL is known: pairing works once the tunnel answers (a new quick tunnel can
+	// take up to a minute), and the dev can paste it meanwhile.
+	logger.info(`remote-claude session ${auth.sessionId.slice(0, 8)} on ${branch} for roblox users ${users.join(", ")}`);
+	publishCode(server.pairing.formatted, server.pairing.expiresAt);
+	if (tunnel) {
+		const waitStart = Date.now();
+		logger.info("waiting for the tunnel to answer (a new quick tunnel can take up to a minute)...");
+		const reachable = await tunnel.waitReachable(90_000);
+		const waited = Math.round((Date.now() - waitStart) / 1000);
+		if (reachable) logger.info(`tunnel reachable after ${waited} s`);
+		else logger.warn(`the tunnel isn't answering yet after ${waited} s; announcing anyway (game servers retry)`);
+	}
 	started = true;
 	if (announcer) {
-		await announcer.announce();
+		if (await announcer.announce()) logger.info(`announced to game servers on ${branch}: DEV > Claude shows this session (paste the code there)`);
+		else logger.warn("couldn't announce to game servers yet; retrying in the background");
 		announcer.start();
 	}
 
@@ -331,7 +343,7 @@ export async function startRemoteClaude(options: RemoteClaudeOptions): Promise<R
 			const active = q.active;
 			return [
 				`session ${auth.sessionId.slice(0, 8)}  branch ${branch} (git ${gitBranch}, worktree on ${worktree.workBranch})`,
-				`tunnel ${tunnel?.url ?? (cloudflared ? "(down)" : "(disabled)")}  announce ${announcer ? "on" : "off"}  deploy ${deploy ? (cli ? "on" : "no CLI") : "off"}`,
+				`tunnel ${tunnel?.url ?? (cloudflared ? "(down)" : "(disabled)")}  announce ${announcer ? (announcer.lastAnnouncedAt ? `on (last ${new Date(announcer.lastAnnouncedAt).toLocaleTimeString()})` : "on (not yet)") : "off"}  deploy ${deploy ? (cli ? "on" : "no CLI") : "off"}`,
 				`users ${auth.allowedUsers().join(", ") || "(none)"}  prompts ${q.createdCount}/${options.maxPrompts ?? 50}  queued ${q.queued.length}  running ${active ? `${active.id.slice(0, 8)} (${active.state})` : "-"}`,
 				`pairing code valid for ${formatDuration(server.pairing.expiresAt - clock())} (until ${formatClock(server.pairing.expiresAt, clock())}, single use)  wrong codes ${server.lockout.total} (${server.lockout.lockedCount()} user+server pairs locked)  paired servers ${auth.refreshTokenCount()}`,
 			].join("\n");
@@ -351,9 +363,7 @@ export async function startRemoteClaude(options: RemoteClaudeOptions): Promise<R
 		},
 	};
 
-	logger.info(`remote-claude session ${auth.sessionId.slice(0, 8)} on ${branch} for roblox users ${users.join(", ")}`);
 	if (options.terminal !== false) attachTerminal(session, logger);
-	publishCode(server.pairing.formatted, server.pairing.expiresAt);
 	return session;
 }
 
