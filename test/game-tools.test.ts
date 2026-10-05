@@ -106,9 +106,9 @@ async function fakeGame(jwt: string, answer: (request: { id: string; tool: strin
 
 const toolText = (reply: unknown) => (reply as { result: { content: { text: string }[]; isError: boolean } }).result;
 
-beforeAll(() => {
+beforeAll(async () => {
 	dir = mkdtempSync(join(tmpdir(), "tt-game-"));
-	srv = createRemoteClaudeServer({
+	srv = await createRemoteClaudeServer({
 		branch: "dev",
 		users: USERS,
 		runner,
@@ -257,7 +257,7 @@ describe("game tools over MCP", () => {
 			expect((await fetch(ctx.mcp!.url, { headers: { authorization: `Bearer ${token}` } })).status).toBe(405);
 			return { state: "answered", summary: "ok" };
 		};
-		const own = createRemoteClaudeServer({ branch: "dev", users: USERS, runner: holdRunner, logger: silentLogger, attachmentsDir: join(dir, "b") });
+		const own = await createRemoteClaudeServer({ branch: "dev", users: USERS, runner: holdRunner, logger: silentLogger, attachmentsDir: join(dir, "b") });
 		try {
 			const res = await fetch(`${own.localUrl}/v1/token`, {
 				method: "POST",
@@ -336,7 +336,7 @@ describe("game feed (long-poll)", () => {
 			return { state: "answered", summary: "ok" };
 		};
 		const wakesHere: string[] = [];
-		const own = createRemoteClaudeServer({
+		const own = await createRemoteClaudeServer({
 			branch: "dev",
 			users: USERS,
 			runner: streaming,

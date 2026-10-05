@@ -20,7 +20,7 @@
  * Only the token's user AND job can read or answer a request: no other server and no other dev.
  */
 import { createHash, timingSafeEqual } from "node:crypto";
-import { oneLine, redactEvent } from "./log";
+import { oneLine, redactEvent } from "./log.ts";
 
 export const GAME_MCP_SERVER = "typetorch-game";
 export const GAME_TOPIC = "TypeTorch/tool";

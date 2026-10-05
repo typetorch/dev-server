@@ -156,9 +156,9 @@ describe("relayed status lines, tool refs and log files over HTTP", () => {
 		return { state: "answered", summary: "ok" };
 	};
 	let server: RemoteClaudeServer;
-	beforeAll(() => {
+	beforeAll(async () => {
 		setEventPaths({ worktree: WORKTREE, repo: REPO });
-		server = createRemoteClaudeServer({ branch: BRANCH, users: USERS, runner, logger: silentLogger });
+		server = await createRemoteClaudeServer({ branch: BRANCH, users: USERS, runner, logger: silentLogger });
 	});
 	afterAll(async () => {
 		setEventPaths();

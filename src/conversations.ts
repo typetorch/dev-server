@@ -4,7 +4,7 @@
  * same worktree, so Claude keeps the context. Conversations live in memory for the dev-server session and are visible
  * only to the user who started them.
  */
-import { oneLine } from "./log";
+import { oneLine } from "./log.ts";
 
 export const CONVERSATION_ID_PATTERN = /^[A-Za-z0-9_-]{22}$/;
 /** Claude Code session ids are UUIDs. */

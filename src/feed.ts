@@ -9,8 +9,8 @@
  *   It answers at once when something is waiting, else holds up to `holdMs` (20 s); once data arrives it waits a
  *   little longer (`coalesceMs`, 250 ms) so a streaming reply goes out in batches.
  */
-import type { GameRequest } from "./game-tools";
-import type { PromptEvent, PromptRecord, PromptView } from "./prompts";
+import type { GameRequest } from "./game-tools.ts";
+import type { PromptEvent, PromptRecord, PromptView } from "./prompts.ts";
 
 export type PromptSummary = Omit<PromptView, "log" | "events" | "next" | "more">;
 

@@ -22,11 +22,11 @@
  * Text from the store (names, descriptions, creator names) reaches Claude only inside <untrusted-toolbox-data>, with
  * "<" and ">" escaped, already cleaned and capped by toolbox.ts.
  */
-import { GAME_MCP_SERVER } from "./game-tools";
-import { oneLine, redactEvent, type Logger } from "./log";
-import type { PromptMode } from "./prompts";
-import { TOOLBOX_LIMITS, TOOLBOX_SORTS, TOOLBOX_TYPES, ToolboxMemory, type ToolboxAsset, type ToolboxClient, type ToolboxPage, type ToolboxQuery, type ToolboxSort, type ToolboxType } from "./toolbox";
-import { KIND_OF, ToolboxLock, TOOLBOX_LOCK_FILE, TOOLBOX_PATH_PATTERN, lockEntryFor } from "./toolbox-lock";
+import { GAME_MCP_SERVER } from "./game-tools.ts";
+import { oneLine, redactEvent, type Logger } from "./log.ts";
+import type { PromptMode } from "./prompts.ts";
+import { TOOLBOX_LIMITS, TOOLBOX_SORTS, TOOLBOX_TYPES, ToolboxMemory, type ToolboxAsset, type ToolboxClient, type ToolboxPage, type ToolboxQuery, type ToolboxSort, type ToolboxType } from "./toolbox.ts";
+import { KIND_OF, ToolboxLock, TOOLBOX_LOCK_FILE, TOOLBOX_PATH_PATTERN, lockEntryFor } from "./toolbox-lock.ts";
 
 export const TOOLBOX_TOOLS = ["toolbox_search", "toolbox_insert", "toolbox_add"] as const;
 export type ToolboxToolName = (typeof TOOLBOX_TOOLS)[number];

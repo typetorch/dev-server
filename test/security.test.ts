@@ -46,7 +46,7 @@ const stubRunner: Runner = async (ctx) => {
 let srv: RemoteClaudeServer;
 let base: string;
 
-function newServer(extra: Partial<Parameters<typeof createRemoteClaudeServer>[0]> = {}): RemoteClaudeServer {
+function newServer(extra: Partial<Parameters<typeof createRemoteClaudeServer>[0]> = {}): Promise<RemoteClaudeServer> {
 	return createRemoteClaudeServer({ branch: BRANCH, users: USERS, runner: stubRunner, logger: silentLogger, ...extra });
 }
 
@@ -113,8 +113,8 @@ async function forge(claims: Record<string, unknown>, options: { key?: Uint8Arra
 		.sign(options.key ?? KEY);
 }
 
-beforeAll(() => {
-	srv = newServer({ maxQueued: 50, maxPrompts: 1000, unsafeSigningKey: KEY });
+beforeAll(async () => {
+	srv = await newServer({ maxQueued: 50, maxPrompts: 1000, unsafeSigningKey: KEY });
 	base = srv.localUrl;
 });
 
@@ -266,7 +266,7 @@ describe("POST /v1/token: code grant", () => {
 	});
 
 	test("wrong code → 401 and the (user, job) failure counter goes up", async () => {
-		const own = newServer();
+		const own = await newServer();
 		try {
 			expect((await tokenRequest(own, codeGrant(own, USERS[0], { code: generateCode() }))).status).toBe(401);
 			expect((await tokenRequest(own, codeGrant(own, USERS[0], { code: "" }))).status).toBe(401); // schema, not counted
@@ -278,7 +278,7 @@ describe("POST /v1/token: code grant", () => {
 	});
 
 	test("sid, branch and user are checked before the code (and don't count as code failures)", async () => {
-		const own = newServer();
+		const own = await newServer();
 		try {
 			expect((await tokenRequest(own, codeGrant(own, OUTSIDER))).status).toBe(401);
 			expect((await tokenRequest(own, codeGrant(own, USERS[0], { sid: "0".repeat(32), code: generateCode() }))).status).toBe(401);
@@ -292,7 +292,7 @@ describe("POST /v1/token: code grant", () => {
 
 	test("single use: a redeemed code never works again; the next code is printed and works", async () => {
 		const rotated: string[] = [];
-		const own = newServer({ onPairingCode: (code, reason) => rotated.push(`${reason}:${code}`) });
+		const own = await newServer({ onPairingCode: (code, reason) => rotated.push(`${reason}:${code}`) });
 		try {
 			const first = own.pairing.formatted;
 			expect((await tokenRequest(own, codeGrant(own, USERS[0], { code: first }))).status).toBe(200);
@@ -334,7 +334,7 @@ describe("POST /v1/token: code grant", () => {
 	});
 
 	test("lockout per (user, job): 5 wrong codes lock that pair only; the code is not rotated; others pair fine", async () => {
-		const own = newServer();
+		const own = await newServer();
 		try {
 			const paired = await pair(own, USERS[1]);
 			const code = own.pairing.formatted;
@@ -356,7 +356,7 @@ describe("POST /v1/token: code grant", () => {
 
 	test("many wrong codes from many jobs never rotate the code or block anyone else", async () => {
 		const rotated: string[] = [];
-		const own = newServer({ onPairingCode: (_, reason) => rotated.push(reason) });
+		const own = await newServer({ onPairingCode: (_, reason) => rotated.push(reason) });
 		try {
 			const code = own.pairing.formatted;
 			for (let i = 0; i < 40; i++) expect((await tokenRequest(own, codeGrant(own, USERS[0], { job: `job-${i}`, code: generateCode() }))).status).toBe(401);
@@ -407,7 +407,7 @@ describe("tunnel binding (audit H1)", () => {
 
 	test("startup binds silently; a new URL re-keys the session: new sid and code, old tokens dead", async () => {
 		const rotated: string[] = [];
-		const own = newServer({ onPairingCode: (code, reason) => rotated.push(`${reason}:${code}`) });
+		const own = await newServer({ onPairingCode: (code, reason) => rotated.push(`${reason}:${code}`) });
 		try {
 			const first = "https://first-tunnel-name.trycloudflare.com";
 			expect(own.setTunnelUrl(first)).toBeUndefined();
@@ -487,7 +487,7 @@ describe("pairing code lifetime (injectable clock)", () => {
 		let clock = Date.now();
 		const events: string[] = [];
 		const ttlMs = 60 * 60_000;
-		const own = newServer({ codeTtlMs: ttlMs, now: () => clock, onPairingCode: (_, reason, expiresAt) => events.push(`${reason}@${expiresAt - clock}`) });
+		const own = await newServer({ codeTtlMs: ttlMs, now: () => clock, onPairingCode: (_, reason, expiresAt) => events.push(`${reason}@${expiresAt - clock}`) });
 		try {
 			const early = await pair(own, USERS[0]); // t = 0; the next code is issued now
 			expect(early.refresh_expires_in).toBe(3600);
@@ -517,7 +517,7 @@ describe("pairing code lifetime (injectable clock)", () => {
 	});
 
 	test("refresh tokens are capped at 12 h even with a longer --code-ttl", async () => {
-		const own = newServer({ codeTtlMs: 24 * 3600_000 });
+		const own = await newServer({ codeTtlMs: 24 * 3600_000 });
 		try {
 			expect((await pair(own, USERS[0])).refresh_expires_in).toBe(REFRESH_TTL_SECONDS);
 		} finally {
@@ -555,7 +555,7 @@ describe("POST /v1/token: refresh grant", () => {
 
 	test("reuse detection: presenting a rotated-out refresh token revokes the whole pairing", async () => {
 		const warnings: string[] = [];
-		const own = newServer({ logger: { ...silentLogger, warn: (line) => warnings.push(line) } });
+		const own = await newServer({ logger: { ...silentLogger, warn: (line) => warnings.push(line) } });
 		try {
 			const paired = await pair(own, USERS[0]);
 			const other = await pair(own, USERS[1]);
@@ -574,7 +574,7 @@ describe("POST /v1/token: refresh grant", () => {
 	});
 
 	test("a new pairing of the same user on the same server replaces the old one", async () => {
-		const own = newServer();
+		const own = await newServer();
 		try {
 			const a = await pair(own, USERS[0]);
 			const b = await pair(own, USERS[0]);
@@ -602,7 +602,7 @@ describe("POST /v1/token: refresh grant", () => {
 		// The right binding still works: a mismatch is refused, not treated as a reuse.
 		expect((await tokenRequest(srv, refreshGrant(srv, u, paired.refresh_token))).status).toBe(200);
 		// A refresh token from another session is unknown here.
-		const otherSession = newServer();
+		const otherSession = await newServer();
 		try {
 			const foreign = await pair(otherSession, u);
 			expect((await tokenRequest(srv, refreshGrant(srv, u, foreign.refresh_token))).status).toBe(401);
@@ -612,7 +612,7 @@ describe("POST /v1/token: refresh grant", () => {
 	});
 
 	test("revoke <userId> kills the user's refresh tokens, access tokens and pairing", async () => {
-		const own = newServer();
+		const own = await newServer();
 		try {
 			const a = await pair(own, USERS[0]);
 			const b = await pair(own, USERS[1]);
@@ -638,7 +638,7 @@ describe("POST /v1/token: refresh grant", () => {
 	});
 
 	test("rotate kills refresh tokens, access tokens and the pairing code", async () => {
-		const own = newServer();
+		const own = await newServer();
 		try {
 			const a = await pair(own, USERS[0]);
 			const oldCode = own.pairing.formatted;
@@ -758,7 +758,7 @@ describe("POST /v1/prompts", () => {
 	});
 
 	test("queue cap (5) and --max-prompts → 429", async () => {
-		const own = newServer({ maxPrompts: 7 });
+		const own = await newServer({ maxPrompts: 7 });
 		try {
 			const jwt = (await pair(own, USERS[0])).access_token;
 			const post = () => createPrompt(jwt, { prompt: "x" }, {}, own);

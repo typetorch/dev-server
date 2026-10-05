@@ -203,11 +203,11 @@ describe("endpoints draw the marks before the crop", () => {
 	// A red line across the middle, 8 px thick (radius 4) on a 200 px tall capture: (40, 100) to (360, 100).
 	const line: Stroke = { color: "red", width: 0.04, points: [0.1, 0.5, 0.9, 0.5] };
 
-	beforeAll(() => {
+	beforeAll(async () => {
 		dir = mkdtempSync(join(tmpdir(), "tt-strokes-"));
 		captures = join(dir, "tmp-capture-storage");
 		mkdirSync(captures);
-		srv = createRemoteClaudeServer({
+		srv = await createRemoteClaudeServer({
 			branch: "dev",
 			users: USERS,
 			runner,

@@ -19,11 +19,11 @@
  *   POST /mcp                       per-run bearer token (local claude only) → MCP JSON-RPC: the game tools
  * Errors are bare status codes with no body; the reason is only logged locally (never a token or code).
  */
-import type { Server } from "bun";
 import { createHash } from "node:crypto";
+import { readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ATTACHMENT_ID_PATTERN, ATTACHMENT_LIMITS, AttachmentStore, type Attachment, type AttachmentSource } from "./attachments";
+import { ATTACHMENT_ID_PATTERN, ATTACHMENT_LIMITS, AttachmentStore, type Attachment, type AttachmentSource } from "./attachments.ts";
 import {
 	CLAUDE_IMAGE_SIDE,
 	IMAGE_ID_PATTERN,
@@ -41,14 +41,14 @@ import {
 	type AssetDownloader,
 	type ImageRef,
 	type Stroke,
-} from "./images";
-import { encodePng } from "./png";
-import { SessionAuth, type Scope } from "./auth";
-import { CONVERSATION_ID_PATTERN, ConversationStore, type Conversation } from "./conversations";
-import { NonceCache, SlidingWindow } from "./limits";
-import { addSecret, consoleLogger, oneLine, type Logger } from "./log";
-import { GameFeeds, requestPayload } from "./feed";
-import { DEFAULT_CODE_TTL_MS, PairingCode, PairingLockout, type RotateReason } from "./pairing";
+} from "./images.ts";
+import { encodePng } from "./png.ts";
+import { SessionAuth, type Scope } from "./auth.ts";
+import { CONVERSATION_ID_PATTERN, ConversationStore, type Conversation } from "./conversations.ts";
+import { NonceCache, SlidingWindow } from "./limits.ts";
+import { addSecret, consoleLogger, oneLine, type Logger } from "./log.ts";
+import { GameFeeds, requestPayload } from "./feed.ts";
+import { DEFAULT_CODE_TTL_MS, PairingCode, PairingLockout, type RotateReason } from "./pairing.ts";
 import {
 	GAME_LIMITS,
 	GAME_MCP_SERVER,
@@ -62,11 +62,12 @@ import {
 	parseToolCall,
 	waitMsFor,
 	wakeMessage,
-} from "./game-tools";
-import { PromptQueue, type PromptRecord, type Runner } from "./prompts";
-import { ToolboxClient } from "./toolbox";
-import { ToolboxLock } from "./toolbox-lock";
-import { TOOLBOX_INSERT_LIMITS, ToolboxService, isToolboxTool, type ToolboxGameResult, type ToolboxRun } from "./toolbox-tools";
+} from "./game-tools.ts";
+import { PromptQueue, type PromptRecord, type Runner } from "./prompts.ts";
+import { serve, type ServeContext } from "./runtime.ts";
+import { ToolboxClient } from "./toolbox.ts";
+import { ToolboxLock } from "./toolbox-lock.ts";
+import { TOOLBOX_INSERT_LIMITS, ToolboxService, isToolboxTool, type ToolboxGameResult, type ToolboxRun } from "./toolbox-tools.ts";
 import {
 	CHUNK_PATTERN,
 	LIMITS,
@@ -81,7 +82,7 @@ import {
 	parsePromptRequest,
 	parseTokenGrant,
 	type Crop,
-} from "./schema";
+} from "./schema.ts";
 
 export const TIMESTAMP_WINDOW_SECONDS = 300;
 export const TOKENS_PER_USER_PER_MINUTE = 6;
@@ -271,6 +272,11 @@ export interface RemoteClaudeServerOptions {
 	gameWaitMs?: (defaultMs: number) => number;
 	/** Tests only (honored only when NODE_ENV=test): a known signing key so tests can forge crafted tokens. */
 	unsafeSigningKey?: Uint8Array;
+	/**
+	 * Tests: the HTTP implementation (runtime.ts serve: Bun.serve under Bun, node:http under Node by default) and the
+	 * idle timeout in seconds (default 10).
+	 */
+	http?: { backend?: "bun" | "node"; idleTimeoutSeconds?: number };
 }
 
 export interface RemoteClaudeServer {
@@ -287,6 +293,8 @@ export interface RemoteClaudeServer {
 	readonly port: number;
 	/** http://127.0.0.1:<port> */
 	readonly localUrl: string;
+	/** Which HTTP implementation serves (runtime.ts): "bun" (Bun.serve) or "node" (node:http). */
+	readonly backend: "bun" | "node";
 	/** New signing key, no refresh tokens, new pairing code: every credential issued so far dies. */
 	rotateAll(): void;
 	/**
@@ -299,10 +307,17 @@ export interface RemoteClaudeServer {
 	stop(): Promise<void>;
 }
 
-export function createRemoteClaudeServer(options: RemoteClaudeServerOptions): RemoteClaudeServer {
+/**
+ * Starts the server on 127.0.0.1 and resolves once it listens. Invalid options throw at once (not through the promise).
+ */
+export function createRemoteClaudeServer(options: RemoteClaudeServerOptions): Promise<RemoteClaudeServer> {
 	if (options.users.length === 0) throw new Error("--users is required (no default, no wildcard)");
 	for (const id of options.users) if (!Number.isSafeInteger(id) || id <= 0) throw new Error(`invalid user id ${id}`);
 	if (options.unsafeSigningKey && process.env.NODE_ENV !== "test") throw new Error("unsafeSigningKey is for tests only");
+	return startServer(options);
+}
+
+async function startServer(options: RemoteClaudeServerOptions): Promise<RemoteClaudeServer> {
 
 	const logger = options.logger ?? consoleLogger();
 	const codeTtlMs = options.codeTtlMs ?? DEFAULT_CODE_TTL_MS;
@@ -440,7 +455,7 @@ export function createRemoteClaudeServer(options: RemoteClaudeServerOptions): Re
 		shownPerPrompt.set(record.id, shown);
 		let prepared;
 		try {
-			const decoded = await decodeImage(new Uint8Array(await Bun.file(resolved.path).arrayBuffer()), { ffmpeg: options.ffmpeg });
+			const decoded = await decodeImage(new Uint8Array(await readFile(resolved.path)), { ffmpeg: options.ffmpeg });
 			prepared = prepareGameImage(decoded);
 		} catch (error) {
 			return refuse(oneLine((error as Error).message, 80));
@@ -911,14 +926,14 @@ export function createRemoteClaudeServer(options: RemoteClaudeServerOptions): Re
 	 * The game tools as an MCP server (streamable HTTP, JSON responses). Only the local claude process of a running
 	 * prompt can use it: it needs that run's bearer token, and requests that came through the tunnel are refused.
 	 */
-	async function handleMcp(req: Request, bunServer: Server<unknown>): Promise<Response> {
+	async function handleMcp(req: Request, http: ServeContext): Promise<Response> {
 		for (const name of req.headers.keys()) if (isProxyHeader(name)) return empty(404);
 		if (req.method !== "POST") return empty(405);
 		const m = /^Bearer ([A-Za-z0-9_-]{20,100})$/.exec(req.headers.get("authorization") ?? "");
 		const promptId = m ? gameRequests.promptForToken(m[1]) : undefined;
 		const record = promptId ? queue.get(promptId) : undefined;
 		if (!record || record.done) return decide(401, "POST /mcp", "no run token"), empty(401);
-		bunServer.timeout(req, 0); // a tool call waits for the game (and the dev's approval)
+		http.timeout(req, 0); // a tool call waits for the game (and the dev's approval)
 		const text = await readBody(req, 64 * 1024);
 		if (typeof text !== "string") return empty(413);
 		const body = parseJson(text);
@@ -958,32 +973,35 @@ export function createRemoteClaudeServer(options: RemoteClaudeServerOptions): Re
 		return json(Array.isArray(body) ? replies : replies[0]);
 	}
 
-	const server = Bun.serve({
+	// Bun.serve under Bun, node:http under Node (runtime.ts): same routes, caps, timeouts and headers.
+	const server = await serve({
 		hostname: "127.0.0.1",
 		port: options.port ?? 0,
-		development: false,
 		// The attachment body is the largest; every route still enforces its own cap while reading.
 		maxRequestBodySize: ATTACHMENT_LIMITS.maxBodyBytes + 64 * 1024,
-		async fetch(req: Request, bunServer: Server<unknown>): Promise<Response> {
+		idleTimeoutSeconds: options.http?.idleTimeoutSeconds,
+		backend: options.http?.backend,
+		async fetch(req: Request, http: ServeContext): Promise<Response> {
 			const url = new URL(req.url);
-			if (url.pathname === MCP_PATH) return handleMcp(req, bunServer);
+			if (url.pathname === MCP_PATH) return handleMcp(req, http);
 			const route = matchRoute(req.method, url.pathname);
 			if (!route) return empty(404);
 			if (headersTooLarge(req)) return decide(431, `${req.method} ${url.pathname.slice(0, 40)}`, "headers too large"), empty(431);
-			// The long-poll holds up to 20 s (Bun closes idle requests after 10 s by default); a capture pickup waits up to
+			// The long-poll holds up to 20 s (idle requests close after 10 s by default); a capture pickup waits up to
 			// about 7 s for Roblox's file and an asset download up to 50 s.
-			if (route.kind === "gamePoll") bunServer.timeout(req, 40);
-			if (route.kind === "attachCapture") bunServer.timeout(req, 30);
-			if (route.kind === "attachAsset") bunServer.timeout(req, 90);
+			if (route.kind === "gamePoll") http.timeout(req, 40);
+			if (route.kind === "attachCapture") http.timeout(req, 30);
+			if (route.kind === "attachAsset") http.timeout(req, 90);
 			return route.kind === "token" ? handleToken(req) : handleAuthed(req, url, route);
 		},
 		error(error: Error): Response {
 			logger.error(`request failed: ${error.message}`);
 			return empty(500);
 		},
+		reject: (status) => empty(status),
 	});
 
-	const port = server.port as number;
+	const port = server.port;
 	localUrl = `http://127.0.0.1:${port}`;
 	return {
 		auth,
@@ -996,6 +1014,7 @@ export function createRemoteClaudeServer(options: RemoteClaudeServerOptions): Re
 		gameRequests,
 		port,
 		localUrl: `http://127.0.0.1:${port}`,
+		backend: server.backend,
 		rotateAll() {
 			auth.rotate();
 			pairing.rotate("manual");
@@ -1015,7 +1034,7 @@ export function createRemoteClaudeServer(options: RemoteClaudeServerOptions): Re
 		async stop() {
 			pairing.dispose();
 			await queue.stop();
-			await server.stop(true);
+			await server.stop();
 			clearInterval(pruneTimer);
 			attachments.clear();
 			images.clear();

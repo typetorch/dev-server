@@ -1,11 +1,12 @@
-#!/usr/bin/env bun
+#!/usr/bin/env node
 /**
  * typetorch-dev-server remote-claude --users 1,2,56 [--repo <dir>] [--branch <name>] [--port <n>]
  *                                    [--max-prompts 50] [--no-deploy] [--cli <path>]
  * Prints a pairing code; a dev pastes it into DEV > Claude in game to pair that game server with this session.
  */
-import { consoleLogger } from "./log";
-import { startRemoteClaude } from "./session";
+import { consoleLogger } from "./log.ts";
+import { isMainModule } from "./runtime.ts";
+import { startRemoteClaude } from "./session.ts";
 
 const USAGE = `typetorch-dev-server remote-claude: prompt Claude Code on this machine from inside a live Roblox dev server.
 
@@ -29,7 +30,9 @@ Options:
   --port <n>             local port (default: a random free port; always bound to 127.0.0.1)
   --max-prompts <n>      prompts accepted per session (default 50)
   --no-deploy            stop after the commit
-  --cli <path>           TypeTorch CLI entry used for "deploy" (default: ../cli/src/index.ts, then typetorch on PATH)
+  --cli <path>           TypeTorch CLI used for "deploy" (default: a CLI next to this package, then typetorch on PATH)
+  --env-file <path>      env file with the Open Cloud API key (default: TYPETORCH_ENV_FILE, as the TypeTorch CLI;
+                         the environment wins over it, it wins over .env files; Claude never sees its values)
   --model <name>         Claude model for the runs (default: your Claude Code default)
   --max-budget-usd <n>   per-run cap on Claude Code's cost estimate (runs always use your subscription)
   --protect <globs>      extra comma-separated globs Claude may not edit (e.g. files your build script runs);
@@ -47,7 +50,7 @@ interface Parsed {
 	flags: Map<string, string | true>;
 }
 
-const VALUE_FLAGS = new Set(["users", "repo", "branch", "port", "max-prompts", "cli", "model", "max-budget-usd", "protect", "code-ttl"]);
+const VALUE_FLAGS = new Set(["users", "repo", "branch", "port", "max-prompts", "cli", "env-file", "model", "max-budget-usd", "protect", "code-ttl"]);
 
 function parseArgs(argv: string[]): Parsed {
 	const flags = new Map<string, string | true>();
@@ -110,6 +113,7 @@ async function main(argv: string[]): Promise<number> {
 		maxPrompts: positive(flags, "max-prompts"),
 		deploy: !flags.has("no-deploy"),
 		cli: flags.get("cli") as string | undefined,
+		envFile: flags.get("env-file") as string | undefined,
 		announce: !flags.has("no-announce"),
 		installDeps: !flags.has("no-install"),
 		model: flags.get("model") as string | undefined,
@@ -122,7 +126,7 @@ async function main(argv: string[]): Promise<number> {
 	return 0;
 }
 
-if (import.meta.main) {
+if (isMainModule(import.meta)) {
 	main(process.argv.slice(2)).then(
 		(code) => process.exit(code),
 		(error) => {

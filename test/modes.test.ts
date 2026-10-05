@@ -100,7 +100,7 @@ beforeAll(async () => {
 		claudeCommand: FAKE,
 		subscriptionVerified: true,
 	});
-	server = createRemoteClaudeServer({ branch: BRANCH, users: USERS, runner, logger: silentLogger, attachmentsDir: join(dir, "att"), proposalTtlMs: 1500 });
+	server = await createRemoteClaudeServer({ branch: BRANCH, users: USERS, runner, logger: silentLogger, attachmentsDir: join(dir, "att"), proposalTtlMs: 1500 });
 });
 
 afterAll(async () => {

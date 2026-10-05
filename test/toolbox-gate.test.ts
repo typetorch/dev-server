@@ -93,9 +93,9 @@ async function fakeGame(jwt: string, answer: (request: { tool: string; args: Rec
 const tools = (reply: unknown) => (reply as { result: { tools: { name: string }[] } }).result.tools.map((t) => t.name);
 const callResult = (reply: unknown) => (reply as { result: { content: { text: string }[]; isError: boolean } }).result;
 
-beforeAll(() => {
+beforeAll(async () => {
 	dir = mkdtempSync(join(tmpdir(), "tt-toolbox-gate-"));
-	srv = createRemoteClaudeServer({
+	srv = await createRemoteClaudeServer({
 		branch: "dev",
 		users: USERS,
 		runner,

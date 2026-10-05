@@ -9,15 +9,16 @@
 import { existsSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { childEnv } from "./env";
-import type { Logger } from "./log";
-import { forEachLine, killTree, run } from "./proc";
+import { childEnv } from "./env.ts";
+import type { Logger } from "./log.ts";
+import { forEachLine, killTree, run } from "./proc.ts";
+import { sleep, spawnChild, which, type ChildHandle } from "./runtime.ts";
 
 const URL_PATTERN = /https:\/\/(?!api\.)[a-z0-9]+(?:-[a-z0-9]+)*\.trycloudflare\.com/;
 
 function candidates(): string[] {
 	const list: string[] = [];
-	const onPath = Bun.which("cloudflared");
+	const onPath = which("cloudflared");
 	if (onPath) list.push(onPath);
 	if (process.platform === "win32") {
 		const pf86 = process.env["ProgramFiles(x86)"] ?? "C:\\Program Files (x86)";
@@ -67,7 +68,7 @@ export interface QuickTunnelOptions {
 }
 
 export class QuickTunnel {
-	private proc: ReturnType<typeof Bun.spawn> | undefined;
+	private proc: ChildHandle | undefined;
 	private stopping = false;
 	private restarts = 0;
 	private readonly configFile: string;
@@ -88,10 +89,12 @@ export class QuickTunnel {
 
 	private spawn(): Promise<string> {
 		const { exe, port, logger } = this.options;
-		const proc = Bun.spawn(
-			[exe, "tunnel", "--config", this.configFile, "--no-autoupdate", "--url", `http://127.0.0.1:${port}`],
-			{ stdin: "ignore", stdout: "pipe", stderr: "pipe", env: childEnv(), windowsHide: true },
-		);
+		const proc = spawnChild([exe, "tunnel", "--config", this.configFile, "--no-autoupdate", "--url", `http://127.0.0.1:${port}`], {
+			stdin: "ignore",
+			stdout: "pipe",
+			stderr: "pipe",
+			env: childEnv(),
+		});
 		this.proc = proc;
 		let url: string | undefined;
 		let resolveUrl!: (url: string) => void;
@@ -128,8 +131,8 @@ export class QuickTunnel {
 			settle(new Error(`cloudflared gave no trycloudflare.com URL in time; last output:\n${this.recent.slice(-8).join("\n")}`));
 			killTree(proc);
 		}, this.options.startTimeoutMs ?? 60_000);
-		void forEachLine(proc.stdout as ReadableStream<Uint8Array>, onLine);
-		void forEachLine(proc.stderr as ReadableStream<Uint8Array>, onLine);
+		void forEachLine(proc.stdout, onLine);
+		void forEachLine(proc.stderr, onLine);
 
 		void proc.exited.then((code) => {
 			if (grace) clearTimeout(grace);
@@ -169,7 +172,7 @@ export class QuickTunnel {
 				await res.arrayBuffer().catch(() => {});
 				if (res.status === 404 && res.headers.get("referrer-policy") === "no-referrer") return true;
 			} catch {}
-			await Bun.sleep(1500);
+			await sleep(1500);
 		}
 		return false;
 	}

@@ -8,7 +8,7 @@
  * message only counts when both its session id and its URL match (security audit H1). After a tunnel restart the dev
  * server therefore announces a new session id (auth.ts `rekey`) and closes the old one.
  */
-import type { Logger } from "./log";
+import type { Logger } from "./log.ts";
 
 export const TOPIC = "TypeTorch/remote-claude";
 export const ANNOUNCE_INTERVAL_MS = 60_000;

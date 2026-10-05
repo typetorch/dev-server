@@ -1,7 +1,7 @@
 /** Strict request body validation: exact shapes, size caps, unknown fields rejected. */
-import { ATTACHMENT_ID_PATTERN, ATTACHMENT_LIMITS, type AttachmentRequest } from "./attachments";
-import { CONVERSATION_ID_PATTERN } from "./conversations";
-import { STROKE_COLORS, type Stroke, type StrokeColor } from "./images";
+import { ATTACHMENT_ID_PATTERN, ATTACHMENT_LIMITS, type AttachmentRequest } from "./attachments.ts";
+import { CONVERSATION_ID_PATTERN } from "./conversations.ts";
+import { STROKE_COLORS, type Stroke, type StrokeColor } from "./images.ts";
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value) && Object.getPrototypeOf(value) === Object.prototype;

@@ -45,15 +45,39 @@ dev's Roblox client ─► game server (dev channel; checks dev + allowlist + ra
              live: Read/Glob/Grep + game tools        code: edit + build ─► git commit ─► proposal ─► (Deploy) typetorch deploy
 ```
 
+## Install
+The dev-server runs on **Node 20+** (npm, npx) or **Bun 1.3+**.
+
+```sh
+npm i -g @typetorch/dev-server           # then: typetorch-dev-server remote-claude --users ...
+npx @typetorch/dev-server remote-claude --users ...
+typetorch remote-claude --users ...      # through the TypeTorch CLI (it runs this package; install both)
+bun src/index.ts remote-claude --users ...   # from a checkout of this repo
+```
+
+`typetorch remote-claude` finds this package installed next to the CLI (globally, in the game repo's
+`node_modules`, or both in one `npx -p @typetorch/cli -p @typetorch/dev-server typetorch remote-claude ...`) or a
+sibling `../dev-server` checkout.
+
+**Bun is still needed for Code mode:** the game repo is a Bun project, so the worktree install (`bun install`), Claude's
+one allowed command (`bun run build`) and the deploy's build run Bun. Under Node the dev-server puts the `bun` on PATH
+first on Claude's PATH, and warns at startup when there is none (Live mode works without it). Images Claude shows in the
+chat and zstd screenshots need zstd: Bun, or Node 22.15+ (the dev-server warns when it is missing).
+
 ## Requirements
-- [Bun](https://bun.sh) 1.3+
 - [Claude Code](https://claude.com/claude-code) (`claude`), installed and logged in **with your Claude subscription**
   (`claude auth login`, Claude.ai account). An API-key, Bedrock, Vertex or Foundry login is refused at startup
 - `cloudflared` (installed automatically with winget on Windows when missing; macOS `brew install cloudflared`)
 - A TypeTorch game repo (`typetorch.json`) and an Open Cloud API key that can publish MessagingService messages
-  (`TYPETORCH_API_KEY`, `OPENCLOUD_API_KEY` or `ROBLOX_API_KEY`, in the environment or a `.env`). It is used to tell
-  game servers where the session is. When you play on another PC, screenshots come as CaptureService uploads, and the
-  same key downloads them (Open Cloud asset delivery; untested live, the key may need `legacy-asset:manage`).
+  (`OPENCLOUD_DEPLOY_KEY`, else the shared `TYPETORCH_API_KEY`, `OPENCLOUD_API_KEY` or `ROBLOX_API_KEY`). It is used to tell
+  game servers where the session is. When you play on another PC, screenshots come as CaptureService uploads, and
+  `OPENCLOUD_ASSETS_KEY` (else the shared key) downloads them (Open Cloud asset delivery; untested live, the key may
+  need `legacy-asset:manage`).
+  Keys are read like the TypeTorch CLI reads them: the environment first, then the env file (`--env-file <path>`, else
+  `TYPETORCH_ENV_FILE`, from the environment or declared in the nearest `.env`; the recommended place is outside the
+  repo, e.g. `~/.config/typetorch/<game>.env`), then `.env` files in the repo and its parents. File values never go
+  into `process.env`: Claude, git and the tunnel never see them; only the deploy gets the keys it needs (and the env file
+  path).
 - Optional: `ffmpeg` on PATH (or `TT_FFMPEG`) for JPEG, WebP, GIF, BMP and 16-bit or interlaced PNG images. Plain
   8-bit PNGs (Roblox screenshots) are decoded without it.
 
@@ -65,7 +89,7 @@ its owner must be 13+ and ID-verified. Without them the chat shows one dim line 
 ## Usage
 ```sh
 typetorch-dev-server remote-claude --users 1,2,56 [--repo <dir>] [--branch <name>] [--port <n>]
-                                   [--max-prompts 50] [--no-deploy] [--cli <typetorch cli entry>]
+                                   [--max-prompts 50] [--no-deploy] [--cli <typetorch cli entry>] [--env-file <path>]
 ```
 Once the tunnel is up it prints one line:
 ```
@@ -85,7 +109,11 @@ new code, and every game server must pair again (see "Tunnel binding" below).
   (`branches`). It must be on the **dev** channel (`channels`; `defaultBranch` is prod). Prod branches are refused,
   with no override.
 - `--no-deploy` stops code runs after the commit (no proposal). `--cli` points at the TypeTorch CLI used for `deploy`
-  (default: the sibling `../cli/src/index.ts`, then `typetorch` on PATH; without one, code runs stop at `committed`).
+  (default: a CLI next to this package: `../cli` from a checkout, which is also where npm puts `@typetorch/cli` beside
+  this package (Bun runs `src/index.ts`, Node `dist/index.js`); then `typetorch` on PATH; without one, code runs stop
+  at `committed`).
+- `--env-file <path>`: the env file with the Open Cloud key (see Requirements); the environment wins over it, it wins
+  over `.env` files.
 - `--protect <globs>`: extra files Claude may not edit (for example files your build script runs); a change to one is
   committed but never proposed for deploy.
 - `--code-ttl <minutes>`: lifetime of each pairing code (default 180). Refresh tokens never outlive it (12 h at most).
@@ -104,8 +132,9 @@ Terminal commands while it runs:
 | `cancel <promptId>` | Cancels a prompt (discards a pending proposal) |
 | `quit` / Ctrl+C | Tells game servers the session closed, discards pending proposals, stops the tunnel and exits |
 
-The library entry exports `startRemoteClaude(options)` (the TypeTorch CLI exposes it as `typetorch remote-claude`)
-and `createRemoteClaudeServer(options)` (just the HTTP server, for embedding and tests).
+The library entry exports `startRemoteClaude(options)` (the TypeTorch CLI's `typetorch remote-claude` runs this
+package's bin with the same arguments) and `createRemoteClaudeServer(options)` (just the HTTP server, for embedding and
+tests; since 0.2 it resolves once the server listens).
 
 ## Pairing code format
 `XXXX-XXXX-XXXX-XXXX-XXXX-FFFF`: 24 symbols from `ABCDEFGHJKLMNPQRSTUVWXYZ23456789` (no 0/O, 1/I), case, spaces and
@@ -143,7 +172,7 @@ The Quick Tunnel URL is public, so the server authenticates everything itself:
 | Deploy approval | A code run that changed files is committed by the dev server (`remote-claude: <summary>` + `Requested-By: roblox:<userId>`, hooks disabled) and proposed, never deployed on its own. Only the requesting dev can deploy or discard it; Discard (or 15 minutes without an answer, or the session ending) resets the worktree to the commit before the run (the dropped commit stays in the reflog). Deploy and Discard refuse when the worktree moved since the proposal. Nothing is ever pushed |
 | Untrusted context | The game's `context` (paths, error lines, artifact id; players can influence it) is JSON-escaped inside `<untrusted-game-context>` and the system prompt tells Claude it is data, never instructions |
 | Attached logs | "My logs", "Server logs" and "Player logs" (another player's client log history, fetched by the game from that player's client) may hold other players' names and chat. They are kept in memory only until the run starts, then written to `<temp>/tt-rc-logs-*/{client,server,player}-logs.txt` (outside the worktree, owner-only, with a header saying they are untrusted), given to Claude by path with `--add-dir`, and the folder is deleted when the run ends. They are never logged, relayed or kept with the prompt (the terminal says only "client + player logs attached"). A player name must be a Roblox username (letters, digits, `_`) |
-| Secrets in children | `.env` values stay in a private map, and values Bun auto-loads from `.env` files are stripped: Claude, git and builds never inherit the API key or other local secrets (the deploy gets the API key only) |
+| Secrets in children | Env-file (`--env-file` / `TYPETORCH_ENV_FILE`) and `.env` values stay in a private map, and values Bun auto-loads from `.env` files are stripped: Claude, git and builds never inherit the API key or other local secrets (the deploy gets the API key only) |
 | Subscription only | `claude auth status` must report `loggedIn`, `authMethod: "claude.ai"`, `apiProvider: "firstParty"` or the session doesn't start. Child processes never get `ANTHROPIC_*`, `CLAUDE_CODE_USE_*` or `AWS_BEARER_TOKEN_BEDROCK` (the host app's `ANTHROPIC_BASE_URL` included), no `--settings`/`apiKeyHelper` is passed, and a run whose stream-json `init` event has an `apiKeySource` other than `"none"` is killed before it publishes anything (`error: "api_billing_refused"`). Costs shown are Claude Code's estimates (`est.`), not charges |
 | Conversations | Per user and private: a follow-up must name a conversation the caller owns (else `404`) and runs `claude -p --resume <session>` in the same worktree; one prompt at a time per conversation, including a proposal waiting for its decision (`409`) |
 | What reaches games | Everything relayed (events, summaries, errors, status lines) is redacted: the pairing code, the API key, `.env` values, JWT/Bearer shapes, tunnel URLs, and **local paths**: worktree files become relative (`src/a.ts`), the repo becomes `<repo>/`, the home folder `~/`, the temp folder `<tmp>/`, any other absolute path (`C:\...`, `/Users/...`, `\\server\...`, `file://`) `<path>`, and the OS username `<user>`. Streamed text holds back any tail that could be the start of one of these, so nothing is ever published in part. Tool results are one line (a count or a status), never file contents. The prompt's `log` holds only short status lines (≤ 120 characters); raw deploy output and Claude's stderr go to the terminal only |
@@ -367,7 +396,22 @@ bun test                 # security, relay (paths, status lines, logs), modes + 
                          # (TT_SKIP_TUNNEL=1 to skip it)
 bun test/e2e.ts          # a real two-message conversation with an image attachment through the tunnel and Claude,
                          # in test-fixture/ (--no-deploy)
+bun run test:node-http   # the whole suite against the node:http server (what Node runs) instead of Bun.serve
+bun run build            # tsc -p tsconfig.build.json: src/*.ts -> dist/*.js + .d.ts (ESM for Node 20+)
+bun run smoke            # node scripts/smoke.mjs: the compiled bin, runtime and HTTP server under plain Node
+bun run smoke:pack       # + npm pack: file list, a scan for keys/local paths/user names, npx <tarball> --help (offline)
 ```
+
+Runtime differences live in `src/runtime.ts`, on Node's own modules: child processes (PATH lookup; on Windows npm
+`.cmd` shims run their JS target with node, other `.cmd` scripts go through cmd.exe quoted and escaped and refuse
+arguments with a double quote or a line break; kill-tree with `taskkill /T`), zstd, and the HTTP server: **Bun.serve
+under Bun, node:http under Node**, behind one contract (`scripts/http-check.mjs`, run on both by `test/http.test.ts`
+and under Node by the smoke test): bound to 127.0.0.1, 413 for an oversized body (declared or streamed), 431 for big
+headers, a 10 s idle timeout with per-request overrides (the long-poll, captures, MCP calls), `req.signal` aborted when
+the client leaves, and only our headers (Node adds Date and Connection/Keep-Alive): no CORS. `src/glob.ts` replaces
+Bun.Glob for the protected paths (`test/glob.test.ts` checks it against Bun.Glob). The build compiles with
+`types: ["node"]`, so a Bun global in `src/` doesn't compile. `prepublishOnly` runs the build, `bun test` and the
+pack smoke test; publishing is done by hand (`npm publish`, 2FA).
 
 ## License
 MIT

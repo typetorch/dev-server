@@ -38,18 +38,20 @@
  */
 import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, relative, resolve } from "node:path";
-import { API_BILLING_REFUSED, judgeInitEvent } from "./billing";
-import { CLAUDE_SESSION_PATTERN } from "./conversations";
-import { childEnv } from "./env";
-import { GAME_MCP_SERVER, GAME_TOOL_PREFIX, GAME_TOOLS, READ_ONLY_GAME_TOOLS, fullToolName } from "./game-tools";
-import { IMAGES_PER_PROMPT, markdownImages } from "./images";
-import { changedFiles, commitStaged, diffStat, resetWorktree, resetWorktreeTo, syncWorktree, worktreeHead, type Worktree } from "./git";
-import { oneLine } from "./log";
-import type { DeployContext, DeployOutcome, LogFile, PromptMode, RunContext, RunOutcome, Runner } from "./prompts";
-import { forEachLine, killTree } from "./proc";
-import { TOOLBOX_LOCK_FILE, type ToolboxLock } from "./toolbox-lock";
-import { toolboxAllowedRules, toolboxDeniedRules, toolboxSystemLines } from "./toolbox-tools";
+import { dirname, join, relative, resolve } from "node:path";
+import { API_BILLING_REFUSED, judgeInitEvent } from "./billing.ts";
+import { CLAUDE_SESSION_PATTERN } from "./conversations.ts";
+import { childEnv } from "./env.ts";
+import { GAME_MCP_SERVER, GAME_TOOL_PREFIX, GAME_TOOLS, READ_ONLY_GAME_TOOLS, fullToolName } from "./game-tools.ts";
+import { IMAGES_PER_PROMPT, markdownImages } from "./images.ts";
+import { changedFiles, commitStaged, diffStat, resetWorktree, resetWorktreeTo, syncWorktree, worktreeHead, type Worktree } from "./git.ts";
+import { oneLine } from "./log.ts";
+import type { DeployContext, DeployOutcome, LogFile, PromptMode, RunContext, RunOutcome, Runner } from "./prompts.ts";
+import { Glob } from "./glob.ts";
+import { forEachLine, killTree } from "./proc.ts";
+import { bunExecutable, isBun, moduleDir, spawnChild, which } from "./runtime.ts";
+import { TOOLBOX_LOCK_FILE, type ToolboxLock } from "./toolbox-lock.ts";
+import { toolboxAllowedRules, toolboxDeniedRules, toolboxSystemLines } from "./toolbox-tools.ts";
 
 // Exact commands only: a wildcard such as `bun run build*` also matched `bun run build-x.ts`, which runs any file Claude
 // just wrote, outside every file-tool restriction (security audit C1). `typetorch build` / `typetorch test` were
@@ -120,7 +122,7 @@ export const DISALLOWED_TOOLS = disallowedTools();
 
 export function isProtectedPath(path: string, extra: readonly string[] = []): boolean {
 	const p = path.replace(/\\/g, "/");
-	const patterns = protectedGlobs(extra).map((glob) => new Bun.Glob(glob));
+	const patterns = protectedGlobs(extra).map((glob) => new Glob(glob));
 	return patterns.some((g) => g.match(p) || g.match(`x/${p}`)) || /(^|\/)\.env/.test(p);
 }
 
@@ -414,19 +416,37 @@ export interface CliCommand {
 	label: string;
 }
 
-/** The TypeTorch CLI: --cli, else $TYPETORCH_CLI, else ../cli/src/index.ts next to this package, else `typetorch` on PATH. */
+/**
+ * The TypeTorch CLI: --cli, else $TYPETORCH_CLI, else a CLI next to this package, else `typetorch` on PATH.
+ *   - "next to this package": `../cli` from a checkout (src/index.ts, or the built dist/index.js), which is also where
+ *     npm puts @typetorch/cli beside @typetorch/dev-server (node_modules/@typetorch/{cli,dev-server});
+ *   - a .ts entry runs with Bun (this process under Bun, else `bun` on PATH; none = not usable), a .js entry with this
+ *     runtime, anything else as an executable;
+ *   - on PATH, a checkout's bin/typetorch.cmd runs its ../src/index.ts directly, so arguments never pass through
+ *     cmd.exe (npm's .cmd shims are run without cmd.exe by runtime.ts).
+ */
 export function resolveCli(flag?: string): CliCommand | undefined {
 	const asCommand = (path: string): CliCommand | undefined => {
 		if (!existsSync(path)) return undefined;
-		return /\.(ts|tsx|js|mjs|cjs)$/i.test(path) ? { cmd: [process.execPath, path], label: path } : { cmd: [path], label: path };
+		if (/\.(ts|tsx)$/i.test(path)) {
+			const bun = bunExecutable();
+			return bun ? { cmd: [bun, path], label: path } : undefined;
+		}
+		return /\.(js|mjs|cjs)$/i.test(path) ? { cmd: [process.execPath, path], label: path } : { cmd: [path], label: path };
 	};
 	if (flag) return asCommand(resolve(flag));
 	const env = process.env.TYPETORCH_CLI?.trim();
 	if (env) return asCommand(resolve(env));
-	const sibling = asCommand(resolve(import.meta.dir, "..", "..", "cli", "src", "index.ts"));
-	if (sibling) return sibling;
-	const onPath = Bun.which("typetorch");
-	return onPath ? { cmd: [onPath], label: onPath } : undefined;
+	const cli = resolve(moduleDir(import.meta), "..", "..", "cli");
+	const entries = [join(cli, "src", "index.ts"), join(cli, "dist", "index.js")];
+	for (const entry of isBun ? entries : entries.reverse()) {
+		const found = asCommand(entry);
+		if (found) return found;
+	}
+	const onPath = which("typetorch");
+	if (!onPath) return undefined;
+	const checkout = /\.(cmd|bat)$/i.test(onPath) ? asCommand(resolve(dirname(onPath), "..", "src", "index.ts")) : undefined;
+	return checkout ?? { cmd: [onPath], label: onPath };
 }
 
 export interface ClaudeRunnerOptions {
@@ -516,7 +536,7 @@ interface ClaudeRun {
 
 export function createClaudeRunner(options: ClaudeRunnerOptions): Runner {
 	const wt = options.worktree;
-	const claude = options.claudeCommand ?? [options.claudePath ?? Bun.which("claude") ?? "claude"];
+	const claude = options.claudeCommand ?? [options.claudePath ?? which("claude") ?? "claude"];
 	const verified = options.subscriptionVerified === true;
 
 	/** Images a run showed (`![caption](path)` in a finished text block): each path once; the server shows at most 4. */
@@ -556,13 +576,12 @@ export function createClaudeRunner(options: ClaudeRunnerOptions): Runner {
 		const toolbox = ctx.record.toolbox === true;
 		const system = systemPrompt(wt.branch, wt.workBranch, options.ttBranch, mode, toolbox);
 		const addDirs = ctx.logFiles ? [ctx.logFiles.dir] : [];
-		const proc = Bun.spawn([...claude, ...claudeArgs(options, system, { mode, toolbox, resume, mcpConfigFile, addDirs })], {
+		const proc = spawnChild([...claude, ...claudeArgs(options, system, { mode, toolbox, resume, mcpConfigFile, addDirs })], {
 			cwd: wt.path,
 			env: childEnv({ forClaude: true }),
 			stdin: new TextEncoder().encode(input),
 			stdout: "pipe",
 			stderr: "pipe",
-			windowsHide: true,
 		});
 		const kill = () => killTree(proc);
 		signal.addEventListener("abort", kill, { once: true });
@@ -661,8 +680,8 @@ export function createClaudeRunner(options: ClaudeRunnerOptions): Runner {
 			}
 		};
 		await Promise.all([
-			forEachLine(proc.stdout as ReadableStream<Uint8Array>, onEvent),
-			forEachLine(proc.stderr as ReadableStream<Uint8Array>, (line) => {
+			forEachLine(proc.stdout, onEvent),
+			forEachLine(proc.stderr, (line) => {
 				state.stderrTail.push(line);
 				if (state.stderrTail.length > 5) state.stderrTail.shift();
 			}),
@@ -687,14 +706,13 @@ export function createClaudeRunner(options: ClaudeRunnerOptions): Runner {
 		const message = summary ? ["--message", oneLine(summary.replace(/[\u0000-\u001f\u007f]+/g, " "), 200)] : [];
 		const stateDir = options.stateDir ?? join(wt.repo, ".typetorch");
 		const env = childEnv({ extra: { ...options.deployEnv, TYPETORCH_STATE_DIR: stateDir } });
-		const deploy = Bun.spawn([...cli.cmd, "deploy", "--branch", options.ttBranch, "--json", "--proposed-by", "dev-server/claude", ...message], {
+		const deploy = spawnChild([...cli.cmd, "deploy", "--branch", options.ttBranch, "--json", "--proposed-by", "dev-server/claude", ...message], {
 			cwd: wt.path,
 			// The main repo's state dir, passed explicitly: one deployments.jsonl and one seq for every checkout.
 			env,
 			stdin: "ignore",
 			stdout: "pipe",
 			stderr: "pipe",
-			windowsHide: true,
 		});
 		const killDeploy = () => killTree(deploy);
 		signal.addEventListener("abort", killDeploy, { once: true });
@@ -706,8 +724,8 @@ export function createClaudeRunner(options: ClaudeRunnerOptions): Runner {
 			if (line.trim()) ctx.log(`deploy: ${line}`);
 		};
 		await Promise.all([
-			forEachLine(deploy.stdout as ReadableStream<Uint8Array>, (line) => stdout.push(line)),
-			forEachLine(deploy.stderr as ReadableStream<Uint8Array>, onDeployLine),
+			forEachLine(deploy.stdout, (line) => stdout.push(line)),
+			forEachLine(deploy.stderr, onDeployLine),
 		]);
 		artifactId = deployedArtifactId(stdout.join("\n")) ?? artifactId;
 		const proposalId = deployProposalId(stdout.join("\n"));

@@ -12,9 +12,9 @@
  */
 import { copyFileSync, lstatSync, mkdirSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { zstdDecompressSync } from "node:zlib";
-import { CLAUDE_IMAGE_SIDE, downscale, type Rgba } from "./images";
-import { encodePng } from "./png";
+import { CLAUDE_IMAGE_SIDE, downscale, type Rgba } from "./images.ts";
+import { encodePng } from "./png.ts";
+import { zstdDecompress, ZstdUnavailableError } from "./runtime.ts";
 
 export const ATTACHMENT_LIMITS = {
 	/** Longest side in pixels of a raw upload (and the EditableImage maximum). */
@@ -105,8 +105,9 @@ export function decodeAttachment(request: AttachmentRequest): Uint8Array | strin
 	if (declared !== undefined && declared !== raw) return "zstd size is not width × height × 4";
 	let pixels: Uint8Array;
 	try {
-		pixels = new Uint8Array(zstdDecompressSync(bytes, { maxOutputLength: raw }));
-	} catch {
+		pixels = zstdDecompress(bytes, raw);
+	} catch (error) {
+		if (error instanceof ZstdUnavailableError) return "zstd is not available on this dev-server (Node 22.15+ or Bun)";
 		return "zstd data is invalid or too large";
 	}
 	return pixels.length === raw ? pixels : "decompressed size is not width × height × 4";

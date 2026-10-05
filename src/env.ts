@@ -1,13 +1,16 @@
 /**
- * Settings from the real environment and `.env` files. `.env` files are read from each start folder and every parent
- * (the nearest file wins; real environment variables win over every file).
+ * Settings from the real environment, the TypeTorch env file (`--env-file` / TYPETORCH_ENV_FILE, as the CLI reads it)
+ * and `.env` files. `.env` files are read from each start folder and every parent (the nearest file wins; the env file
+ * wins over them; real environment variables win over every file).
  *
- * Unlike the TypeTorch CLI, values are NOT copied into process.env: they stay in this private map, so child processes
+ * As in the TypeTorch CLI, values are NOT copied into process.env: they stay in this private map, so child processes
  * (Claude Code, git, build tools) never inherit the Open Cloud API key or other local secrets by accident. Values are
  * never printed; only variable names and file paths are.
  */
 import { existsSync, readFileSync, readdirSync } from "node:fs";
-import { delimiter, dirname, join, resolve } from "node:path";
+import { homedir } from "node:os";
+import { delimiter, dirname, isAbsolute, join, resolve } from "node:path";
+import { bunExecutable } from "./runtime.ts";
 
 export function parseDotEnv(text: string): Record<string, string> {
 	const values: Record<string, string> = {};
@@ -44,34 +47,86 @@ export function dotEnvChain(startDir: string): string[] {
 
 export interface Setting {
 	value: string;
-	/** `.env` path, or "environment". */
+	/** Env file or `.env` path, or "environment". */
 	source: string;
 }
 
-export class Settings {
-	readonly files: string[] = [];
-	private readonly values = new Map<string, Setting>();
+/** The env file the TypeTorch CLI reads keys from (recommended: outside the repo, e.g. ~/.config/typetorch/<game>.env). */
+export const ENV_FILE_VAR = "TYPETORCH_ENV_FILE";
 
-	constructor(startDirs: string[]) {
+/** `~/x` → home; relative paths against `base` (as the CLI's expandPath). */
+export function expandPath(path: string, base: string): string {
+	if (path === "~" || path.startsWith("~/") || path.startsWith("~\\")) return join(homedir(), path.slice(1));
+	return isAbsolute(path) ? path : resolve(base, path);
+}
+
+function readEnvFile(file: string): Record<string, string> | undefined {
+	try {
+		return parseDotEnv(readFileSync(file, "utf8"));
+	} catch {
+		return undefined;
+	}
+}
+
+export interface SettingsOptions {
+	/** `--env-file` (relative to the working directory); wins over TYPETORCH_ENV_FILE. */
+	envFile?: string;
+	/** The real environment (default process.env; tests pass their own). */
+	env?: Record<string, string | undefined>;
+}
+
+/**
+ * Settings with the TypeTorch CLI's precedence (cli/src/env.ts), highest first:
+ *   1. the real environment;
+ *   2. the explicit env file: `--env-file`, else TYPETORCH_ENV_FILE from the environment (both relative to the working
+ *      directory), else TYPETORCH_ENV_FILE declared in the nearest `.env` (relative to that file's folder);
+ *   3. `.env` files in each start folder and its parents, nearest first.
+ * Values from files stay in this object: never copied into process.env, so no child process inherits them (only the
+ * deploy gets the keys it needs, explicitly).
+ */
+export class Settings {
+	/** Every env file read, highest priority first. */
+	readonly files: string[] = [];
+	/** The explicit env file, resolved; undefined when none is configured. */
+	readonly envFile?: string;
+	/** The explicit env file is configured but doesn't exist. */
+	readonly envFileMissing: boolean = false;
+	private readonly values = new Map<string, Setting>();
+	private readonly real: Record<string, string | undefined>;
+
+	constructor(startDirs: string[], options: SettingsOptions = {}) {
+		this.real = options.env ?? process.env;
+		const chain: { file: string; values?: Record<string, string> }[] = [];
 		for (const start of startDirs) {
 			for (const file of dotEnvChain(start)) {
-				if (this.files.includes(file)) continue;
-				this.files.push(file);
-				let parsed: Record<string, string>;
-				try {
-					parsed = parseDotEnv(readFileSync(file, "utf8"));
-				} catch {
-					continue;
-				}
-				for (const [key, value] of Object.entries(parsed)) {
-					if (!this.values.has(key) && value !== "") this.values.set(key, { value, source: file });
-				}
+				if (!chain.some((c) => c.file === file)) chain.push({ file, values: readEnvFile(file) });
+			}
+		}
+		let envFile: string | undefined;
+		if (options.envFile?.trim()) envFile = expandPath(options.envFile.trim(), process.cwd());
+		else if (this.real[ENV_FILE_VAR]?.trim()) envFile = expandPath(this.real[ENV_FILE_VAR]!.trim(), process.cwd());
+		else {
+			const declared = chain.find((c) => c.values?.[ENV_FILE_VAR]?.trim());
+			if (declared) envFile = expandPath(declared.values![ENV_FILE_VAR].trim(), dirname(declared.file));
+		}
+		this.envFile = envFile;
+		const sources: { file: string; values?: Record<string, string> }[] = [];
+		if (envFile) {
+			if (existsSync(envFile)) sources.push({ file: envFile, values: readEnvFile(envFile) });
+			else this.envFileMissing = true;
+		}
+		sources.push(...chain);
+		for (const { file, values } of sources) {
+			if (!values || this.files.includes(file)) continue;
+			this.files.push(file);
+			for (const [key, value] of Object.entries(values)) {
+				if (!this.values.has(key) && value !== "") this.values.set(key, { value, source: file });
 			}
 		}
 	}
 
 	get(name: string): Setting | undefined {
-		const real = process.env[name]?.trim();
+		const real = this.real[name]?.trim();
 		if (real) return { value: real, source: "environment" };
 		return this.values.get(name);
 	}
@@ -237,8 +292,10 @@ export function childEnv(options: { forClaude?: boolean; extra?: Record<string, 
 		env[key] = value;
 	}
 	env.GIT_TERMINAL_PROMPT = "0";
-	// Claude's one allowed command is `bun run build`: make sure `bun` resolves to the Bun running this server.
-	if (options.forClaude) prependPath(env, dirname(process.execPath));
+	// Claude's one allowed command is `bun run build`: make sure `bun` resolves to the Bun running this server (under
+	// Node: the bun on PATH).
+	const bun = options.forClaude ? bunExecutable() : undefined;
+	if (bun) prependPath(env, dirname(bun));
 	return { ...env, ...(options.extra ?? {}) };
 }
 

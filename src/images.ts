@@ -22,9 +22,10 @@
 import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { extname, isAbsolute, join, relative, resolve, sep } from "node:path";
-import { constants as zlibConstants, inflateSync, zstdCompressSync } from "node:zlib";
-import { childEnv } from "./env";
-import { PNG_SIGNATURE } from "./png";
+import { constants as zlibConstants, inflateSync } from "node:zlib";
+import { childEnv } from "./env.ts";
+import { sleep, spawnChild, which, zstdCompress } from "./runtime.ts";
+import { PNG_SIGNATURE } from "./png.ts";
 
 export interface Rgba {
 	width: number;
@@ -316,23 +317,18 @@ const DEMUXER: Record<ImageFormat, string> = { png: "png_pipe", jpeg: "jpeg_pipe
 export function findFfmpeg(): string | undefined {
 	const configured = process.env.TT_FFMPEG?.trim();
 	if (configured) return existsSync(configured) ? configured : undefined;
-	return Bun.which("ffmpeg") ?? undefined;
+	return which("ffmpeg");
 }
 
-/** Reads a stream to the end, or throws once it passes `max` bytes. */
-export async function readCapped(stream: ReadableStream<Uint8Array> | null, max: number): Promise<Uint8Array> {
+/** Reads a stream (a web ReadableStream or a Node Readable) to the end, or throws once it passes `max` bytes. */
+export async function readCapped(stream: AsyncIterable<Uint8Array> | null, max: number): Promise<Uint8Array> {
 	if (!stream) return new Uint8Array(0);
 	const parts: Uint8Array[] = [];
 	let total = 0;
-	const reader = stream.getReader();
-	while (true) {
-		const { done, value } = await reader.read();
-		if (done) break;
+	// Leaving the loop early (the throw) cancels a web stream and destroys a Node stream.
+	for await (const value of stream) {
 		total += value.byteLength;
-		if (total > max) {
-			await reader.cancel().catch(() => {});
-			throw new Error("too large");
-		}
+		if (total > max) throw new Error("too large");
 		parts.push(value);
 	}
 	return new Uint8Array(Buffer.concat(parts));
@@ -360,13 +356,13 @@ export async function decodeImage(bytes: Uint8Array, options: DecodeOptions = {}
 	}
 	const ffmpeg = options.ffmpeg === false ? undefined : (options.ffmpeg ?? findFfmpeg());
 	if (!ffmpeg) throw new Error(`can't decode this ${format.toUpperCase()} without ffmpeg${reason ? ` (${reason})` : ""}`);
-	const proc = Bun.spawn(
+	const proc = spawnChild(
 		[ffmpeg, "-hide_banner", "-v", "error", "-protocol_whitelist", "pipe", "-f", DEMUXER[format], "-i", "pipe:0", "-frames:v", "1", "-f", "image2pipe", "-vcodec", "png", "-pix_fmt", "rgba", "pipe:1"],
-		{ stdin: bytes, stdout: "pipe", stderr: "ignore", env: childEnv(), windowsHide: true },
+		{ stdin: bytes, stdout: "pipe", stderr: "ignore", env: childEnv() },
 	);
 	const timer = setTimeout(() => proc.kill(), options.timeoutMs ?? 20_000);
 	try {
-		const [out, code] = await Promise.all([readCapped(proc.stdout as ReadableStream<Uint8Array>, MAX_SOURCE_PIXELS * 4 + 1024 * 1024), proc.exited]);
+		const [out, code] = await Promise.all([readCapped(proc.stdout, MAX_SOURCE_PIXELS * 4 + 1024 * 1024), proc.exited]);
 		if (code !== 0 || out.length === 0) throw new Error(`ffmpeg could not decode the image (exit ${code})`);
 		return decodePng(out);
 	} catch (error) {
@@ -528,7 +524,7 @@ export async function pickUpCapture(dir: string, query: CaptureQuery, options: P
 		}
 		// Past the timeout, only a file already being read (its size not settled yet) gets one more poll.
 		if (elapsed >= timeoutMs && !(match && last?.file === match.file && elapsed < timeoutMs + 2000)) return undefined;
-		await Bun.sleep(options.pollMs ?? 150);
+		await sleep(options.pollMs ?? 150);
 	}
 }
 
@@ -714,7 +710,7 @@ export function prepareGameImage(image: Rgba, maxBytes = MAX_GAME_IMAGE_BYTES): 
 	let side = GAME_IMAGE_SIDE;
 	while (true) {
 		const scaled = downscale(image, side);
-		const zstd = new Uint8Array(zstdCompressSync(scaled.pixels, { params: { [zlibConstants.ZSTD_c_compressionLevel]: 9 } }));
+		const zstd = zstdCompress(scaled.pixels, { [zlibConstants.ZSTD_c_compressionLevel]: 9 });
 		if (zstd.length <= maxBytes || side <= 64) return { width: scaled.width, height: scaled.height, zstd };
 		side = Math.floor(Math.min(side, Math.max(scaled.width, scaled.height)) * 0.75);
 	}

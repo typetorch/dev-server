@@ -12,8 +12,8 @@
 import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
-import { childEnv } from "./env";
-import { run } from "./proc";
+import { childEnv } from "./env.ts";
+import { run } from "./proc.ts";
 
 export class GitError extends Error {
 	override name = "GitError";

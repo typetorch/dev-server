@@ -1,6 +1,7 @@
 /** Terminal controls on stdin: code, revoke <id>, users, rotate, status, cancel <id>, quit (and Ctrl+C). */
-import type { Logger } from "./log";
-import type { RemoteClaudeSession } from "./session";
+import { createInterface } from "node:readline";
+import type { Logger } from "./log.ts";
+import type { RemoteClaudeSession } from "./session.ts";
 
 export const HELP = "commands: code | revoke <userId> | users | rotate | status | cancel <promptId> | quit   (Ctrl+C also quits)";
 
@@ -63,7 +64,8 @@ export function attachTerminal(session: RemoteClaudeSession, logger: Logger): vo
 
 	void (async () => {
 		try {
-			for await (const line of console) {
+			// node:readline on stdin (Bun and Node); Bun's `for await (const line of console)` is Bun-only.
+			for await (const line of createInterface({ input: process.stdin, crlfDelay: Infinity })) {
 				if (handleCommand(session, line, logger) === "quit") {
 					await session.close();
 					process.exit(0);

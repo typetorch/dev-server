@@ -181,9 +181,9 @@ const b64 = (bytes: Uint8Array) => Buffer.from(bytes).toString("base64");
 let srv: RemoteClaudeServer;
 let attachmentsDir: string;
 
-beforeAll(() => {
+beforeAll(async () => {
 	attachmentsDir = mkdtempSync(join(tmpdir(), "tt-attach-"));
-	srv = createRemoteClaudeServer({ branch: BRANCH, users: USERS, runner: scripted, logger: silentLogger, maxPrompts: 500, maxQueued: 50, attachmentsDir: join(attachmentsDir, "a") });
+	srv = await createRemoteClaudeServer({ branch: BRANCH, users: USERS, runner: scripted, logger: silentLogger, maxPrompts: 500, maxQueued: 50, attachmentsDir: join(attachmentsDir, "a") });
 });
 
 afterAll(async () => {
@@ -285,7 +285,7 @@ describe("events", () => {
 			}
 			return { state: "answered", summary: "ok" };
 		};
-		const own = createRemoteClaudeServer({ branch: BRANCH, users: USERS, runner, logger: silentLogger, attachmentsDir: join(attachmentsDir, "b") });
+		const own = await createRemoteClaudeServer({ branch: BRANCH, users: USERS, runner, logger: silentLogger, attachmentsDir: join(attachmentsDir, "b") });
 		try {
 			const jwt = await pair(own, USERS[0]);
 			const created = (await (await post(own, jwt, "/v1/prompts", { prompt: "leak?" })).json()) as View;
@@ -419,7 +419,7 @@ describe("attachments", () => {
 		const wrapped = wrapPrompt(1, "what is wrong here?", undefined, [{ path: "/tmp/tt-rc-logs-x/screenshot-abc.png", width: 640, height: 360 }]);
 		expect(wrapped).toContain("<attachments>\nAttached screenshot: /tmp/tt-rc-logs-x/screenshot-abc.png (640x360)\n</attachments>");
 		const dir = join(attachmentsDir, "stop");
-		const own = createRemoteClaudeServer({ branch: BRANCH, users: USERS, runner: scripted, logger: silentLogger, attachmentsDir: dir });
+		const own = await createRemoteClaudeServer({ branch: BRANCH, users: USERS, runner: scripted, logger: silentLogger, attachmentsDir: dir });
 		const jwt = await pair(own, USERS[0]);
 		expect((await post(own, jwt, "/v1/attachments", { width: 1, height: 1, format: "rgba8", compression: "none", data: b64(new Uint8Array(4)) })).status).toBe(200);
 		expect(existsSync(dir)).toBe(true);
@@ -538,7 +538,7 @@ describe("real runner with a fake claude (stream mapping, resume, answered, bill
 		writeFileSync(out, "");
 		env({ TT_FAKE_OUT: out });
 		const runner: Runner = (ctx) => createClaudeRunner({ worktree, ttBranch: BRANCH, deploy: false, claudeCommand: FAKE, subscriptionVerified })(ctx);
-		server = createRemoteClaudeServer({ branch: BRANCH, users: USERS, runner, logger: silentLogger, worktree: worktree.path });
+		server = await createRemoteClaudeServer({ branch: BRANCH, users: USERS, runner, logger: silentLogger, worktree: worktree.path });
 	});
 
 	afterAll(async () => {

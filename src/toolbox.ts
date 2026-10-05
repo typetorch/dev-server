@@ -15,6 +15,7 @@
  * - ToolboxMemory remembers each conversation's results (id → snapshot). Insert and add accept only remembered ids, and
  *   the game's approval card shows the snapshot, never text Claude wrote.
  */
+import { anySignal } from "./runtime.ts";
 
 export const TOOLBOX_SEARCH_URL = "https://apis.roblox.com/toolbox-service/v2/assets:search";
 
@@ -295,7 +296,7 @@ export class ToolboxClient {
 				// No cookie, no key: the endpoint answers unauthenticated GETs (plans/14). Nothing about the dev is sent.
 				headers: { accept: "application/json" },
 				redirect: "error",
-				signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
+				signal: signal ? anySignal([signal, timeout]) : timeout,
 			});
 		} catch (error) {
 			const name = error instanceof Error ? error.name : "";

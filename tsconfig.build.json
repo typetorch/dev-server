@@ -1,0 +1,20 @@
+{
+	// The npm build: src -> dist as plain ESM JavaScript (+ .d.ts for the library entry) for Node >= 20
+	// (bun src/index.ts keeps running the sources). types: node only, so a Bun global in src is a compile error
+	// (runtime.ts reaches Bun.serve through globalThis, behind a feature check); target/lib: what Node 20 runs.
+	"extends": "./tsconfig.json",
+	"compilerOptions": {
+		"noEmit": false,
+		"allowImportingTsExtensions": false,
+		"rewriteRelativeImportExtensions": true,
+		"rootDir": "src",
+		"outDir": "dist",
+		"target": "ES2022",
+		"lib": ["ES2023"],
+		"types": ["node"],
+		"declaration": true,
+		"sourceMap": false,
+		"newLine": "lf"
+	},
+	"include": ["src"]
+}

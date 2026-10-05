@@ -15,7 +15,7 @@
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import type { ToolboxAsset, ToolboxType } from "./toolbox";
+import type { ToolboxAsset, ToolboxType } from "./toolbox.ts";
 
 export const TOOLBOX_LOCK_FILE = "toolbox.lock.toml";
 /** Typed asset paths: "toolbox/" then 1–5 lowercase segments. */

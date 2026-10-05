@@ -9,8 +9,8 @@
  *   3. Every run checks the stream-json init event: an `apiKeySource` other than "none" kills the run
  *      ("api_billing_refused"). Without the field, the startup check is what vouches for the run.
  */
-import { childEnv } from "./env";
-import { run } from "./proc";
+import { childEnv } from "./env.ts";
+import { run } from "./proc.ts";
 
 export const API_BILLING_REFUSED = "api_billing_refused";
 

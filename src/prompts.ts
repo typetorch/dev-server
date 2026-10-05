@@ -21,17 +21,18 @@
  * Images Claude shows (`![caption](path)` in its reply) become `image` events: the server (server.ts) prepares them
  * for the game and the runner waits for that before the run ends, so the final status always comes last.
  */
-import { moveAttachment, releaseAttachments, type Attachment } from "./attachments";
-import type { Conversation } from "./conversations";
+import { moveAttachment, releaseAttachments, type Attachment } from "./attachments.ts";
+import type { Conversation } from "./conversations.ts";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { FileChange } from "./git";
-import type { ImageMeta, ImageRef } from "./images";
-import type { Logger } from "./log";
-import { oneLine, redactEvent, safePrefixLength } from "./log";
-import type { PromptContext } from "./schema";
-import type { ToolboxTile } from "./toolbox-tools";
+import type { FileChange } from "./git.ts";
+import type { ImageMeta, ImageRef } from "./images.ts";
+import type { Logger } from "./log.ts";
+import { oneLine, redactEvent, safePrefixLength } from "./log.ts";
+import { sleep } from "./runtime.ts";
+import type { PromptContext } from "./schema.ts";
+import type { ToolboxTile } from "./toolbox-tools.ts";
 
 /**
  * States: queued → running → answered | failed | cancelled; code mode with changes: → committed → proposed (a deploy
@@ -535,7 +536,7 @@ export class PromptQueue {
 		if (running) {
 			this.cancel(running.id, "shutdown");
 			const deadline = Date.now() + 10_000;
-			while (this.running === running && Date.now() < deadline) await Bun.sleep(50);
+			while (this.running === running && Date.now() < deadline) await sleep(50);
 		}
 		for (const record of this.records.values()) {
 			if (record.proposal?.status === "pending") await this.discardProposal(record, "discarded", "shutdown");

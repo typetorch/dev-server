@@ -320,11 +320,11 @@ describe("endpoints", () => {
 		return { state: "answered", summary: "ok" };
 	};
 
-	beforeAll(() => {
+	beforeAll(async () => {
 		dir = mkdtempSync(join(tmpdir(), "tt-img-ep-"));
 		captures = join(dir, "tmp-capture-storage");
 		mkdirSync(captures);
-		srv = createRemoteClaudeServer({
+		srv = await createRemoteClaudeServer({
 			branch: "dev",
 			users: USERS,
 			runner,
@@ -413,7 +413,7 @@ describe("endpoints", () => {
 		expect((await post(jwt, "/v1/attachments/asset", { assetId: 404 })).status).toBe(502);
 		expect((await post(jwt, "/v1/attachments/asset", { assetId: -1 })).status).toBe(400);
 		expect(downloads).toEqual([1234, 404]);
-		const bare = createRemoteClaudeServer({ branch: "dev", users: USERS, runner, logger: silentLogger, attachmentsDir: join(dir, "bare") });
+		const bare = await createRemoteClaudeServer({ branch: "dev", users: USERS, runner, logger: silentLogger, attachmentsDir: join(dir, "bare") });
 		try {
 			const token = await (async () => {
 				const r = await fetch(`${bare.localUrl}/v1/token`, {
@@ -498,7 +498,7 @@ describe("screenshot game tool", () => {
 			reply = ((await call.json()) as { result: typeof reply }).result;
 			return { state: "answered", summary: "ok" };
 		};
-		const srv = createRemoteClaudeServer({ branch: "dev", users: [userId], runner, logger: silentLogger, attachmentsDir: join(dir, "att"), captureDir: dir, pickupTimeoutMs: 1000 });
+		const srv = await createRemoteClaudeServer({ branch: "dev", users: [userId], runner, logger: silentLogger, attachmentsDir: join(dir, "att"), captureDir: dir, pickupTimeoutMs: 1000 });
 		try {
 			const tokenRes = await fetch(`${srv.localUrl}/v1/token`, {
 				method: "POST",
@@ -646,7 +646,7 @@ describe("player logs (another player's client logs)", () => {
 			seen = { path: file.path, text: readFileSync(file.path, "utf8"), dir: ctx.logFiles!.dir };
 			return { state: "answered", summary: "ok" };
 		};
-		const srv = createRemoteClaudeServer({ branch: "dev", users: [USERS[28]], runner, logger: silentLogger });
+		const srv = await createRemoteClaudeServer({ branch: "dev", users: [USERS[28]], runner, logger: silentLogger });
 		try {
 			const record = srv.queue.create(USERS[28], "why?", { logs: { player: { name: "Bob_123", text: "[12:00] output hi from Bob" } } }, { job: JOB });
 			if (typeof record === "string") throw new Error(record);

@@ -6,22 +6,23 @@
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { Announcer, closedMessage, publishMessage, registrationMessage } from "./announce";
-import { GAME_TOPIC } from "./game-tools";
-import { sweepStaleTempFolders } from "./attachments";
-import { captureDir, openCloudAssetDownloader } from "./images";
-import { checkSubscriptionAuth } from "./billing";
-import { branchChannel, branchFromGit, loadGameConfig } from "./config";
-import { API_KEY_VARS, DEPLOY_SECRET_VARS, Settings, childEnv } from "./env";
-import { branchExists, currentBranch, ensureIgnored, ensureWorktree, repoRoot, type Worktree } from "./git";
-import { addEventSecret, addSecret, consoleLogger, setEventPaths, type Logger } from "./log";
-import { run } from "./proc";
-import type { Runner } from "./prompts";
-import { createClaudeRunner, protectedGlobs, resolveCli } from "./runner";
-import { createRemoteClaudeServer, type RemoteClaudeServer } from "./server";
-import { ToolboxLock } from "./toolbox-lock";
-import { attachTerminal } from "./terminal";
-import { QuickTunnel, findCloudflared } from "./tunnel";
+import { Announcer, closedMessage, publishMessage, registrationMessage } from "./announce.ts";
+import { GAME_TOPIC } from "./game-tools.ts";
+import { sweepStaleTempFolders } from "./attachments.ts";
+import { captureDir, openCloudAssetDownloader } from "./images.ts";
+import { checkSubscriptionAuth } from "./billing.ts";
+import { branchChannel, branchFromGit, loadGameConfig } from "./config.ts";
+import { API_KEY_VARS, DEPLOY_SECRET_VARS, Settings, childEnv } from "./env.ts";
+import { branchExists, currentBranch, ensureIgnored, ensureWorktree, repoRoot, type Worktree } from "./git.ts";
+import { addEventSecret, addSecret, consoleLogger, setEventPaths, type Logger } from "./log.ts";
+import { run } from "./proc.ts";
+import { bunExecutable, hasZstd, runtimeName, spawnChild, which } from "./runtime.ts";
+import type { Runner } from "./prompts.ts";
+import { createClaudeRunner, protectedGlobs, resolveCli } from "./runner.ts";
+import { createRemoteClaudeServer, type RemoteClaudeServer } from "./server.ts";
+import { ToolboxLock } from "./toolbox-lock.ts";
+import { attachTerminal } from "./terminal.ts";
+import { QuickTunnel, findCloudflared } from "./tunnel.ts";
 
 export interface RemoteClaudeOptions {
 	/** Roblox user ids allowed to prompt. Required; no default, no wildcard. */
@@ -36,6 +37,8 @@ export interface RemoteClaudeOptions {
 	deploy?: boolean;
 	/** Path to the TypeTorch CLI entry (or binary). */
 	cli?: string;
+	/** `--env-file`: the env file with the Open Cloud key (else TYPETORCH_ENV_FILE, as the CLI). */
+	envFile?: string;
 	/** false = no tunnel (local only, for testing). */
 	tunnel?: boolean;
 	/** false = never publish registration messages (testing). */
@@ -101,10 +104,17 @@ export async function startRemoteClaude(options: RemoteClaudeOptions): Promise<R
 	}
 
 	// 2. Settings (the API key is never printed).
-	const settings = new Settings([process.cwd(), repo]);
+	// The CLI's precedence: environment, then --env-file / TYPETORCH_ENV_FILE, then .env files (env.ts Settings).
+	const settings = new Settings([process.cwd(), repo], { envFile: options.envFile });
+	if (settings.envFileMissing) logger.warn(`the env file ${settings.envFile} does not exist (--env-file / TYPETORCH_ENV_FILE)`);
+	else if (settings.envFile) logger.info(`env file: ${settings.envFile}`);
 	const announce = options.announce !== false;
 	const apiKey = settings.first(API_KEY_VARS);
 	addSecret(apiKey?.value);
+	// Per-job keys as in the CLI (plans/04 "Keys and secrets"): messaging (the announcement, wakes) with the deploy key,
+	// asset downloads with the assets key; each falls back to the shared key.
+	const messagingKey = settings.first(["OPENCLOUD_DEPLOY_KEY", ...API_KEY_VARS]);
+	const assetsKey = settings.first(["OPENCLOUD_ASSETS_KEY", ...API_KEY_VARS]);
 	// What the deploy (the TypeTorch CLI) gets: the shared key, any per-job keys, and the CLI's own
 	// env file path. Claude never sees any of them (childEnv allowlist).
 	const deployEnv: Record<string, string> = {};
@@ -115,12 +125,16 @@ export async function startRemoteClaude(options: RemoteClaudeOptions): Promise<R
 		addSecret(found.value);
 		deployEnv[name] = found.value;
 	}
-	const envFile = settings.first(["TYPETORCH_ENV_FILE"]);
-	if (envFile) deployEnv.TYPETORCH_ENV_FILE = envFile.value;
+	// The deploy (the CLI) reads the same env file.
+	if (settings.envFile && !settings.envFileMissing) deployEnv.TYPETORCH_ENV_FILE = settings.envFile;
 	// No .env value may reach a game client through prompt events.
 	for (const value of settings.fileValues()) addEventSecret(value);
 	const universeId = config.universeId ?? (Number(settings.get("UNIVERSE_ID")?.value) || undefined);
-	if (announce && !apiKey) throw new Error(`no Open Cloud API key (${API_KEY_VARS.join(", ")}); it is needed to announce the session to game servers`);
+	if (announce && !messagingKey) {
+		throw new Error(
+			`no Open Cloud API key (OPENCLOUD_DEPLOY_KEY or ${API_KEY_VARS.join(", ")}) in the environment, the env file (--env-file / TYPETORCH_ENV_FILE) or a .env file; it is needed to announce the session to game servers`,
+		);
+	}
 	if (announce && !universeId) throw new Error(`no universe id: set "universeId" in ${config.path} or UNIVERSE_ID`);
 
 	// 3. Tools. Claude Code must be logged in with a Claude subscription: API billing is refused (billing.ts).
@@ -128,7 +142,7 @@ export async function startRemoteClaude(options: RemoteClaudeOptions): Promise<R
 	let subscriptionVerified = false;
 	if (!options.runner || options.claudeCommand) {
 		if (!claudeCommand) {
-			const claude = Bun.which("claude");
+			const claude = which("claude");
 			if (!claude) throw new Error("the claude CLI is not installed (https://claude.com/claude-code)");
 			claudeCommand = [claude];
 		}
@@ -154,9 +168,13 @@ export async function startRemoteClaude(options: RemoteClaudeOptions): Promise<R
 	// Screenshots and log files a crashed session left in the temp folder.
 	const swept = sweepStaleTempFolders(tmpdir());
 	if (swept > 0) logger.info(`deleted ${swept} stale remote-claude temp folder(s)`);
-	if (options.installDeps !== false && existsSync(join(worktree.path, "package.json")) && !existsSync(join(worktree.path, "node_modules"))) {
+	// The game repo is a Bun project: its install, Claude's `bun run build` (Code mode) and the deploy's build need Bun.
+	const bun = bunExecutable();
+	if (!bun) logger.warn(`bun is not on PATH (${runtimeName()}): Code mode's \`bun run build\`, worktree installs and deploy builds need Bun (https://bun.sh)`);
+	if (!hasZstd()) logger.warn(`${runtimeName()} has no zstd: images Claude shows can't reach the game and zstd screenshots are refused (Node 22.15+ or Bun)`);
+	if (options.installDeps !== false && bun && existsSync(join(worktree.path, "package.json")) && !existsSync(join(worktree.path, "node_modules"))) {
 		logger.info("installing dependencies in the worktree (bun install)…");
-		const installed = await run([process.execPath, "install"], { cwd: worktree.path, env: childEnv(), timeoutMs: 10 * 60_000 });
+		const installed = await run([bun, "install"], { cwd: worktree.path, env: childEnv(), timeoutMs: 10 * 60_000 });
 		if (installed.code !== 0) logger.warn(`bun install failed in the worktree (exit ${installed.code}); builds may fail`);
 	}
 
@@ -200,7 +218,7 @@ export async function startRemoteClaude(options: RemoteClaudeOptions): Promise<R
 			protect: options.protect,
 			toolboxLock,
 		});
-	const server = createRemoteClaudeServer({
+	const server = await createRemoteClaudeServer({
 		branch,
 		users,
 		runner,
@@ -214,9 +232,9 @@ export async function startRemoteClaude(options: RemoteClaudeOptions): Promise<R
 		worktree: worktree.path,
 		toolboxLock,
 		captureDir: captureDir(),
-		downloadAsset: apiKey ? openCloudAssetDownloader(apiKey.value) : undefined,
+		downloadAsset: assetsKey ? openCloudAssetDownloader(assetsKey.value) : undefined,
 		// Game tools: a wake message per request (no code in it); game servers also poll GET /v1/game/pending.
-		publishWake: apiKey && universeId ? (message) => publishMessage(universeId, apiKey.value, GAME_TOPIC, message, logger) : undefined,
+		publishWake: messagingKey && universeId ? (message) => publishMessage(universeId, messagingKey.value, GAME_TOPIC, message, logger) : undefined,
 		onPairingCode: (formatted, reason, expiresAt) => {
 			if (reason === "used") logger.info("pairing code used (each code pairs one user on one game server); the next code is below");
 			if (reason === "expired") logger.info("pairing code expired; new code below (paired servers keep working until their refresh token expires)");
@@ -232,10 +250,10 @@ export async function startRemoteClaude(options: RemoteClaudeOptions): Promise<R
 	/** The URL the current session was announced with (the closed message must carry it). */
 	let announcedUrl: string | undefined;
 	const announcer =
-		announce && apiKey && universeId
+		announce && messagingKey && universeId
 			? new Announcer({
 					universeId,
-					apiKey: apiKey.value,
+					apiKey: messagingKey.value,
 					logger,
 					current: () => {
 						const url = tunnel?.url;
@@ -361,7 +379,7 @@ export async function copyToClipboard(text: string): Promise<boolean> {
 	const cmd = process.platform === "win32" ? ["clip"] : process.platform === "darwin" ? ["pbcopy"] : undefined;
 	if (!cmd) return false;
 	try {
-		const proc = Bun.spawn(cmd, { stdin: new TextEncoder().encode(text), stdout: "ignore", stderr: "ignore", windowsHide: true });
+		const proc = spawnChild(cmd, { stdin: new TextEncoder().encode(text), stdout: "ignore", stderr: "ignore" });
 		return (await proc.exited) === 0;
 	} catch {
 		return false;
