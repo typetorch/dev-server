@@ -1,0 +1,41 @@
+# @typetorch/dev-server: typecheck, the unit tests on both HTTP backends (Bun.serve and node:http), the Node build and
+# the smoke test (HTTP contract, a whole session, npm pack scan, offline npx). No Claude usage: Claude runs are faked.
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: typecheck, tests, build, smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install
+        run: bun install --frozen-lockfile
+      - name: Typecheck
+        run: bun run typecheck
+      - name: Unit tests (Bun.serve)
+        run: bun test
+      - name: Unit tests (node:http)
+        run: bun run test:node-http
+      - name: Build (tsc -> dist/)
+        run: bun run build
+      - name: Smoke test
+        run: node scripts/smoke.mjs --pack
