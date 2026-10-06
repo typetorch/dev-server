@@ -100,6 +100,10 @@ The code is also copied to the clipboard and saved, with its expiry time, to `<r
 (git-ignored through `.git/info/exclude`, deleted when the session ends). Paste it into **DEV > Claude** in game; that
 game server is then paired and renews its tokens on its own for up to 3 hours, then asks for a code again.
 
+**Logs to this PC, without Claude:** once paired, **DEV > Logs > Upload** (Server, Client or Others) saves those logs
+as `<repo>/.typetorch/logs/<UTC time>-<branch>-<job8>-<kind>.log` (git-ignored) and the terminal prints
+`logs from <name> (<kind>, N lines) saved: <path>`. No prompt is made; see `POST /v1/logs` below.
+
 **Each code pairs one user on one game server, once.** The first successful pairing uses it up, and the next code is
 printed (and copied and saved) right away; pairing a second server or a second user takes that next code. Unused
 codes expire after **3 hours** (`--code-ttl <minutes>`) and are replaced too. A tunnel restart (new URL) also prints a
@@ -320,6 +324,22 @@ In Studio `game.JobId` is `""`: send `job: ""`. Roblox may drop an empty header,
   (the last 30 prompts; `events` with the chunks of each text block merged; continue a running prompt with
   `GET /v1/prompts/:id?since=<next>`). Use it to reopen a chat after a swap or a rejoin.
 
+### `POST /v1/logs` (Logs > Upload, no Claude)
+- Headers like every POST (JWT with `prompt:create`, `X-TT-Job`, nonce, timestamp, JSON); body ≤ 2 MB:
+  `{"kind": "server" | "client" | "player", "uploader": "<Roblox username>", "player"?: "<username>" (kind player only),
+  "artifact"?: "<id>#<generation>", "kernel"?, "framework"?, "time"?: <unix s>, "text": "<log lines>"}`, nothing else.
+- The dev menu's Logs tab sends the logs a dev sees: this game server's log ring (Server), the dev's own client logs
+  (Client), or another player's client logs (Others). The pairing is the Claude tab's; no prompt is made and nothing
+  counts against `--max-prompts`.
+- Saved as `<repo>/.typetorch/logs/<UTC time>-<branch>-<job8>-<kind>.log` (git-ignored; `-2`, `-3` when the name is
+  taken; owner-only) with a `#` header (kind, who uploaded it, artifact, branch, JobId, kernel and framework versions,
+  times, line count) from the checked fields and the token, never from the text. The text is untrusted: control
+  characters and terminal escapes are removed and it goes to the file only.
+- The terminal prints one line: `logs from <name> (<kind>, N lines) saved: <path>`.
+- `200` → `{"ok": true, "file": "<file name>", "lines": N}` (the file name only, never the path); `413` over 2 MB;
+  `429` 6 uploads per user per minute, or 500 files this session; `503` the server has no logs folder (library use
+  without `logsDir`).
+
 ### Game tools (MCP, for Claude)
 Every run gets an MCP server named `typetorch-game` (`--mcp-config`, a per-run bearer token, loopback only: requests
 that came through the tunnel are refused). Its tools act only on the game server that sent the prompt (the JWT's
@@ -358,11 +378,11 @@ Claude gets the result capped at 64 KB inside `<untrusted-game-data>`; with no a
 | `400` | Bad body/schema/unknown field, missing or invalid `X-TT-Nonce`/`X-TT-Timestamp`, timestamp outside ±300 s, bad `since`, an attachment that isn't the caller's or was used, an image whose sizes don't match | Fix the request |
 | `404` | Unknown prompt, conversation (or someone else's), proposal, image (or someone else's) or route; no capture file for `POST /v1/attachments/capture` | Capture: use the asset fallback |
 | `409` | Nonce already used; cancel of a finished prompt; a deploy decision on a settled proposal; a follow-up while the conversation's last prompt runs or waits for a deploy decision | |
-| `413` / `431` | Body over 480 KB (3 MB for attachments) / headers over 2 KB | |
+| `413` / `431` | Body over 480 KB (3 MB for attachments, 2 MB for logs) / headers over 2 KB | |
 | `423` | A code prompt while another code run or an undecided proposal holds the worktree | Wait for it, or decide the proposal |
-| `429` | This user locked on this job (5 wrong codes), token rate limit, queue full (5), `--max-prompts` reached, 8 unsent or 40 attachments, a pickup running or 10 pickups/downloads this minute | Back off |
+| `429` | This user locked on this job (5 wrong codes), token rate limit, queue full (5), `--max-prompts` reached, 8 unsent or 40 attachments, a pickup running or 10 pickups/downloads this minute, 6 log uploads this minute | Back off |
 | `422` / `502` | A capture or asset that isn't a readable image / the asset download failed | |
-| `503` | Session shutting down; `POST /v1/attachments/asset` without an Open Cloud key | |
+| `503` | Session shutting down; `POST /v1/attachments/asset` without an Open Cloud key; `POST /v1/logs` without a logs folder | |
 
 ### Registration (Open Cloud MessagingService)
 Topic `TypeTorch/remote-claude`, every 60 s (and right away when a user is revoked):
@@ -392,7 +412,8 @@ bun test                 # security, relay (paths, status lines, logs), modes + 
                          # image tests (PNG decode, downscale, crop, capture pickup, asset fallback, Claude → game),
                          # strokes tests (marks at the right pixels, crop + marks, the caps, both endpoints),
                          # Toolbox tests (a recorded Creator Store response in test/fixtures/toolbox, the chip gate
-                         # end to end, toolbox.lock.toml; no live search calls),
+                         # end to end, toolbox.lock.toml; no live search calls), log uploads (schema, cleaning,
+                         # file names and headers, auth, 2 MB cap, rate limit, no prompt quota),
                          # all on 127.0.0.1 (a fake claude drives the real runner), and one real Quick Tunnel
                          # (TT_SKIP_TUNNEL=1 to skip it)
 bun test/e2e.ts          # a real two-message conversation with an image attachment through the tunnel and Claude,

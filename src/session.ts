@@ -182,6 +182,9 @@ export async function startRemoteClaude(options: RemoteClaudeOptions): Promise<R
 	// Nowhere else: it is redacted from every other log line and never announced or committed.
 	const codeFile = join(repo, ".typetorch", "remote-claude.code");
 	await ensureIgnored(repo, ".typetorch/remote-claude.code");
+	// Logs > Upload lands in <repo>/.typetorch/logs/ (git-ignored too; the folder is made on the first upload).
+	const logsDir = join(repo, ".typetorch", "logs");
+	await ensureIgnored(repo, ".typetorch/logs");
 	const clock = options.now ?? Date.now;
 	const codeTtlMinutes = options.codeTtlMinutes ?? 180;
 	if (!(codeTtlMinutes > 0)) throw new Error("--code-ttl must be a positive number of minutes");
@@ -231,6 +234,7 @@ export async function startRemoteClaude(options: RemoteClaudeOptions): Promise<R
 		// or (fallback) downloaded with the Open Cloud key.
 		worktree: worktree.path,
 		toolboxLock,
+		logsDir,
 		captureDir: captureDir(),
 		downloadAsset: assetsKey ? openCloudAssetDownloader(assetsKey.value) : undefined,
 		// Game tools: a wake message per request (no code in it); game servers also poll GET /v1/game/pending.

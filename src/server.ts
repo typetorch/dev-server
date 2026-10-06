@@ -16,6 +16,7 @@
  *   POST /v1/game/requests/:id/result JWT → the game server's answer
  *   GET  /v1/game/poll?since=n      JWT → long-poll: this server's chat events and tool requests (feed.ts)
  *   POST /v1/game/tool-result       JWT → {id, ...result} for a request from the poll
+ *   POST /v1/logs                   JWT → {ok, file, lines}: Logs > Upload, saved as <repo>/.typetorch/logs/*.log (logs.ts)
  *   POST /mcp                       per-run bearer token (local claude only) → MCP JSON-RPC: the game tools
  * Errors are bare status codes with no body; the reason is only logged locally (never a token or code).
  */
@@ -46,6 +47,7 @@ import { encodePng } from "./png.ts";
 import { SessionAuth, type Scope } from "./auth.ts";
 import { CONVERSATION_ID_PATTERN, ConversationStore, type Conversation } from "./conversations.ts";
 import { NonceCache, SlidingWindow } from "./limits.ts";
+import { LOG_UPLOAD_LIMITS, LogStore, parseLogUpload } from "./logs.ts";
 import { addSecret, consoleLogger, oneLine, type Logger } from "./log.ts";
 import { GameFeeds, requestPayload } from "./feed.ts";
 import { DEFAULT_CODE_TTL_MS, PairingCode, PairingLockout, type RotateReason } from "./pairing.ts";
@@ -120,7 +122,8 @@ type Route =
 	| { kind: "gamePoll" }
 	| { kind: "gameToolResult" }
 	| { kind: "gameRequest"; id: string }
-	| { kind: "gameResult"; id: string };
+	| { kind: "gameResult"; id: string }
+	| { kind: "logs" };
 
 type AuthedRoute = Exclude<Route, { kind: "token" }>;
 
@@ -136,6 +139,7 @@ function matchRoute(method: string, path: string): Route | undefined {
 	if (method === "GET" && path === "/v1/game/pending") return { kind: "gamePending" };
 	if (method === "GET" && path === "/v1/game/poll") return { kind: "gamePoll" };
 	if (method === "POST" && path === "/v1/game/tool-result") return { kind: "gameToolResult" };
+	if (method === "POST" && path === "/v1/logs") return { kind: "logs" };
 	let m = /^\/v1\/prompts\/([^/]{1,128})$/.exec(path);
 	if (m && method === "GET") return { kind: "get", id: m[1] };
 	m = /^\/v1\/prompts\/([^/]{1,128})\/cancel$/.exec(path);
@@ -169,6 +173,7 @@ const SCOPE_FOR: Record<AuthedRoute["kind"], Scope> = {
 	gameToolResult: "prompt:create",
 	gameRequest: "prompt:read",
 	gameResult: "prompt:create",
+	logs: "prompt:create",
 };
 
 const TOO_LARGE = Symbol("too large");
@@ -270,6 +275,11 @@ export interface RemoteClaudeServerOptions {
 	feedTiming?: { holdMs?: number; coalesceMs?: number };
 	/** Tests: how long a tool call waits for the game (default: approval + timeout + grace). */
 	gameWaitMs?: (defaultMs: number) => number;
+	/**
+	 * Where Logs > Upload saves files (session.ts: `<repo>/.typetorch/logs`, git-ignored). Without it POST /v1/logs
+	 * answers 503.
+	 */
+	logsDir?: string;
 	/** Tests only (honored only when NODE_ENV=test): a known signing key so tests can forge crafted tokens. */
 	unsafeSigningKey?: Uint8Array;
 	/**
@@ -399,6 +409,8 @@ async function startServer(options: RemoteClaudeServerOptions): Promise<RemoteCl
 	const conversations = new ConversationStore();
 	const attachments = new AttachmentStore(options.attachmentsDir ?? join(tmpdir(), `tt-rc-att-${auth.sessionId.slice(0, 12)}`));
 	const tokenLimiter = new SlidingWindow(TOKENS_PER_USER_PER_MINUTE, 60_000);
+	const logStore = options.logsDir ? new LogStore(options.logsDir) : undefined;
+	const logLimiter = new SlidingWindow(LOG_UPLOAD_LIMITS.perMinute, 60_000);
 	const nonces = new NonceCache();
 	/** Capture pickups and asset downloads per user (each one polls the disk or downloads and decodes). */
 	const fetchLimiter = new SlidingWindow(ATTACHMENT_LIMITS.fetchesPerMinute, 60_000);
@@ -588,6 +600,8 @@ async function startServer(options: RemoteClaudeServerOptions): Promise<RemoteCl
 				return `GET /v1/game/requests/${oneLine(route.id, 8)}`;
 			case "gameResult":
 				return `POST /v1/game/requests/${oneLine(route.id, 8)}/result`;
+			case "logs":
+				return "POST /v1/logs";
 		}
 	};
 
@@ -694,6 +708,29 @@ async function startServer(options: RemoteClaudeServerOptions): Promise<RemoteCl
 				.join(", ");
 			decide(200, what, `${who} queued ${record.id.slice(0, 8)} (${extra})`);
 			return json({ id: record.id, state: record.state, conversationId: conversation.id });
+		}
+
+		// Logs > Upload: saved on this PC, one terminal line. Claude isn't involved (no prompt, no quota). The text is
+		// untrusted: logs.ts cleans it and it goes to the file only.
+		if (route.kind === "logs") {
+			if (!logStore) return decide(503, what, `${who} log uploads are off`), empty(503);
+			if (!isJson(req)) return decide(400, what, `${who} content-type`), empty(400);
+			if (!logLimiter.take(String(userId))) return decide(429, what, `${who} too many log uploads`), empty(429);
+			const text = await readBody(req, LOG_UPLOAD_LIMITS.bodyBytes);
+			if (text === TOO_LARGE) return decide(413, what, `${who} body too large`), empty(413);
+			if (text === undefined) return decide(400, what, `${who} body encoding`), empty(400);
+			const body = parseLogUpload(parseJson(text));
+			if (!body) return decide(400, what, `${who} body schema`), empty(400);
+			let saved;
+			try {
+				saved = logStore.save(body, { userId, branch: claims.branch, job: claims.job });
+			} catch (error) {
+				return decide(500, what, `${who} could not save: ${oneLine((error as Error).message, 120)}`), empty(500);
+			}
+			if (saved === "quota") return decide(429, what, `${who} log file quota for this session`), empty(429);
+			const kindText = body.kind === "player" ? `player ${body.player}` : body.kind;
+			logger.info(`logs from ${body.uploader} (${kindText}, ${saved.lines} lines) saved: ${saved.path}`);
+			return json({ ok: true, file: saved.name, lines: saved.lines });
 		}
 
 		if (route.kind === "attach") {
@@ -992,6 +1029,8 @@ async function startServer(options: RemoteClaudeServerOptions): Promise<RemoteCl
 			if (route.kind === "gamePoll") http.timeout(req, 40);
 			if (route.kind === "attachCapture") http.timeout(req, 30);
 			if (route.kind === "attachAsset") http.timeout(req, 90);
+			// Up to 2 MB of logs through the tunnel.
+			if (route.kind === "logs") http.timeout(req, 60);
 			return route.kind === "token" ? handleToken(req) : handleAuthed(req, url, route);
 		},
 		error(error: Error): Response {

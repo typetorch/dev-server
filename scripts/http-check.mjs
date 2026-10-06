@@ -2,9 +2,12 @@
 // node:http adapter under `bun test` (test/http.test.ts), and node:http under plain Node (scripts/smoke.mjs, compiled).
 //   loopback only; bare 404 with the security headers and no CORS; 413 for a declared oversized body; 431 for big
 //   headers; 401 for a wrong content type or an oversized token body (chunked); pairing + JWT; a long-poll held past the
-//   idle timeout (per-request timeout); an idle connection closed; nothing listening after stop().
+//   idle timeout (per-request timeout); an idle connection closed; a 1.5 MB log upload saved and a 2 MB+ one refused
+//   (POST /v1/logs); nothing listening after stop().
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { connect } from "node:net";
-import { networkInterfaces } from "node:os";
+import { networkInterfaces, tmpdir } from "node:os";
+import { join } from "node:path";
 
 const JOB = "6f1c2b9e-3d4a-4b8c-9e7f-0a1b2c3d4e5f";
 const USER = 4242;
@@ -53,11 +56,13 @@ function idleClose(port, limitMs) {
 export async function httpChecks({ createRemoteClaudeServer, backend, check }) {
 	const logger = { info() {}, warn() {}, error() {}, debug() {} };
 	const runner = async () => ({ state: "answered", summary: "ok" });
+	const logsDir = mkdtempSync(join(tmpdir(), "tt-http-logs-"));
 	const srv = await createRemoteClaudeServer({
 		branch: "dev",
 		users: [USER],
 		runner,
 		logger,
+		logsDir,
 		feedTiming: { holdMs: 1500, coalesceMs: 50 },
 		http: { backend, idleTimeoutSeconds: 1 },
 	});
@@ -123,12 +128,31 @@ export async function httpChecks({ createRemoteClaudeServer, backend, check }) {
 			const poll = await fetch(`${base}/v1/game/poll?since=${cursor}`, { headers: auth });
 			const held = Date.now() - started;
 			check("long-poll held past the 1 s idle timeout -> 200", poll.status === 200 && held >= 1200, `${poll.status} after ${held} ms`);
+
+			// Logs > Upload: a big body streams in whole (past the 1 s idle timeout here) and lands as a file.
+			const upload = (text, nonce) =>
+				fetch(`${base}/v1/logs`, {
+					method: "POST",
+					headers: { ...auth, "content-type": "application/json", "x-tt-nonce": nonce, "x-tt-timestamp": String(Math.floor(Date.now() / 1000)) },
+					body: JSON.stringify({ kind: "server", uploader: "Smoke", text }),
+				});
+			const saved = await upload(`${"l".repeat(79)}\n`.repeat(19_000), `smoke-logs-1-${Date.now()}`);
+			const reply = saved.status === 200 ? await saved.json() : undefined;
+			const file = reply ? join(logsDir, reply.file) : undefined;
+			check(
+				"logs: 1.5 MB upload -> 200, saved with a header",
+				Boolean(file && existsSync(file) && readFileSync(file, "utf8").startsWith("# TypeTorch logs: server") && reply.lines === 19_000),
+				`${saved.status} ${reply ? reply.file : ""}`,
+			);
+			const tooBigLogs = await upload("x".repeat(2 * 1024 * 1024), `smoke-logs-2-${Date.now()}`);
+			check("logs: over 2 MB -> 413", tooBigLogs.status === 413, String(tooBigLogs.status));
 		}
 
 		const kept = await idleClose(srv.port, 12_000);
 		check("an idle connection is closed", kept > 0, kept > 0 ? `after ${kept} ms` : "still open after 12 s");
 	} finally {
 		await srv.stop();
+		rmSync(logsDir, { recursive: true, force: true });
 	}
 	const after = await rawRequest(srv.port, "GET / HTTP/1.1\r\nHost: x\r\n\r\n", { waitMs: 2000 });
 	check("stop(): nothing listens any more", after.startsWith("error") || after === "closed", after);
