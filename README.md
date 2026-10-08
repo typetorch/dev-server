@@ -74,11 +74,11 @@ chat and zstd screenshots need zstd: Bun, or Node 22.15+ (the dev-server warns w
   game servers where the session is. When you play on another PC, screenshots come as CaptureService uploads, and
   `OPENCLOUD_ASSETS_KEY` (else the shared key) downloads them (Open Cloud asset delivery; untested live, the key may
   need `legacy-asset:manage`).
-  Keys are read like the TypeTorch CLI reads them: the environment first, then the env file (`--env-file <path>`, else
-  `TYPETORCH_ENV_FILE`, from the environment or declared in the nearest `.env`; the recommended place is outside the
-  repo, e.g. `~/.config/typetorch/<game>.env`), then `.env` files in the repo and its parents. File values never go
-  into `process.env`: Claude, git and the tunnel never see them; only the deploy gets the keys it needs (and the env file
-  path).
+  Keys are read like the TypeTorch CLI 0.9 reads them: the environment first, then the game repo's `.env` (no parent
+  folder's). `--env-file <path>` or `TYPETORCH_ENV_FILE` (environment) read that file instead; a `TYPETORCH_ENV_FILE=`
+  line inside `.env` still works for one release. File values never go into `process.env`: Claude, git and the tunnel
+  never see them; only the deploy gets the keys it needs (and the env file path, so the CLI in Claude's worktree reads
+  the main repo's `.env`). The backend's keys (`TYPETORCH_API_KEY`, `TYPETORCH_ADMIN_TOKEN`) reach no child.
 - Optional: `ffmpeg` on PATH (or `TT_FFMPEG`) for JPEG, WebP, GIF, BMP and 16-bit or interlaced PNG images. Plain
   8-bit PNGs (Roblox screenshots) are decoded without it.
 
