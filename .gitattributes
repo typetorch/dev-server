@@ -1,0 +1,5 @@
+# Shell scripts, the Dockerfile and the Docker ignore list must keep LF endings: the image reads them on Linux, and a
+# Windows checkout with core.autocrlf would otherwise write CRLF into them.
+*.sh text eol=lf
+Dockerfile text eol=lf
+.dockerignore text eol=lf

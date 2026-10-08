@@ -1,0 +1,7 @@
+# Build context: only what the Dockerfile copies. Everything else (game repos, .env files, .typetorch, .git, node_modules,
+# tests) stays out of the image.
+*
+!package.json
+!bun.lock
+!src
+!docker-entrypoint.sh

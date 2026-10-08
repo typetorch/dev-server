@@ -406,6 +406,79 @@ Claude Code keeps its sessions under `~/.claude/projects/`, which is what lets a
 during a run, attached logs and screenshots included, is part of that session's local transcript, and the screenshot
 tool's image too).
 
+## Docker
+One image runs remote-claude on Linux, macOS or Windows (Docker Desktop) and as a Coolify app: Bun runs the dev-server,
+Node 22 and Claude Code run the chats, cloudflared opens the tunnel. Files: `Dockerfile`, `compose.yaml`,
+`docker-entrypoint.sh`, `.dockerignore`.
+
+In the container the game repo is `/work/game`, and Claude works in `/work/game-remote-claude` (next to it, on the same
+volume). Claude's login and settings are in `/home/dev/.claude`. **Log in with your claude.ai account inside the
+container: `claude auth login`** (not `claude login`, which starts a chat). The image sets no `ANTHROPIC_*`, Bedrock,
+Vertex or Foundry variable, and the dev-server only runs on the subscription login, as on your PC. Don't set those
+variables in the container.
+
+### Local (Docker Desktop)
+1. **Game repo.** `compose.yaml` mounts `GAME_REPO` (default `../template`, the TypeTorch template next to this folder)
+   at `/work/game`. Set it in a `.env` file next to `compose.yaml` (git-ignored) or in your shell, for example
+   `GAME_REPO=C:/Users/you/Documents/GitHub/my-game`.
+2. **Log in once.** The login is saved in the `claude-home` volume:
+   ```sh
+   docker compose run --rm dev-server claude auth login
+   ```
+   Follow the prompts: open the link it shows on your PC, sign in with your Claude.ai account, and paste back the code.
+3. **Start.** The first start needs the Roblox user ids allowed to prompt. Set `TT_USERS=1,2,56` in `.env` (or your
+   shell), then:
+   ```sh
+   docker compose up -d
+   ```
+4. **Pair.** `docker compose logs -f dev-server` shows the `pairing code:` line. Paste it into **DEV > Claude** in game.
+   A new code is printed when one is used, or after 3 hours.
+5. **Terminal commands** (`status`, `code`, `revoke <userId>`, ...): `docker compose attach dev-server`. Detach with
+   Ctrl+P, then Ctrl+Q. Don't press Ctrl+C there: it quits the dev-server, and the restart policy starts it again with a
+   new tunnel and a new code. To stop it, run `docker compose stop` (the dev-server closes its session first).
+
+`docker compose down` keeps the volumes (the login, the worktree, the remembered users). `docker compose down -v`
+deletes them.
+
+### Where --users is remembered
+`--users` is saved in `<game repo>/.typetorch/remote-claude.json` (git-ignored through `.git/info/exclude`). In the
+container that is `/work/game/.typetorch/remote-claude.json`, on the game volume (or in your bind-mounted game folder),
+so it survives restarts, rebuilds and redeploys. A `TT_USERS` value replaces the saved list. With no `TT_USERS` and no
+saved list, the dev-server exits with an error asking for `--users`; with `restart: unless-stopped` Compose keeps
+retrying, so run `docker compose stop` and set `TT_USERS`.
+
+### Coolify
+Create a Dockerfile application from this repository (not the Docker Compose option: `compose.yaml` is for local runs).
+The container only makes outbound connections, so no port needs publishing.
+
+1. **Storage.** Two persistent volumes: `/work` (the game clone at `/work/game`, and Claude's worktree next to it) and
+   `/home/dev/.claude` (Claude's login and settings).
+2. **Environment.** `TT_IDLE=1` (the container stays up without starting the dev-server, for set-up), `TT_USERS=1,2,56`,
+   and the Open Cloud key as `OPENCLOUD_API_KEY` (or `OPENCLOUD_DEPLOY_KEY`). Variables set in Coolify win over the
+   game's `.env` file, so the key never has to be written to a volume.
+3. **Deploy.** The container starts and idles.
+4. **Set up in the container's terminal** (Coolify's Terminal, or `docker exec -it <container> sh`):
+   ```sh
+   git clone <game repo url> /work/game     # a private repo: a read-only deploy key or a token, never committed
+   cd /work/game && git checkout <dev branch>
+   claude auth login
+   ```
+5. **Start.** Remove `TT_IDLE` and redeploy. The dev-server starts, and its log (Coolify's Logs tab) shows the pairing
+   code.
+
+Later deploys keep the volumes, so the clone, the login and the remembered users stay.
+
+### Limits of the image
+- **Deploy from the chat needs the TypeTorch CLI**, which the image does not include. Without it a Code run stops at
+  `committed`; merge the work branch yourself (`git merge remote-claude/<branch>` in the game repo).
+- **Screenshots.** The capture pickup reads Roblox's capture folder on the host, which the container can't see. The
+  asset fallback (CaptureService uploads with `OPENCLOUD_ASSETS_KEY`) works.
+- **No ffmpeg.** It is only needed for JPEG, WebP, GIF, BMP and 16-bit PNG images.
+- **Commit identity.** Commits use `remote-claude <remote-claude@localhost>` unless the game repo sets its own
+  `user.name` and `user.email`.
+- **Claude Code version** is pinned by the `CLAUDE_CODE_VERSION` build argument in the Dockerfile. Change it and rebuild
+  to update.
+
 ## Tests
 ```sh
 bun test                 # security, relay (paths, status lines, logs), modes + deploy approval, chat, game-tool and

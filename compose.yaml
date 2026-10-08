@@ -1,0 +1,29 @@
+# Local run of the dev-server image. Build and start from this folder; see README "Docker".
+# Coolify uses the Dockerfile instead (persistent volumes at /work and /home/dev/.claude).
+
+services:
+  dev-server:
+    build: .
+    image: typetorch-dev-server:local
+    restart: unless-stopped
+    # A terminal (tty + stdin) so `docker compose attach dev-server` gives the terminal commands (status, code, ...).
+    tty: true
+    stdin_open: true
+    # SIGTERM makes the dev-server close its session (game servers are told) before it exits.
+    stop_grace_period: 20s
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      # Roblox user ids allowed to prompt, as --users. Needed on the first start; then the saved list is used.
+      TT_USERS: ${TT_USERS:-}
+    volumes:
+      # The game repo on the host (default: the template next to this folder), at /work/game.
+      - ${GAME_REPO:-../template}:/work/game
+      # /work also holds the worktree Claude edits (/work/game-remote-claude), next to the game repo.
+      - work:/work
+      # Claude Code's login and settings (CLAUDE_CONFIG_DIR=/home/dev/.claude).
+      - claude-home:/home/dev/.claude
+
+volumes:
+  work:
+  claude-home:
