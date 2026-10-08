@@ -70,7 +70,7 @@ chat and zstd screenshots need zstd: Bun, or Node 22.15+ (the dev-server warns w
   (`claude auth login`, Claude.ai account). An API-key, Bedrock, Vertex or Foundry login is refused at startup
 - `cloudflared` (installed automatically with winget on Windows when missing; macOS `brew install cloudflared`)
 - A TypeTorch game repo (`typetorch.json`) and an Open Cloud API key that can publish MessagingService messages
-  (`OPENCLOUD_DEPLOY_KEY`, else the shared `TYPETORCH_API_KEY`, `OPENCLOUD_API_KEY` or `ROBLOX_API_KEY`). It is used to tell
+  (`OPENCLOUD_DEPLOY_KEY`, else the shared `OPENCLOUD_API_KEY` or `ROBLOX_API_KEY`; since CLI 0.9 `TYPETORCH_API_KEY` is the backend's key, never read here). It is used to tell
   game servers where the session is. When you play on another PC, screenshots come as CaptureService uploads, and
   `OPENCLOUD_ASSETS_KEY` (else the shared key) downloads them (Open Cloud asset delivery; untested live, the key may
   need `legacy-asset:manage`).
