@@ -104,8 +104,8 @@ export async function startRemoteClaude(options: RemoteClaudeOptions): Promise<R
 	}
 
 	// 2. Settings (the API key is never printed).
-	// The CLI's precedence: environment, then --env-file / TYPETORCH_ENV_FILE, then .env files (env.ts Settings).
-	const settings = new Settings([process.cwd(), repo], { envFile: options.envFile });
+	// The CLI's sources (CLI 0.9): the environment, then the game repo's .env (--env-file / TYPETORCH_ENV_FILE replace it).
+	const settings = new Settings(repo, { envFile: options.envFile });
 	if (settings.envFileMissing) logger.warn(`the env file ${settings.envFile} does not exist (--env-file / TYPETORCH_ENV_FILE)`);
 	else if (settings.envFile) logger.info(`env file: ${settings.envFile}`);
 	const announce = options.announce !== false;
@@ -125,14 +125,16 @@ export async function startRemoteClaude(options: RemoteClaudeOptions): Promise<R
 		addSecret(found.value);
 		deployEnv[name] = found.value;
 	}
-	// The deploy (the CLI) reads the same env file.
+	// The deploy (the CLI) reads the same env file. It runs in Claude's worktree, which has no .env of its own (it is
+	// gitignored), so it is pointed at the main repo's .env (or the override).
 	if (settings.envFile && !settings.envFileMissing) deployEnv.TYPETORCH_ENV_FILE = settings.envFile;
+	else if (settings.files.includes(settings.dotEnv)) deployEnv.TYPETORCH_ENV_FILE = settings.dotEnv;
 	// No .env value may reach a game client through prompt events.
 	for (const value of settings.fileValues()) addEventSecret(value);
 	const universeId = config.universeId ?? (Number(settings.get("UNIVERSE_ID")?.value) || undefined);
 	if (announce && !messagingKey) {
 		throw new Error(
-			`no Open Cloud API key (OPENCLOUD_DEPLOY_KEY or ${API_KEY_VARS.join(", ")}) in the environment, the env file (--env-file / TYPETORCH_ENV_FILE) or a .env file; it is needed to announce the session to game servers`,
+			`no Open Cloud API key (OPENCLOUD_DEPLOY_KEY or ${API_KEY_VARS.join(", ")}) in the environment or the game repo's .env (or the --env-file / TYPETORCH_ENV_FILE file); it is needed to announce the session to game servers`,
 		);
 	}
 	if (announce && !universeId) throw new Error(`no universe id: set "universeId" in ${config.path} or UNIVERSE_ID`);

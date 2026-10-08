@@ -1,7 +1,6 @@
 /**
- * Settings from the real environment, the TypeTorch env file (`--env-file` / TYPETORCH_ENV_FILE, as the CLI reads it)
- * and `.env` files. `.env` files are read from each start folder and every parent (the nearest file wins; the env file
- * wins over them; real environment variables win over every file).
+ * Settings from the real environment and the game repo's `.env` (`--env-file` / TYPETORCH_ENV_FILE replace it), as the
+ * TypeTorch CLI 0.9 reads them; real environment variables win over the file.
  *
  * As in the TypeTorch CLI, values are NOT copied into process.env: they stay in this private map, so child processes
  * (Claude Code, git, build tools) never inherit the Open Cloud API key or other local secrets by accident. Values are
@@ -29,20 +28,6 @@ export function parseDotEnv(text: string): Record<string, string> {
 		values[match[1]] = value;
 	}
 	return values;
-}
-
-/** The `.env` files from `startDir` up to the filesystem root, nearest first. */
-export function dotEnvChain(startDir: string): string[] {
-	const files: string[] = [];
-	let dir = resolve(startDir);
-	while (true) {
-		const file = join(dir, ".env");
-		if (existsSync(file)) files.push(file);
-		const parent = dirname(dir);
-		if (parent === dir) break;
-		dir = parent;
-	}
-	return files;
 }
 
 export interface Setting {
@@ -76,38 +61,38 @@ export interface SettingsOptions {
 }
 
 /**
- * Settings with the TypeTorch CLI's precedence (cli/src/env.ts), highest first:
+ * Settings with the TypeTorch CLI's sources (cli/src/env.ts, CLI 0.9), highest first:
  *   1. the real environment;
- *   2. the explicit env file: `--env-file`, else TYPETORCH_ENV_FILE from the environment (both relative to the working
- *      directory), else TYPETORCH_ENV_FILE declared in the nearest `.env` (relative to that file's folder);
- *   3. `.env` files in each start folder and its parents, nearest first.
- * Values from files stay in this object: never copied into process.env, so no child process inherits them (only the
- * deploy gets the keys it needs, explicitly).
+ *   2. the game repo's `.env` (the folder holding typetorch.json; no parent folder's `.env` counts any more).
+ * `--env-file` or TYPETORCH_ENV_FILE from the environment (relative to the working directory) is an override: that
+ * file is read INSTEAD of the game's `.env`. A `TYPETORCH_ENV_FILE=` line inside the game's `.env` (the CLI 0.8
+ * layout) is still followed for one release (that file wins over the `.env`). Values from files stay in this object:
+ * never copied into process.env, so no child process inherits them (only the deploy gets the keys it needs).
  */
 export class Settings {
 	/** Every env file read, highest priority first. */
 	readonly files: string[] = [];
-	/** The explicit env file, resolved; undefined when none is configured. */
+	/** The override (or the file a `.env` names), resolved; undefined when none is configured. */
 	readonly envFile?: string;
-	/** The explicit env file is configured but doesn't exist. */
+	/** That file is configured but doesn't exist. */
 	readonly envFileMissing: boolean = false;
+	/** The game repo's `.env` (read unless an override replaces it). */
+	readonly dotEnv: string;
 	private readonly values = new Map<string, Setting>();
 	private readonly real: Record<string, string | undefined>;
 
-	constructor(startDirs: string[], options: SettingsOptions = {}) {
+	/** `gameDir`: the game repo (the folder holding typetorch.json). */
+	constructor(gameDir: string, options: SettingsOptions = {}) {
 		this.real = options.env ?? process.env;
+		this.dotEnv = join(resolve(gameDir), ".env");
 		const chain: { file: string; values?: Record<string, string> }[] = [];
-		for (const start of startDirs) {
-			for (const file of dotEnvChain(start)) {
-				if (!chain.some((c) => c.file === file)) chain.push({ file, values: readEnvFile(file) });
-			}
-		}
 		let envFile: string | undefined;
 		if (options.envFile?.trim()) envFile = expandPath(options.envFile.trim(), process.cwd());
 		else if (this.real[ENV_FILE_VAR]?.trim()) envFile = expandPath(this.real[ENV_FILE_VAR]!.trim(), process.cwd());
 		else {
-			const declared = chain.find((c) => c.values?.[ENV_FILE_VAR]?.trim());
-			if (declared) envFile = expandPath(declared.values![ENV_FILE_VAR].trim(), dirname(declared.file));
+			if (existsSync(this.dotEnv)) chain.push({ file: this.dotEnv, values: readEnvFile(this.dotEnv) });
+			const declared = chain[0]?.values?.[ENV_FILE_VAR]?.trim();
+			if (declared) envFile = expandPath(declared, dirname(this.dotEnv));
 		}
 		this.envFile = envFile;
 		const sources: { file: string; values?: Record<string, string> }[] = [];
@@ -145,8 +130,14 @@ export class Settings {
 	}
 }
 
-/** Open Cloud API key variables, in the TypeTorch CLI's priority order. */
-export const API_KEY_VARS = ["TYPETORCH_API_KEY", "OPENCLOUD_API_KEY", "ROBLOX_API_KEY"] as const;
+/** Open Cloud API key variables, in the TypeTorch CLI's priority order (CLI 0.9: TYPETORCH_API_KEY is not one). */
+export const API_KEY_VARS = ["OPENCLOUD_API_KEY", "ROBLOX_API_KEY"] as const;
+
+/**
+ * The TypeTorch backend's secrets (the CLI's backend.ts): the game key, the admin token and their CLI 0.8 names. The
+ * dev-server never uses them; they are scrubbed from every child (Claude, git, the deploy).
+ */
+export const BACKEND_SECRET_VARS = ["TYPETORCH_API_KEY", "TYPETORCH_ADMIN_TOKEN", "TYPETORCH_FLEET_TOKEN", "TYPETORCH_FLEET_INGEST_TOKEN"] as const;
 
 /**
  * remote-claude only runs on the dev's Claude subscription (claude.ai login), never on pay-per-token API billing.
@@ -182,7 +173,7 @@ export const DEPLOY_SECRET_VARS = ["OPENCLOUD_ASSETS_KEY", "OPENCLOUD_DEPLOY_KEY
  */
 export const SIGNING_KEY_VARS = ["TYPETORCH_KEY_FILE", "TYPETORCH_FALLBACK_KEY_FILE", "TYPETORCH_SIGNING_KEY", "TYPETORCH_ALLOW_ENV_SIGNING_KEY"] as const;
 
-export const SCRUBBED_VARS: readonly string[] = [...API_KEY_VARS, ...DEPLOY_SECRET_VARS, ...SIGNING_KEY_VARS, ...API_BILLING_VARS];
+export const SCRUBBED_VARS: readonly string[] = [...API_KEY_VARS, ...DEPLOY_SECRET_VARS, ...BACKEND_SECRET_VARS, ...SIGNING_KEY_VARS, ...API_BILLING_VARS];
 
 /**
  * Variables that tie a process to the Claude Code session that launched this server (set when the dev server itself
