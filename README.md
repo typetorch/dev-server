@@ -412,7 +412,7 @@ Node 22 and Claude Code run the chats, cloudflared opens the tunnel. Files: `Doc
 `docker-entrypoint.sh`, `.dockerignore`.
 
 In the container the game repo is `/work/game`, and Claude works in `/work/game-remote-claude` (next to it, on the same
-volume). Claude's login and settings are in `/home/dev/.claude`. **Log in with your claude.ai account inside the
+volume). Claude's login and settings are in the `dev` user's `~/.claude` (the Dockerfile's `CLAUDE_CONFIG_DIR`). **Log in with your claude.ai account inside the
 container: `claude auth login`** (not `claude login`, which starts a chat). The image sets no `ANTHROPIC_*`, Bedrock,
 Vertex or Foundry variable, and the dev-server only runs on the subscription login, as on your PC. Don't set those
 variables in the container.
@@ -420,7 +420,7 @@ variables in the container.
 ### Local (Docker Desktop)
 1. **Game repo.** `compose.yaml` mounts `GAME_REPO` (default `../template`, the TypeTorch template next to this folder)
    at `/work/game`. Set it in a `.env` file next to `compose.yaml` (git-ignored) or in your shell, for example
-   `GAME_REPO=C:/Users/you/Documents/GitHub/my-game`.
+   `GAME_REPO=../my-game`.
 2. **Log in once.** The login is saved in the `claude-home` volume:
    ```sh
    docker compose run --rm dev-server claude auth login
@@ -452,7 +452,7 @@ Create a Dockerfile application from this repository (not the Docker Compose opt
 The container only makes outbound connections, so no port needs publishing.
 
 1. **Storage.** Two persistent volumes: `/work` (the game clone at `/work/game`, and Claude's worktree next to it) and
-   `/home/dev/.claude` (Claude's login and settings).
+   the `dev` user's `~/.claude`, the path in the Dockerfile's `CLAUDE_CONFIG_DIR` (Claude's login and settings).
 2. **Environment.** `TT_IDLE=1` (the container stays up without starting the dev-server, for set-up), `TT_USERS=1,2,56`,
    and the Open Cloud key as `OPENCLOUD_API_KEY` (or `OPENCLOUD_DEPLOY_KEY`). Variables set in Coolify win over the
    game's `.env` file, so the key never has to be written to a volume.
