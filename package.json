@@ -1,6 +1,6 @@
 {
 	"name": "@typetorch/dev-server",
-	"version": "0.2.1",
+	"version": "0.2.2",
 	"description": "TypeTorch remote-claude: lets allowlisted devs prompt Claude Code on your machine from inside a live Roblox dev server, behind a Cloudflare Quick Tunnel with JWT auth.",
 	"license": "MIT",
 	"repository": {
