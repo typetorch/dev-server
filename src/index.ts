@@ -44,6 +44,8 @@ Options:
   --code-ttl <minutes>   lifetime of each pairing code (default 180); a new one is printed when it expires,
                          and paired servers must pair again at most this long after pairing
   --no-announce          do not publish the session to game servers (local testing)
+  --no-tunnel            no Cloudflare tunnel: local clients only (typetorch serve --claude, which reaches it through
+                         its own gateway); .typetorch/remote-claude.session.json tells them the session id and port
   --no-install           do not bun install in a fresh worktree
 
 Terminal commands while running: code (show the pairing code again), revoke <userId>, users, rotate (new pairing code;
@@ -94,7 +96,7 @@ function positive(flags: Map<string, string | true>, name: string): number | und
 	return n;
 }
 
-const KNOWN = new Set([...VALUE_FLAGS, "no-deploy", "no-announce", "no-install", "help"]);
+const KNOWN = new Set([...VALUE_FLAGS, "no-deploy", "no-announce", "no-tunnel", "no-install", "help"]);
 
 async function main(argv: string[]): Promise<number> {
 	const { command, flags } = parseArgs(argv);
@@ -131,6 +133,7 @@ async function main(argv: string[]): Promise<number> {
 		cli: flags.get("cli") as string | undefined,
 		envFile: flags.get("env-file") as string | undefined,
 		announce: !flags.has("no-announce"),
+		tunnel: !flags.has("no-tunnel"),
 		installDeps: !flags.has("no-install"),
 		model: flags.get("model") as string | undefined,
 		maxBudgetUsd: positive(flags, "max-budget-usd"),

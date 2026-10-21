@@ -124,6 +124,10 @@ new code, and every game server must pair again (see "Tunnel binding" below).
 - `--code-ttl <minutes>`: lifetime of each pairing code (default 180). Refresh tokens never outlive it (12 h at most).
 - Also: `--model <name>`, `--max-budget-usd <n>` (a per-run cap on Claude Code's own cost estimate; runs are always
   billed to your subscription), `--no-announce` (local testing), `--no-install`.
+- `--no-tunnel`: no Cloudflare tunnel, for a local client only. `typetorch serve --claude` runs remote-claude this way
+  for the Studio plugin's Claude tab: it reads `<repo>/.typetorch/remote-claude.session.json` (`{v, sid, branch, port,
+  url, pid}`, no secret; rewritten whenever a code goes out, deleted when the session ends) and the code file, pairs
+  on the Studio user's behalf, and passes the plugin's requests through its own gateway.
 
 Terminal commands while it runs:
 
