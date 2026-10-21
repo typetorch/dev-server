@@ -191,7 +191,24 @@ export async function startRemoteClaude(options: RemoteClaudeOptions): Promise<R
 	const codeTtlMinutes = options.codeTtlMinutes ?? 180;
 	if (!(codeTtlMinutes > 0)) throw new Error("--code-ttl must be a positive number of minutes");
 	const codeTtlMs = Math.round(codeTtlMinutes * 60_000);
+	// <repo>/.typetorch/remote-claude.session.json: what a local client (typetorch serve, for the Studio plugin's Claude
+	// tab) needs to pair: the session id, branch and port. Rewritten whenever a code goes out (start, rotate, a tunnel
+	// restart re-keys the session) and removed on close. No secret in it: pairing still needs the code.
+	const sessionFile = join(repo, ".typetorch", "remote-claude.session.json");
+	await ensureIgnored(repo, ".typetorch/remote-claude.session.json");
+	let describeSession: () => object | undefined = () => undefined;
+	const writeSessionFile = () => {
+		const info = describeSession();
+		if (!info) return;
+		try {
+			mkdirSync(dirname(sessionFile), { recursive: true });
+			writeFileSync(sessionFile, JSON.stringify(info, null, "\t") + "\n", { mode: 0o600 });
+		} catch (error) {
+			logger.warn(`could not write ${sessionFile}: ${(error as Error).message}`);
+		}
+	};
 	const publishCode = (formatted: string, expiresAt: number) => {
+		writeSessionFile();
 		try {
 			mkdirSync(dirname(codeFile), { recursive: true });
 			writeFileSync(codeFile, `${formatted}\nexpires ${new Date(expiresAt).toISOString()}\n`, { mode: 0o600 });
@@ -249,6 +266,7 @@ export async function startRemoteClaude(options: RemoteClaudeOptions): Promise<R
 		},
 	});
 	const { auth } = server;
+	describeSession = () => ({ v: 1, sid: auth.sessionId, branch, port: server.port, url: tunnel?.url ?? null, pid: process.pid });
 
 	// 7. Tunnel + registration. Pairing is bound to the tunnel URL: the code's fingerprint, the refresh tokens and the
 	// session id all change with it (security audit H1).
@@ -362,6 +380,7 @@ export async function startRemoteClaude(options: RemoteClaudeOptions): Promise<R
 				await server.stop();
 				tunnel?.stop();
 				rmSync(codeFile, { force: true });
+				rmSync(sessionFile, { force: true });
 				if (await closedSent) logger.info("announced closed session");
 				resolveClosed();
 			})();

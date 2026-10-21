@@ -189,6 +189,12 @@ describe("startup", () => {
 			expect(printed.join("")).toContain(line(code, pairing.expiresAt));
 			expect(readFileSync(session.codeFile, "utf8")).toBe(`${code}\nexpires ${new Date(pairing.expiresAt).toISOString()}\n`);
 			expect(git("check-ignore", "-q", ".typetorch/remote-claude.code").exitCode).toBe(0);
+			// What a local client (typetorch serve --claude) reads to pair: no secret in it.
+			const sessionFile = join(repo, ".typetorch", "remote-claude.session.json");
+			const info = JSON.parse(readFileSync(sessionFile, "utf8"));
+			expect(info).toEqual({ v: 1, sid: session.sessionId, branch: "dev", port: session.server.port, url: null, pid: process.pid });
+			expect(readFileSync(sessionFile, "utf8")).not.toContain(code.replace(/-/g, "").slice(0, 8));
+			expect(git("check-ignore", "-q", ".typetorch/remote-claude.session.json").exitCode).toBe(0);
 			expect(git("status", "--porcelain").stdout.toString()).toBe("");
 			expect(session.status()).toContain("pairing code valid for 3 h 00 min");
 			expect(session.status()).not.toContain(code);
@@ -222,6 +228,7 @@ describe("startup", () => {
 			await session?.close();
 		}
 		expect(existsSync(session!.codeFile)).toBe(false);
+		expect(existsSync(join(repo, ".typetorch", "remote-claude.session.json"))).toBe(false);
 		rmSync(dir, { recursive: true, force: true });
 	});
 });
