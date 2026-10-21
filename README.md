@@ -1,3 +1,5 @@
+<img src="https://raw.githubusercontent.com/typetorch/docs/main/brand/typetorch.svg" width="64" alt="TypeTorch logo">
+
 # @typetorch/dev-server
 
 `remote-claude` for [TypeTorch](https://github.com/typetorch): prompt **Claude Code on your own machine** from inside a
