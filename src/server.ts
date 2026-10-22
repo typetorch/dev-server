@@ -54,9 +54,8 @@ import { DEFAULT_CODE_TTL_MS, PairingCode, PairingLockout, type RotateReason } f
 import {
 	GAME_LIMITS,
 	GAME_MCP_SERVER,
-	GAME_TOOL_DEFS,
-	GAME_TOOLS,
-	READ_ONLY_GAME_TOOLS,
+	gameToolDefsFor,
+	gameToolsFor,
 	GameRequestStore,
 	REQUEST_ID_PATTERN,
 	formatGameResult,
@@ -920,8 +919,9 @@ async function startServer(options: RemoteClaudeServerOptions): Promise<RemoteCl
 	async function callGameTool(record: PromptRecord, name: unknown, args: unknown): Promise<{ text: string; isError: boolean; image?: string }> {
 		const call = parseToolCall(name, args);
 		if (typeof call === "string") return { text: call, isError: true };
-		// Modes are enforced here too, not only by the run's tool allowlist: code runs never run Luau on the server.
-		if (!(record.mode === "live" ? GAME_TOOLS : READ_ONLY_GAME_TOOLS).includes(call.tool as never)) {
+		// Modes are enforced here too, not only by the run's tool allowlist: code runs never run Luau on a game server.
+		if (!gameToolsFor(record.mode, record.job).includes(call.tool)) {
+			if (record.job === "") return { text: `${call.tool} is not available in Studio.`, isError: true };
 			return { text: `${call.tool} is only available in Live mode. Tell the developer to switch to Live mode for this.`, isError: true };
 		}
 		if (gameRequests.countFor(record.id) >= GAME_LIMITS.perPrompt) return { text: "Too many game tool calls in this prompt.", isError: true };
@@ -988,9 +988,8 @@ async function startServer(options: RemoteClaudeServerOptions): Promise<RemoteCl
 				reply({ protocolVersion: version, capabilities: { tools: { listChanged: false } }, serverInfo: { name: GAME_MCP_SERVER, version: "0.1.0" } });
 			} else if (method === "ping") reply({});
 			else if (method === "tools/list") {
-				const allowed: readonly string[] = record.mode === "live" ? GAME_TOOLS : READ_ONLY_GAME_TOOLS;
 				// Creator Store tools only when this prompt carried the Toolbox chip (plans/14).
-				reply({ tools: [...GAME_TOOL_DEFS.filter((def) => allowed.includes(def.name)), ...toolbox.definitionsFor(record)] });
+				reply({ tools: [...gameToolDefsFor(record.mode, record.job), ...toolbox.definitionsFor(record)] });
 			}
 			else if (method === "tools/call" && isToolboxTool(params?.name)) {
 				// Re-checked on every call: the chip of this very prompt, the mode, the ids of this conversation's searches.
