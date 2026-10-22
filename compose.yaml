@@ -14,7 +14,7 @@ services:
     security_opt:
       - no-new-privileges:true
     environment:
-      # Roblox user ids allowed to prompt, as --users. Needed on the first start; then the saved list is used.
+      # Roblox user ids allowed to prompt, as --users. Else the saved list, else the owners in typetorch.json.
       TT_USERS: ${TT_USERS:-}
     volumes:
       # The game repo on the host (default: the template next to this folder), at /work/game.
