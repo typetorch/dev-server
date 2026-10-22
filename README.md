@@ -356,7 +356,8 @@ that came through the tunnel are refused). Its tools act only on the game server
 
 A prompt from Studio (job `""`: the TypeTorch plugin through `typetorch serve`) gets the Studio set in either mode:
 `run_luau`, `game_logs`, `inspect`, `find` and `game_status`, answered by the plugin on the place open in that dev's
-Studio (no screenshot). The plugin shows each `run_luau` snippet with Run / Deny and records it as one undo step; the
+Studio (no screenshot). The plugin runs each `run_luau` snippet at once (no approval card: the dev chose that) as one
+undo step, and the chat shows the code; the
 system prompt keeps code changes in files (Rojo syncs them) and uses `run_luau` for the place's own instances.
 
 | Tool | What it does |

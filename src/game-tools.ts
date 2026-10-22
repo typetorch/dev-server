@@ -31,8 +31,8 @@ export const GAME_TOOLS = ["run_luau", "game_logs", "inspect", "find", "game_sta
 export const READ_ONLY_GAME_TOOLS = ["game_logs", "inspect", "find", "game_status", "screenshot"] as const;
 /**
  * What a prompt from Studio (job "": the dev's own Studio through `typetorch serve`, answered by the TypeTorch plugin
- * on the open place) may call in either mode: run_luau too, since it edits only that dev's place (they approve each
- * snippet in Studio, and it is one undo step), but no screenshot (Studio can't capture its viewport).
+ * on the open place) may call in either mode: run_luau too, since it edits only that dev's place (it runs at once, shows
+ * in their chat, and is one undo step there), but no screenshot (Studio can't capture its viewport).
  */
 export const STUDIO_GAME_TOOLS = ["run_luau", "game_logs", "inspect", "find", "game_status"] as const;
 export type GameToolName = (typeof GAME_TOOLS)[number];
@@ -349,7 +349,7 @@ export const GAME_TOOL_DEFS = [
 /** Descriptions for a prompt from Studio: the tools act on the place open in the dev's Studio, not a game server. */
 const STUDIO_DESCRIPTIONS: Partial<Record<GameToolName, string>> = {
 	run_luau:
-		"Run a Luau snippet in the requesting developer's Roblox Studio, on the place they have open (usually Edit mode). The developer sees the code and approves it in Studio before it runs, and the whole run is one undo step there (Ctrl+Z). Use it for changes to instances in the place (build, move, rename, set properties, insert models); changes to the game's source go in files instead. `game`, `workspace` and the usual globals work; there is no `player`. print/warn output and returned values come back. Changes are saved only when the developer saves or publishes the place. Default timeout 10 s (max 30).",
+		"Run a Luau snippet in the requesting developer's Roblox Studio, on the place they have open (usually Edit mode). It runs at once (no approval step); the developer sees the code in their chat and can undo the whole run in one step (Ctrl+Z). Use it for changes to instances in the place (build, move, rename, set properties, insert models); changes to the game's source go in files instead. `game`, `workspace` and the usual globals work; there is no `player`. print/warn output and returned values come back. Changes are saved only when the developer saves or publishes the place. Default timeout 10 s (max 30).",
 	game_logs: "Recent Studio output lines (print, warn, errors) from the developer's Studio. Newest last. `realm` is ignored.",
 	inspect:
 		"Look at one instance of the place open in the developer's Studio: class, properties, attributes, tags and children (to `depth` levels, max 3). Path like game.Workspace.Map or Workspace/Map/Part. `realm` is ignored.",
