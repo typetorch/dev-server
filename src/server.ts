@@ -253,6 +253,15 @@ export interface RemoteClaudeServerOptions {
 	worktree?: string;
 	/** toolbox_add's lock file (shared with the runner). Default: one in `worktree`; without either, toolbox_add is off. */
 	toolboxLock?: ToolboxLock;
+	/**
+	 * A worktree per user (a local session: several devs in Studio at once). Their prompts run side by side, each in
+	 * its own lane; images and toolbox_add use that user's worktree. Wins over `worktree` and `toolboxLock`.
+	 */
+	lanes?: {
+		laneOf(userId: number): string;
+		worktreeFor(userId: number): string | undefined;
+		toolboxLockFor(userId: number): ToolboxLock | undefined;
+	};
 	/** The Creator Store search client (tests inject one with a fake fetch). */
 	toolboxClient?: ToolboxClient;
 	/** Where the Roblox client writes screenshots on this PC (default images.ts captureDir()). */
@@ -356,6 +365,7 @@ async function startServer(options: RemoteClaudeServerOptions): Promise<RemoteCl
 	let localUrl = "";
 	const queue = new PromptQueue({
 		runner: options.runner,
+		laneOf: options.lanes?.laneOf,
 		maxQueued: options.maxQueued ?? 5,
 		maxPrompts: options.maxPrompts ?? 50,
 		logger,
@@ -381,7 +391,7 @@ async function startServer(options: RemoteClaudeServerOptions): Promise<RemoteCl
 	 */
 	const toolbox = new ToolboxService({
 		client: options.toolboxClient ?? new ToolboxClient(),
-		lock: options.toolboxLock ?? (options.worktree ? new ToolboxLock(options.worktree) : undefined),
+		lock: options.lanes ? (userId) => options.lanes!.toolboxLockFor(userId) : (options.toolboxLock ?? (options.worktree ? new ToolboxLock(options.worktree) : undefined)),
 		logger,
 		gameCall: async (run, args, description, timeoutSeconds): Promise<ToolboxGameResult | undefined> => {
 			const record = queue.get(run.promptId);
@@ -457,8 +467,9 @@ async function startServer(options: RemoteClaudeServerOptions): Promise<RemoteCl
 			queue.note(record, `image not shown: ${reason}`);
 			logger.info(`prompt ${record.id.slice(0, 8)} image not shown: ${reason}`);
 		};
-		if (!options.worktree) return refuse("no worktree");
-		const resolved = resolveImageRef(options.worktree, ref.path);
+		const worktree = options.lanes ? options.lanes.worktreeFor(record.userId) : options.worktree;
+		if (!worktree) return refuse("no worktree");
+		const resolved = resolveImageRef(worktree, ref.path);
 		if (typeof resolved === "string") return refuse(resolved);
 		// Counted before decoding (several are prepared at once).
 		const shown = (shownPerPrompt.get(record.id) ?? 0) + 1;
@@ -681,7 +692,7 @@ async function startServer(options: RemoteClaudeServerOptions): Promise<RemoteCl
 			const used = attachments.check(body.attachments ?? [], userId);
 			if (!used) return decide(400, what, `${who} attachment not found, not yours or already used`), empty(400);
 			const mode = body.mode ?? "live";
-			const refused = queue.refusal(mode);
+			const refused = queue.refusal(mode, userId);
 			if (refused === "max-prompts" || refused === "queue-full") return decide(429, what, `${who} ${refused}`), empty(429);
 			if (refused === "stopped") return decide(503, what, `${who} shutting down`), empty(503);
 			// Code runs take turns on the worktree, and wait while a deploy proposal is undecided.

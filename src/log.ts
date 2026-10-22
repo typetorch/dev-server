@@ -75,9 +75,9 @@ function osUsername(): string | undefined {
  * ("<repo>/"), the temp folder ("<tmp>/") and the home folder ("~/"). Called once by session.ts; also sets up the
  * username. Without a call, only the generic rules and the home/temp folders apply.
  */
-export function setEventPaths(paths: { worktree?: string; repo?: string } = {}): void {
+export function setEventPaths(paths: { worktree?: string | string[]; repo?: string } = {}): void {
 	const roots: { path: string; prefix: string; bare: string }[] = [];
-	if (paths.worktree) roots.push({ path: paths.worktree, prefix: "", bare: "." });
+	for (const worktree of typeof paths.worktree === "string" ? [paths.worktree] : (paths.worktree ?? [])) roots.push({ path: worktree, prefix: "", bare: "." });
 	if (paths.repo) roots.push({ path: paths.repo, prefix: "<repo>/", bare: "<repo>" });
 	roots.push({ path: tmpdir(), prefix: "<tmp>/", bare: "<tmp>" }, { path: homedir(), prefix: "~/", bare: "~" });
 	pathRoots = roots

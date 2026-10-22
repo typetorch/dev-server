@@ -57,6 +57,11 @@ export interface RemoteClaudeOptions {
 	installDeps?: boolean;
 	/** Read terminal commands from stdin (default true). */
 	terminal?: boolean;
+	/**
+	 * A worktree per user, so several devs use Claude at the same time (default: on in a local session, i.e. Studio
+	 * through `typetorch serve`; off otherwise, where everyone shares the one worktree and takes turns).
+	 */
+	worktreePerUser?: boolean;
 	model?: string;
 	/** A cap on Claude Code's own cost estimate per run (runs always use the Claude subscription). */
 	maxBudgetUsd?: number;
@@ -191,11 +196,13 @@ export async function startRemoteClaude(options: RemoteClaudeOptions): Promise<R
 	const bun = bunExecutable();
 	if (!bun) logger.warn(`bun is not on PATH (${runtimeName()}): Code mode's \`bun run build\`, worktree installs and deploy builds need Bun (https://bun.sh)`);
 	if (!hasZstd()) logger.warn(`${runtimeName()} has no zstd: images Claude shows can't reach the game and zstd screenshots are refused (Node 22.15+ or Bun)`);
-	if (options.installDeps !== false && bun && existsSync(join(worktree.path, "package.json")) && !existsSync(join(worktree.path, "node_modules"))) {
-		logger.info("installing dependencies in the worktree (bun install)…");
-		const installed = await run([bun, "install"], { cwd: worktree.path, env: childEnv(), timeoutMs: 10 * 60_000 });
-		if (installed.code !== 0) logger.warn(`bun install failed in the worktree (exit ${installed.code}); builds may fail`);
-	}
+	const installDeps = async (wt: Worktree) => {
+		if (options.installDeps === false || !bun || !existsSync(join(wt.path, "package.json")) || existsSync(join(wt.path, "node_modules"))) return;
+		logger.info(`installing dependencies in ${wt.path} (bun install)…`);
+		const installed = await run([bun, "install"], { cwd: wt.path, env: childEnv(), timeoutMs: 10 * 60_000 });
+		if (installed.code !== 0) logger.warn(`bun install failed in ${wt.path} (exit ${installed.code}); builds may fail`);
+	};
+	await installDeps(worktree);
 
 	// 5. Pairing code output: one terminal line, the clipboard and <repo>/.typetorch/remote-claude.code (git-ignored).
 	// Nowhere else: it is redacted from every other log line and never announced or committed.
@@ -242,10 +249,9 @@ export async function startRemoteClaude(options: RemoteClaudeOptions): Promise<R
 	if (deploy && !cli) logger.warn("TypeTorch CLI not found; prompts will stop at \"committed\" (pass --cli <path>)");
 	// toolbox_add writes toolbox.lock.toml (the server); the runner accepts exactly that write in a commit.
 	const toolboxLock = new ToolboxLock(worktree.path);
-	const runner =
-		options.runner ??
+	const claudeRunner = (wt: Worktree, lock: ToolboxLock) =>
 		createClaudeRunner({
-			worktree,
+			worktree: wt,
 			ttBranch: branch,
 			deployBranch,
 			deploy,
@@ -258,8 +264,45 @@ export async function startRemoteClaude(options: RemoteClaudeOptions): Promise<R
 			model: options.model,
 			maxBudgetUsd: options.maxBudgetUsd,
 			protect: options.protect,
-			toolboxLock,
+			toolboxLock: lock,
 		});
+	// A worktree per user (lanes): each dev's prompts run in their own worktree, side by side with the others'. Made
+	// one after another (git locks the repo while adding a worktree), each on its first prompt or at start below.
+	const perUser = options.worktreePerUser ?? localOnly;
+	interface Lane {
+		worktree: Worktree;
+		lock: ToolboxLock;
+		runner: Runner;
+	}
+	const lanes = new Map<string, Promise<Lane>>();
+	const readyLanes = new Map<string, Lane>();
+	let laneChain: Promise<unknown> = Promise.resolve();
+	const laneOf = (userId: number) => String(userId);
+	const laneFor = (userId: number): Promise<Lane> => {
+		const key = laneOf(userId);
+		let lane = lanes.get(key);
+		if (!lane) {
+			lane = laneChain.then(async () => {
+				const wt = await ensureWorktree(repo, gitBranch, { separate: true, lane: key });
+				rmSync(join(wt.path, ".typetorch", "attachments"), { recursive: true, force: true });
+				await installDeps(wt);
+				const lock = new ToolboxLock(wt.path);
+				const made: Lane = { worktree: wt, lock, runner: options.runner ?? claudeRunner(wt, lock) };
+				readyLanes.set(key, made);
+				setEventPaths({ worktree: [worktree.path, ...[...readyLanes.values()].map((l) => l.worktree.path)], repo });
+				logger.info(`roblox:${userId}: worktree ${wt.path} on ${wt.workBranch}`);
+				return made;
+			});
+			// A failed lane is made again on the next prompt.
+			lane.catch(() => lanes.delete(key));
+			lanes.set(key, lane);
+			laneChain = lane.catch(() => undefined);
+		}
+		return lane;
+	};
+	const runner: Runner = perUser
+		? async (ctx) => (await laneFor(ctx.record.userId)).runner(ctx)
+		: (options.runner ?? claudeRunner(worktree, toolboxLock));
 	const server = await createRemoteClaudeServer({
 		branch,
 		users,
@@ -273,6 +316,13 @@ export async function startRemoteClaude(options: RemoteClaudeOptions): Promise<R
 		// or (fallback) downloaded with the Open Cloud key.
 		worktree: worktree.path,
 		toolboxLock,
+		lanes: perUser
+			? {
+					laneOf,
+					worktreeFor: (userId) => readyLanes.get(laneOf(userId))?.worktree.path,
+					toolboxLockFor: (userId) => readyLanes.get(laneOf(userId))?.lock,
+				}
+			: undefined,
 		logsDir,
 		captureDir: captureDir(),
 		downloadAsset: assetsKey ? openCloudAssetDownloader(assetsKey.value) : undefined,
@@ -286,6 +336,8 @@ export async function startRemoteClaude(options: RemoteClaudeOptions): Promise<R
 		},
 	});
 	const { auth } = server;
+	// Each allowed dev's worktree is made now, so their first prompt doesn't wait for it.
+	if (perUser) for (const userId of users) laneFor(userId).catch((error: Error) => logger.warn(`roblox:${userId}: no worktree: ${error.message}`));
 	describeSession = () => ({ v: 1, sid: auth.sessionId, branch, port: server.port, url: tunnel?.url ?? null, pid: process.pid });
 
 	// 7. Tunnel + registration. Pairing is bound to the tunnel URL: the code's fingerprint, the refresh tokens and the
@@ -386,9 +438,9 @@ export async function startRemoteClaude(options: RemoteClaudeOptions): Promise<R
 			const q = server.queue;
 			const active = q.active;
 			return [
-				`session ${auth.sessionId.slice(0, 8)}  branch ${branch} (git ${gitBranch}, worktree on ${worktree.workBranch})`,
+				`session ${auth.sessionId.slice(0, 8)}  branch ${branch} (git ${gitBranch}, ${perUser ? `a worktree per user: ${readyLanes.size} ready` : `worktree on ${worktree.workBranch}`})`,
 				`tunnel ${tunnel?.url ?? (cloudflared ? "(down)" : "(disabled)")}  announce ${announcer ? (announcer.lastAnnouncedAt ? `on (last ${new Date(announcer.lastAnnouncedAt).toLocaleTimeString()})` : "on (not yet)") : "off"}  deploy ${deploy ? (cli ? "on" : "no CLI") : "off"}`,
-				`users ${auth.allowedUsers().join(", ") || "(none)"}  prompts ${q.createdCount}/${options.maxPrompts ?? 50}  queued ${q.queued.length}  running ${active ? `${active.id.slice(0, 8)} (${active.state})` : "-"}`,
+				`users ${auth.allowedUsers().join(", ") || "(none)"}  prompts ${q.createdCount}/${options.maxPrompts ?? 50}  queued ${q.queued.length}  running ${active.length > 0 ? active.map((record) => `${record.id.slice(0, 8)} (${record.state})`).join(", ") : "-"}`,
 				`pairing code valid for ${formatDuration(server.pairing.expiresAt - clock())} (until ${formatClock(server.pairing.expiresAt, clock())}, single use)  wrong codes ${server.lockout.total} (${server.lockout.lockedCount()} user+server pairs locked)  paired servers ${auth.refreshTokenCount()}`,
 			].join("\n");
 		},
