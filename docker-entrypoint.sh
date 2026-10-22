@@ -3,7 +3,7 @@
 #
 #   no arguments, `--flags`, or `remote-claude [flags]`: runs the dev-server on the game repo at $TT_GAME_DIR
 #       (default /work/game). TT_USERS, when set, is passed as --users; otherwise the ids remembered in the repo are
-#       used. TT_IDLE=1 keeps the container up without starting the dev-server (set-up in a terminal).
+#       used, else the owners in typetorch.json. TT_IDLE=1 keeps the container up without starting the dev-server (set-up in a terminal).
 #   anything else (`claude auth login`, `git status`, `sh`): runs that command as the container user.
 set -eu
 

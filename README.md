@@ -54,11 +54,13 @@ The dev-server runs on **Node 20+** (npm, npx) or **Bun 1.3+**.
 npm i -g @typetorch/dev-server           # then: typetorch-dev-server remote-claude --users ...
 npx @typetorch/dev-server remote-claude --users ...
 typetorch remote-claude --users ...      # through the TypeTorch CLI (it runs this package; install both)
+tt dev --users ...                       # the same: `dev` is the CLI's alias of remote-claude, `tt` of typetorch
 bun src/index.ts remote-claude --users ...   # from a checkout of this repo
 ```
 
-`typetorch remote-claude` finds this package installed next to the CLI (globally, in the game repo's
-`node_modules`, or both in one `npx -p @typetorch/cli -p @typetorch/dev-server typetorch remote-claude ...`) or a
+`typetorch remote-claude` (or `typetorch dev`) passes its arguments through unchanged. It finds this package through
+`TYPETORCH_DEV_SERVER` (an entry or executable), in the game repo's `node_modules` (or a parent's), installed next to
+the CLI (globally, or both in one `npx -p @typetorch/cli -p @typetorch/dev-server typetorch remote-claude ...`), or as a
 sibling `../dev-server` checkout. The [template](https://github.com/typetorch/template) has both packages in its
 devDependencies, so in a game made from it `bun install` is enough: `bun run typetorch remote-claude --users ...`.
 
@@ -127,10 +129,24 @@ new code, and every game server must pair again (see "Tunnel binding" below).
 - `--code-ttl <minutes>`: lifetime of each pairing code (default 180). Refresh tokens never outlive it (12 h at most).
 - Also: `--model <name>`, `--max-budget-usd <n>` (a per-run cap on Claude Code's own cost estimate; runs are always
   billed to your subscription), `--no-announce` (local testing), `--no-clipboard`, `--no-install`.
-- `--no-tunnel`: no Cloudflare tunnel, for a local client only. `typetorch serve --claude` runs remote-claude this way
-  for the Studio plugin's Claude tab: it reads `<repo>/.typetorch/remote-claude.session.json` (`{v, sid, branch, port,
-  url, pid}`, no secret; rewritten whenever a code goes out, deleted when the session ends) and the code file, pairs
-  on the Studio user's behalf, and passes the plugin's requests through its own gateway.
+- `--no-tunnel`: no Cloudflare tunnel, for a local client only. See "Studio plugin (typetorch serve --claude)" below.
+
+### Studio plugin (`typetorch serve --claude`)
+The Studio plugin's Claude tab talks to remote-claude through the TypeTorch CLI's `serve`, never directly.
+`typetorch serve --claude` (CLI 0.12) starts this package as `remote-claude --no-tunnel --no-announce --no-clipboard`,
+adding `--users <ids>` when `--claude-users` is given (otherwise the remembered list, else the owners in
+`typetorch.json`, as above). A remote-claude you start yourself in the same repo works too.
+
+- `serve` reads `<repo>/.typetorch/remote-claude.session.json` (`{v, sid, branch, port, url, pid}`; `url` is `null`
+  without a tunnel; no secret; rewritten whenever a code goes out, deleted when the session ends) and the code file,
+  redeems the code on the Studio user's behalf with `job: ""` (see "Studio" under the HTTP contract) and keeps the
+  tokens, so the plugin never sees a code or a token.
+- The plugin's prompts go out in Code mode by default; a proposal shows **Deploy** / **Discard** in the tab, which
+  `serve` sends as `POST /v1/prompts/:id/deploy`. Besides prompts, cancel and deploy decisions, `serve` passes through
+  only `GET /v1/conversations[/:id]`, `POST /v1/attachments[/capture|/asset]`, `GET /v1/images/:id` and
+  `POST /v1/logs`, never `/v1/token` or `/v1/game/*`.
+- `typetorch serve --remote` (CLI 0.12) opens a tunnel of its own for a Studio on another machine; that tunnel and its
+  pairing link belong to `serve`, not to this package, which still runs with `--no-tunnel` there.
 
 Terminal commands while it runs:
 
@@ -433,8 +449,8 @@ variables in the container.
    docker compose run --rm dev-server claude auth login
    ```
    Follow the prompts: open the link it shows on your PC, sign in with your Claude.ai account, and paste back the code.
-3. **Start.** The first start needs the Roblox user ids allowed to prompt. Set `TT_USERS=1,2,56` in `.env` (or your
-   shell), then:
+3. **Start.** The first start needs the Roblox user ids allowed to prompt, unless the owners in the game's
+   `typetorch.json` are enough. Set `TT_USERS=1,2,56` in `.env` (or your shell), then:
    ```sh
    docker compose up -d
    ```
@@ -514,7 +530,20 @@ headers, a 10 s idle timeout with per-request overrides (the long-poll, captures
 the client leaves, and only our headers (Node adds Date and Connection/Keep-Alive): no CORS. `src/glob.ts` replaces
 Bun.Glob for the protected paths (`test/glob.test.ts` checks it against Bun.Glob). The build compiles with
 `types: ["node"]`, so a Bun global in `src/` doesn't compile. `prepublishOnly` runs the build, `bun test` and the
-pack smoke test; publishing is done by hand (`npm publish`, 2FA).
+pack smoke test.
+
+## Releasing
+Publishing is tag-only, from GitHub Actions (`.github/workflows/publish.yml`):
+
+```sh
+npm version <x.y.z> -m "release %s" && git push origin main --follow-tags
+```
+
+A pushed `v*` tag that matches `package.json` (and isn't on npm yet) runs `npm publish --provenance` with npm trusted
+publishing (environment `npm`; an `NPM_TOKEN` secret works until trusted publishing is set up). `prepublishOnly` runs
+first, with the real Quick Tunnel test skipped (`TT_SKIP_TUNNEL=1`). A prerelease version (`x.y.z-next.0`) goes to the
+`next` dist-tag, anything else to `latest`, and the workflow creates a GitHub release with generated notes. There is
+no other CI.
 
 ## License
 MIT
