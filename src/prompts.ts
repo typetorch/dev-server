@@ -40,7 +40,7 @@ import type { ToolboxTile } from "./toolbox-tools.ts";
  * passed). A "proposed" or "building" prompt is not finished: the chat keeps showing it, and its conversation is busy.
  */
 export type PromptState = "queued" | "running" | "committed" | "proposed" | "building" | "deployed" | "applied" | "discarded" | "answered" | "failed" | "cancelled";
-export const FINISHED_STATES: readonly PromptState[] = ["deployed", "discarded", "answered", "failed", "cancelled"];
+export const FINISHED_STATES: readonly PromptState[] = ["deployed", "applied", "discarded", "answered", "failed", "cancelled"];
 /** live: read-only file tools plus every game tool (run_luau); code: file edits and `bun run build`, read-only game tools. */
 export type PromptMode = "live" | "code";
 export const PROMPT_MODES: readonly PromptMode[] = ["live", "code"];
