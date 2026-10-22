@@ -308,7 +308,8 @@ describe("events", () => {
 	});
 
 	test("redaction helpers", () => {
-		expect(safePrefixLength("hello wor")).toBe(9);
+		// Ends in a space: any other last letter can start the OS username (CI runs as "runner"), which is held back.
+		expect(safePrefixLength("hello wor ")).toBe(10);
 		expect(safePrefixLength("token eyJabc")).toBe(6);
 		expect(safePrefixLength("see https://ab")).toBe(4);
 		expect(redactEvent("a\r\nb\u0007c https://x-y.trycloudflare.com/v1/token")).toBe("a\nbc <tunnel-url>");
