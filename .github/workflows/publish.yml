@@ -1,0 +1,66 @@
+# Publishes @typetorch/dev-server to npm when a version tag is pushed:
+#   npm version <x.y.z> -m "release %s" && git push origin main --follow-tags
+# The tag must match package.json. `npm publish` runs prepublishOnly (build, bun test, the pack smoke test) first; the
+# real Cloudflare Quick Tunnel test is skipped (TT_SKIP_TUNNEL).
+# Auth: npm trusted publishing (on npmjs.com, @typetorch/dev-server > Settings > Trusted publishing: this repo, workflow
+# publish.yml, environment npm), or an NPM_TOKEN secret (an automation token) on this repo until that is set up.
+# Same flow as typetorch/cli. A prerelease version (x.y.z-next.0) goes to the "next" dist-tag; anything else to
+# "latest".
+name: Publish
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write # the GitHub release
+  id-token: write # npm provenance and trusted publishing
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: npm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - name: Dependencies
+        run: bun install --frozen-lockfile
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - name: npm 11.5+ (trusted publishing)
+        run: npm install -g npm@^11.5.1
+      - name: The tag, package.json and npm agree
+        id: version
+        run: |
+          set -euo pipefail
+          version=$(node -p "require('./package.json').version")
+          name=$(node -p "require('./package.json').name")
+          if [ "${GITHUB_REF_NAME}" != "v${version}" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} but package.json is ${version}"
+            exit 1
+          fi
+          if npm view "${name}@${version}" version >/dev/null 2>&1; then
+            echo "::error::${name}@${version} is already on npm"
+            exit 1
+          fi
+          tag=latest
+          case "$version" in *-*) tag=next ;; esac
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+      - name: Publish
+        run: npm publish --provenance --access public --tag "${{ steps.version.outputs.tag }}"
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          TT_SKIP_TUNNEL: "1"
+      - name: GitHub release
+        run: gh release create "${GITHUB_REF_NAME}" --title "${GITHUB_REF_NAME}" --generate-notes ${{ steps.version.outputs.tag == 'next' && '--prerelease' || '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
