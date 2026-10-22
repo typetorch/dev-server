@@ -19,6 +19,8 @@ export interface GameConfig {
 	defaultBranch: string;
 	branches: Record<string, string>;
 	channels: Record<string, Channel>;
+	/** Roblox user ids with the "owner" role in `members` (sorted). */
+	owners: number[];
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -64,6 +66,13 @@ export function loadGameConfig(start: string): GameConfig {
 			else throw new Error(`${path}: "channels.${branch}" must be "prod" or "dev"`);
 		}
 	}
+	const owners = isRecord(raw.members)
+		? Object.entries(raw.members)
+				.filter(([, role]) => role === "owner")
+				.map(([id]) => positiveInt(id))
+				.filter((id): id is number => id !== undefined)
+				.sort((a, b) => a - b)
+		: [];
 	return {
 		path,
 		root: dirname(path),
@@ -72,6 +81,7 @@ export function loadGameConfig(start: string): GameConfig {
 		defaultBranch,
 		branches,
 		channels,
+		owners,
 	};
 }
 

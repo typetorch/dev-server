@@ -34,6 +34,17 @@ describe("remembered --users", () => {
 		Bun.spawnSync(["git", "init", "-q"], { cwd: repo });
 		const result = Bun.spawnSync(["bun", ENTRY, "remote-claude"], { cwd: repo, stdout: "pipe", stderr: "pipe" });
 		expect(result.exitCode).toBe(1);
-		expect(result.stderr.toString()).toContain("--users is required the first time in this repo");
+		expect(result.stderr.toString()).toContain('--users is required: typetorch.json has no "owner"');
+	});
+
+	test("without --users and nothing remembered: the owners in typetorch.json, not saved", () => {
+		const repo = join(root, "d");
+		mkdirSync(repo, { recursive: true });
+		Bun.spawnSync(["git", "init", "-q"], { cwd: repo });
+		writeFileSync(join(repo, "typetorch.json"), JSON.stringify({ project: "x", members: { "56": "owner", "7": "dev", "12": "owner" } }));
+		// --port -1 makes the start fail right after the users are chosen, before any Claude or tunnel work
+		const result = Bun.spawnSync(["bun", ENTRY, "remote-claude", "--port", "-1"], { cwd: repo, stdout: "pipe", stderr: "pipe" });
+		expect(result.stdout.toString()).toContain("users 12,56 (the owners in typetorch.json");
+		expect(readRememberedUsers(repo)).toBeUndefined();
 	});
 });

@@ -8,6 +8,7 @@ import { consoleLogger } from "./log.ts";
 import { isMainModule } from "./runtime.ts";
 import { resolve } from "node:path";
 import { ensureIgnored, repoRoot } from "./git.ts";
+import { loadGameConfig } from "./config.ts";
 import { readRememberedUsers, rememberUsers } from "./remembered-users.ts";
 import { startRemoteClaude } from "./session.ts";
 
@@ -27,8 +28,8 @@ remote-claude only runs on your Claude subscription (claude auth login with your
 ANTHROPIC_* variables, Bedrock, Vertex and Foundry are refused.
 
 Options:
-  --users <ids>          Roblox user ids allowed to prompt (no default, no wildcard). Required the first time in a
-                         repo; remembered in .typetorch/remote-claude.json and reused when omitted
+  --users <ids>          Roblox user ids allowed to prompt (no wildcard). Remembered in .typetorch/remote-claude.json
+                         and reused when omitted; with nothing remembered, the owners in typetorch.json "members"
   --repo <dir>           the game repo (default: current directory)
   --branch <name>        git branch (default: the current branch); must map to a dev-channel branch
   --port <n>             local port (default: a random free port; always bound to 127.0.0.1)
@@ -89,6 +90,15 @@ export function parseUsers(text: string): number[] {
 	});
 }
 
+/** The owners in the game's typetorch.json, or none when there is no readable typetorch.json. */
+function ownersOf(start: string): number[] {
+	try {
+		return loadGameConfig(start).owners;
+	} catch {
+		return [];
+	}
+}
+
 function positive(flags: Map<string, string | true>, name: string): number | undefined {
 	const value = flags.get(name);
 	if (value === undefined) return undefined;
@@ -109,7 +119,8 @@ async function main(argv: string[]): Promise<number> {
 	if (command && command !== "remote-claude") throw new Error(`unknown command "${command}"`);
 
 
-	// --users once per game repo: the list is remembered in <repo>/.typetorch/remote-claude.json and reused next time.
+	// --users once per game repo: the list is remembered in <repo>/.typetorch/remote-claude.json and reused next time;
+	// before that, the game's owners.
 	const repo = await repoRoot(resolve((flags.get("repo") as string | undefined) ?? process.cwd()));
 	const usersFlag = flags.get("users");
 	let users: number[];
@@ -119,9 +130,18 @@ async function main(argv: string[]): Promise<number> {
 		await ensureIgnored(repo, ".typetorch/remote-claude.json");
 	} else {
 		const remembered = readRememberedUsers(repo);
-		if (!remembered) throw new Error("--users is required the first time in this repo, e.g. --users 1,2,56 (no default, no wildcard; it's remembered after that)");
-		users = remembered;
-		console.log(`users ${users.join(",")} (remembered; pass --users to change)`);
+		if (remembered) {
+			users = remembered;
+			console.log(`users ${users.join(",")} (remembered; pass --users to change)`);
+		} else {
+			// Nothing passed or remembered: the game's owners (typetorch.json "members"), read fresh each start.
+			const owners = ownersOf(resolve((flags.get("repo") as string | undefined) ?? process.cwd()));
+			if (owners.length === 0) {
+				throw new Error('--users is required: typetorch.json has no "owner" in "members" to default to, e.g. --users 1,2,56 (no wildcard; it\'s remembered after that)');
+			}
+			users = owners;
+			console.log(`users ${users.join(",")} (the owners in typetorch.json; pass --users to change)`);
+		}
 	}
 	const port = positive(flags, "port");
 	const session = await startRemoteClaude({
