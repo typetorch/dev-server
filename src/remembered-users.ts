@@ -1,7 +1,7 @@
 /**
  * The last `--users` list, remembered per game repo in `<repo>/.typetorch/remote-claude.json` (git-ignored), so
- * `typetorch dev` without `--users` reuses it. Only a list the dev typed is ever saved; there is still no default and no
- * wildcard. Claude can't edit `.typetorch/` (runner.ts protected paths), so it can't widen the list.
+ * `typetorch dev` without `--users` reuses it. Only a list the dev typed is ever saved, and there is no wildcard; with
+ * nothing saved, the owners in typetorch.json are the default (index.ts). Claude can't edit `.typetorch/` (runner.ts protected paths), so it can't widen the list.
  */
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";

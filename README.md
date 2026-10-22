@@ -111,7 +111,8 @@ printed (and copied and saved) right away; pairing a second server or a second u
 codes expire after **3 hours** (`--code-ttl <minutes>`) and are replaced too. A tunnel restart (new URL) also prints a
 new code, and every game server must pair again (see "Tunnel binding" below).
 
-- `--users` (required): Roblox user ids allowed to prompt. No default, no wildcard.
+- `--users`: Roblox user ids allowed to prompt. No wildcard. Omitted, the last list passed in this repo is used, else
+  the owners in `typetorch.json` (`members` with the role `"owner"`).
 - `--branch`: the git branch (default: the repo's current branch), mapped to a TypeTorch branch by `typetorch.json`
   (`branches`). It must be on the **dev** channel (`channels`; `defaultBranch` is prod). Prod branches are refused,
   with no override.
@@ -450,8 +451,9 @@ deletes them.
 `--users` is saved in `<game repo>/.typetorch/remote-claude.json` (git-ignored through `.git/info/exclude`). In the
 container that is `/work/game/.typetorch/remote-claude.json`, on the game volume (or in your bind-mounted game folder),
 so it survives restarts, rebuilds and redeploys. A `TT_USERS` value replaces the saved list. With no `TT_USERS` and no
-saved list, the dev-server exits with an error asking for `--users`; with `restart: unless-stopped` Compose keeps
-retrying, so run `docker compose stop` and set `TT_USERS`.
+saved list, the owners in `typetorch.json` may prompt (not saved, so a change to `members` applies on the next start);
+with no owner there either, the dev-server exits with an error asking for `--users`, and with `restart: unless-stopped`
+Compose keeps retrying, so run `docker compose stop` and set `TT_USERS`.
 
 ### Coolify
 Create a Dockerfile application from this repository (not the Docker Compose option: `compose.yaml` is for local runs).
