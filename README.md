@@ -354,6 +354,11 @@ Every run gets an MCP server named `typetorch-game` (`--mcp-config`, a per-run b
 that came through the tunnel are refused). Its tools act only on the game server that sent the prompt (the JWT's
 `job`) and only for the user who sent it. In code mode `run_luau` is neither listed nor served.
 
+A prompt from Studio (job `""`: the TypeTorch plugin through `typetorch serve`) gets the Studio set in either mode:
+`run_luau`, `game_logs`, `inspect`, `find` and `game_status`, answered by the plugin on the place open in that dev's
+Studio (no screenshot). The plugin shows each `run_luau` snippet with Run / Deny and records it as one undo step; the
+system prompt keeps code changes in files (Rojo syncs them) and uses `run_luau` for the place's own instances.
+
 | Tool | What it does |
 |---|---|
 | `run_luau {code, description?, timeoutSeconds?}` | Live mode only. Luau on the server (`player` = the requester). `game:GetService` refuses MessagingService, DataStoreService, MemoryStoreService and HttpService, and the TypeTorch kernel isn't in scope (defense in depth, not a sandbox). The dev approves each snippet in the chat (or "Always in this chat"); every run leaves a durable audit record in the game (who, when, description, SHA-256 of the code, outcome; never the code), and the terminal logs the same SHA-256 prefix; needs `ServerScriptService.LoadStringEnabled` |
