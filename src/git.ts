@@ -9,7 +9,7 @@
  *     merged) to the branch head before every run; the dev merges it back with `git merge remote-claude/<branch>`.
  * Every commit made here runs with hooks disabled, because hook scripts are files Claude could have edited.
  */
-import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { childEnv } from "./env.ts";
@@ -195,6 +195,27 @@ export async function commitStaged(wt: Worktree, subject: string, trailer: strin
 	});
 	if (result.code !== 0) throw new GitError(`git commit failed: ${result.stderr.trim() || result.stdout.trim()}`);
 	return git(wt.path, ["rev-parse", "HEAD"]);
+}
+
+/**
+ * Applies base..commit to the main checkout (`wt.repo`) as uncommitted changes, so a Rojo serving it syncs them and the
+ * dev reviews and commits them there. All or nothing: a change that doesn't apply (the dev edited the same lines)
+ * leaves the checkout as it was.
+ */
+export async function applyToCheckout(wt: Worktree, base: string, commit: string): Promise<{ ok: boolean; error?: string }> {
+	const diff = await run(["git", "-c", "core.quotepath=off", "diff", "--binary", base, commit], { cwd: wt.path, env: childEnv() });
+	if (diff.code !== 0) return { ok: false, error: `git diff failed: ${diff.stderr.trim()}` };
+	if (!diff.stdout.trim()) return { ok: true };
+	const dir = mkdtempSync(join(tmpdir(), "remote-claude-apply-"));
+	try {
+		const patch = join(dir, "change.patch");
+		writeFileSync(patch, diff.stdout);
+		const applied = await run(["git", "apply", "--whitespace=nowarn", patch], { cwd: wt.repo, env: childEnv() });
+		if (applied.code !== 0) return { ok: false, error: `it doesn't apply to your checkout (changed there too?): ${(applied.stderr.trim().split(/\r?\n/)[0] ?? "").slice(0, 160)}` };
+		return { ok: true };
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
 }
 
 /** Makes sure `relPath` is git-ignored in `repo`, adding it to the local `.git/info/exclude` (never a tracked file). */

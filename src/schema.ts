@@ -304,7 +304,7 @@ export const SINCE_PATTERN = /^\d{1,7}$/;
 export const CHUNK_PATTERN = /^\d{1,4}$/;
 
 /** `{decision: "deploy" | "discard"}` for POST /v1/prompts/:id/deploy, nothing else. */
-export function parseDeployDecision(raw: unknown): "deploy" | "discard" | undefined {
+export function parseDeployDecision(raw: unknown): "apply" | "deploy" | "discard" | undefined {
 	if (!isPlainObject(raw) || !onlyKeys(raw, ["decision"])) return undefined;
-	return raw.decision === "deploy" || raw.decision === "discard" ? raw.decision : undefined;
+	return raw.decision === "apply" || raw.decision === "deploy" || raw.decision === "discard" ? raw.decision : undefined;
 }

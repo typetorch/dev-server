@@ -39,7 +39,7 @@ import type { ToolboxTile } from "./toolbox-tools.ts";
  * proposal waits for the requesting dev) → building → deployed | failed, or → discarded (the dev said no, or 15 minutes
  * passed). A "proposed" or "building" prompt is not finished: the chat keeps showing it, and its conversation is busy.
  */
-export type PromptState = "queued" | "running" | "committed" | "proposed" | "building" | "deployed" | "discarded" | "answered" | "failed" | "cancelled";
+export type PromptState = "queued" | "running" | "committed" | "proposed" | "building" | "deployed" | "applied" | "discarded" | "answered" | "failed" | "cancelled";
 export const FINISHED_STATES: readonly PromptState[] = ["deployed", "discarded", "answered", "failed", "cancelled"];
 /** live: read-only file tools plus every game tool (run_luau); code: file edits and `bun run build`, read-only game tools. */
 export type PromptMode = "live" | "code";
@@ -79,6 +79,8 @@ export interface PromptEvent {
 	commit?: string;
 	files?: FileChange[];
 	expiresAt?: number;
+	/** deploy_proposal: what the dev may do with it ("apply" only in a local session; "deploy" when deploys are on). */
+	actions?: ProposalDecision[];
 	/** image: an image Claude showed, ready for the requesting dev's game server (GET /v1/images/:id). */
 	image?: ImageMeta;
 	/** toolbox_results: the Creator Store results Claude got, as cards for the chat (at most 10; toolbox-tools.ts). */
@@ -91,7 +93,7 @@ export interface PromptEvent {
  * (`approvalId`: its short id), then "deployed", "rejected", "approval_expired" (24 h) or "failed".
  */
 export interface Proposal {
-	status: "pending" | "deploying" | "awaiting_approval" | "deployed" | "discarded" | "expired" | "rejected" | "approval_expired" | "failed";
+	status: "pending" | "deploying" | "awaiting_approval" | "deployed" | "applied" | "discarded" | "expired" | "rejected" | "approval_expired" | "failed";
 	/** The CLI proposal id (8 hex) while it waits for approval on the dev's PC. */
 	approvalId?: string;
 	commit: string;
@@ -119,13 +121,23 @@ export interface DeployOutcome {
 	approval?: "rejected" | "expired";
 }
 
-/** The runner's half of a proposal: deploy or discard the commit (both refuse when the worktree moved since). */
+export type ProposalDecision = "apply" | "deploy" | "discard";
+
+/**
+ * The runner's half of a proposal: deploy, apply or discard the commit (each refuses when the worktree moved since).
+ * `deploy` is absent when deploys are off; `apply` (the change into the main checkout, for Rojo) only in a local session.
+ */
 export interface ProposalActions {
 	/** The worktree commit before the run (a discard resets to it). */
 	base: string;
 	files: FileChange[];
-	deploy(ctx: DeployContext): Promise<DeployOutcome>;
+	deploy?(ctx: DeployContext): Promise<DeployOutcome>;
+	apply?(): Promise<{ ok: boolean; error?: string }>;
 	discard(): Promise<{ ok: boolean; error?: string }>;
+}
+
+export function proposalDecisions(actions: ProposalActions): ProposalDecision[] {
+	return [...(actions.apply ? (["apply"] as const) : []), ...(actions.deploy ? (["deploy"] as const) : []), "discard"];
 }
 
 export const PROPOSAL_FILES = 50;
@@ -198,6 +210,7 @@ export interface ProposalView {
 	commit: string;
 	expiresAt: number;
 	files: FileChange[];
+	actions: ProposalDecision[];
 	error?: string;
 }
 
@@ -427,15 +440,35 @@ export class PromptQueue {
 	 * The requesting dev's answer to a deploy proposal. "deploy" starts the deploy and returns at once (its progress
 	 * comes as events); "discard" resets the worktree to the commit before the run.
 	 */
-	async decide(id: string, userId: number, decision: "deploy" | "discard"): Promise<"ok" | "missing" | "not_yours" | "not_pending" | "failed"> {
+	async decide(id: string, userId: number, decision: ProposalDecision): Promise<"ok" | "missing" | "not_yours" | "not_pending" | "unavailable" | "failed"> {
 		const record = this.records.get(id);
 		const proposal = record?.proposal;
 		if (!record || !proposal) return "missing";
 		if (record.userId !== userId) return "not_yours";
 		if (proposal.status !== "pending" || record.state !== "proposed") return "not_pending";
+		if (!proposalDecisions(proposal.actions).includes(decision)) return "unavailable";
 		if (decision === "discard") return (await this.discardProposal(record, "discarded", `roblox:${userId}`)) ? "ok" : "failed";
+		if (decision === "apply") return (await this.applyProposal(record, proposal)) ? "ok" : "failed";
 		this.startDeploy(record, proposal);
 		return "ok";
+	}
+
+	/** Applies a pending proposal to the main checkout (uncommitted, for Rojo to sync); the dev commits it there. */
+	private async applyProposal(record: PromptRecord, proposal: Proposal): Promise<boolean> {
+		if (proposal.timer) clearTimeout(proposal.timer);
+		const result = await proposal.actions.apply!().catch((error: Error) => ({ ok: false, error: error.message }));
+		if (!result.ok) {
+			// Nothing changed in the checkout: the proposal still waits (another try, Deploy or Discard).
+			proposal.timer = setTimeout(() => void this.discardProposal(record, "expired", "expiry"), Math.max(1000, proposal.expiresAt * 1000 - Date.now()));
+			(proposal.timer as { unref?: () => void }).unref?.();
+			proposal.error = result.error;
+			this.pushEvent(record, { kind: "error", text: redactEvent(oneLine(`apply failed: ${result.error ?? "?"}`, 200)) });
+			return false;
+		}
+		proposal.status = "applied";
+		this.options.logger.info(`prompt ${record.id.slice(0, 8)} applied to the checkout by roblox:${record.userId}: ${proposal.commit.slice(0, 8)}`);
+		this.settle(record, { state: "applied" });
+		return true;
 	}
 
 	private startDeploy(record: PromptRecord, proposal: Proposal): void {
@@ -454,7 +487,7 @@ export class PromptQueue {
 			this.options.logger.info(`prompt ${record.id.slice(0, 8)} waits for approval: typetorch approve ${id}`);
 		};
 		void proposal.actions
-			.deploy({ log: (line) => this.pushLog(record, line), signal: abort.signal, awaitingApproval })
+			.deploy!({ log: (line) => this.pushLog(record, line), signal: abort.signal, awaitingApproval })
 			.catch((error: Error): DeployOutcome => ({ ok: false, error: error.message }))
 			.then((outcome) => {
 				proposal.status = outcome.ok ? "deployed" : outcome.approval === "rejected" ? "rejected" : outcome.approval === "expired" ? "approval_expired" : "failed";
@@ -549,7 +582,7 @@ export class PromptQueue {
 		if (record.conversation) view.conversationId = record.conversation.id;
 		const proposal = record.proposal;
 		if (proposal) {
-			view.proposal = { status: proposal.status, commit: proposal.commit, expiresAt: proposal.expiresAt, files: proposal.files };
+			view.proposal = { status: proposal.status, commit: proposal.commit, expiresAt: proposal.expiresAt, files: proposal.files, actions: proposalDecisions(proposal.actions) };
 			if (proposal.approvalId !== undefined) view.proposal.approvalId = proposal.approvalId;
 			if (proposal.error !== undefined) view.proposal.error = redactEvent(oneLine(proposal.error, 200));
 		}
@@ -620,6 +653,7 @@ export class PromptQueue {
 			clean.files = event.files.slice(0, PROPOSAL_FILES).map((file) => ({ path: redactEvent(oneLine(file.path, 160), 160), added: file.added, removed: file.removed }));
 		}
 		if (event.expiresAt !== undefined) clean.expiresAt = event.expiresAt;
+		if (event.actions !== undefined) clean.actions = [...event.actions];
 		if (event.image !== undefined) clean.image = { ...event.image };
 		// Already cleaned and capped by toolbox.ts (strangers' text); the game re-checks every field.
 		if (event.tiles !== undefined) clean.tiles = event.tiles.slice(0, 10).map((tile) => ({ ...tile }));
@@ -693,6 +727,7 @@ export class PromptQueue {
 			commit: proposal.commit,
 			files: proposal.files,
 			expiresAt: proposal.expiresAt,
+			actions: proposalDecisions(proposal.actions),
 		});
 		proposal.timer = setTimeout(() => void this.discardProposal(record, "expired", "expiry"), ttl);
 		(proposal.timer as { unref?: () => void }).unref?.();

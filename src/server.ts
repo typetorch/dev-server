@@ -4,7 +4,7 @@
  *   POST /v1/prompts                JWT → {id, state:"queued", conversationId}
  *   GET  /v1/prompts/:id[?since=n]  JWT → status (+ events i >= n)
  *   POST /v1/prompts/:id/cancel     JWT → {ok:true}   (a pending deploy proposal is discarded)
- *   POST /v1/prompts/:id/deploy     JWT → {ok:true}   {decision: "deploy" | "discard"}: the requester's answer to a proposal
+ *   POST /v1/prompts/:id/deploy     JWT → {ok:true}   {decision: "apply" | "deploy" | "discard"}: the requester's answer to a proposal
  *   POST /v1/attachments            JWT → {id, width, height}   (RGBA8 pixels → PNG in the session's temp folder)
  *   POST /v1/attachments/capture    JWT → {id, width, height}   (the screenshot Roblox wrote on this PC; 404 = none)
  *   POST /v1/attachments/asset      JWT → {id, width, height}   (a CaptureService upload, downloaded with Open Cloud)
@@ -901,6 +901,7 @@ async function startServer(options: RemoteClaudeServerOptions): Promise<RemoteCl
 			if (result === "not_yours") return decide(403, what, `${who} not the requester`), empty(403);
 			if (result === "missing") return decide(404, what, `${who} no proposal`), empty(404);
 			if (result === "not_pending") return decide(409, what, `${who} proposal already ${record.proposal?.status}`), empty(409);
+			if (result === "unavailable") return decide(409, what, `${who} ${decision} not offered`), empty(409);
 			if (result === "failed") return decide(500, what, `${who} ${decision} failed: ${record.proposal?.error ?? "?"}`), json({ ok: false, error: "failed" }, 500);
 			decide(200, what, `${who} ${decision}`);
 			return json({ ok: true, state: record.state });

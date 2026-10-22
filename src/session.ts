@@ -11,7 +11,7 @@ import { GAME_TOPIC } from "./game-tools.ts";
 import { sweepStaleTempFolders } from "./attachments.ts";
 import { captureDir, openCloudAssetDownloader } from "./images.ts";
 import { checkSubscriptionAuth } from "./billing.ts";
-import { branchChannel, branchFromGit, loadGameConfig } from "./config.ts";
+import { BRANCH_PATTERN, branchChannel, branchFromGit, loadGameConfig } from "./config.ts";
 import { API_KEY_VARS, DEPLOY_SECRET_VARS, Settings, childEnv } from "./env.ts";
 import { branchExists, currentBranch, ensureIgnored, ensureWorktree, repoRoot, type Worktree } from "./git.ts";
 import { addEventSecret, addSecret, consoleLogger, setEventPaths, type Logger } from "./log.ts";
@@ -38,6 +38,11 @@ export interface RemoteClaudeOptions {
 	maxPrompts?: number;
 	/** false = stop after the commit. */
 	deploy?: boolean;
+	/**
+	 * Where Deploy goes (`--deploy-branch`, a dev-channel TypeTorch branch; default the session's branch). A local
+	 * session on a prod-channel branch deploys only with one.
+	 */
+	deployBranch?: string;
 	/** Path to the TypeTorch CLI entry (or binary). */
 	cli?: string;
 	/** `--env-file`: the env file with the Open Cloud key (else TYPETORCH_ENV_FILE, as the CLI). */
@@ -109,7 +114,11 @@ export async function startRemoteClaude(options: RemoteClaudeOptions): Promise<R
 	if (channel !== "dev" && !localOnly) {
 		throw new Error(`branch "${branch}" (git "${gitBranch}") is on the ${channel} channel; remote-claude only runs on dev-channel branches here (a local session, --no-tunnel --no-announce as \`typetorch serve --claude\` runs it, may use it without deploys)`);
 	}
-	if (prodLocal) logger.info(`branch "${branch}" is on the ${channel} channel: local only, edits on remote-claude/${gitBranch}, no deploys`);
+	const deployBranch = options.deployBranch ?? (prodLocal ? undefined : branch);
+	if (deployBranch !== undefined && (!BRANCH_PATTERN.test(deployBranch) || branchChannel(config, deployBranch) !== "dev")) {
+		throw new Error(`--deploy-branch "${deployBranch}" must be a dev-channel TypeTorch branch`);
+	}
+	if (prodLocal) logger.info(`branch "${branch}" is on the ${channel} channel: local only, edits on remote-claude/${gitBranch}${deployBranch ? `, deploys go to ${deployBranch}` : ", no deploys"}`);
 
 	// 2. Settings (the API key is never printed).
 	// The CLI's sources (CLI 0.9): the environment, then the game repo's .env (--env-file / TYPETORCH_ENV_FILE replace it).
@@ -229,7 +238,7 @@ export async function startRemoteClaude(options: RemoteClaudeOptions): Promise<R
 
 	// 6. Runner + HTTP server.
 	const cli = resolveCli(options.cli);
-	const deploy = options.deploy !== false && !prodLocal;
+	const deploy = options.deploy !== false && deployBranch !== undefined;
 	if (deploy && !cli) logger.warn("TypeTorch CLI not found; prompts will stop at \"committed\" (pass --cli <path>)");
 	// toolbox_add writes toolbox.lock.toml (the server); the runner accepts exactly that write in a commit.
 	const toolboxLock = new ToolboxLock(worktree.path);
@@ -238,7 +247,10 @@ export async function startRemoteClaude(options: RemoteClaudeOptions): Promise<R
 		createClaudeRunner({
 			worktree,
 			ttBranch: branch,
+			deployBranch,
 			deploy,
+			// Studio through serve: Apply puts a change into the checkout Rojo serves.
+			apply: localOnly,
 			cli,
 			deployEnv: Object.keys(deployEnv).length > 0 ? deployEnv : undefined,
 			claudeCommand,
