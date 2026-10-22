@@ -298,7 +298,8 @@ export type RunTools = (record: PromptRecord) => { mcp: { url: string; token: st
 export class PromptQueue {
 	private readonly records = new Map<string, PromptRecord>();
 	private readonly waiting: PromptRecord[] = [];
-	private running: PromptRecord | undefined;
+	/** The running prompt of each lane (laneOf): lanes run side by side, one prompt at a time each. */
+	private readonly running = new Map<string, PromptRecord>();
 	private created = 0;
 	private stopped = false;
 
@@ -315,13 +316,22 @@ export class PromptQueue {
 			proposalTtlMs?: number;
 			/** Prepares an image Claude showed and publishes it (imageEvent); without it, images are not shown. */
 			onImage?: (record: PromptRecord, ref: ImageRef) => Promise<void>;
+			/**
+			 * Which lane (worktree) a user's prompts use. Lanes run at the same time, each one prompt at a time, and code
+			 * mode is busy per lane. Default: one lane for everyone.
+			 */
+			laneOf?: (userId: number) => string;
 		},
 	) {}
 
-	/** The code-mode prompt that holds the worktree: queued or running in code mode, or a proposal not yet settled. */
-	private codeHolder(): PromptRecord | undefined {
+	private lane(userId: number): string {
+		return this.options.laneOf?.(userId) ?? "";
+	}
+
+	/** The code-mode prompt that holds a lane's worktree: queued or running in code mode, or a proposal not yet settled. */
+	private codeHolder(lane: string): PromptRecord | undefined {
 		for (const record of this.records.values()) {
-			if (record.mode !== "code") continue;
+			if (record.mode !== "code" || this.lane(record.userId) !== lane) continue;
 			if (!record.done && !FINISHED_STATES.includes(record.state)) return record;
 			if (record.proposal && (record.proposal.status === "pending" || record.proposal.status === "deploying")) return record;
 		}
@@ -332,8 +342,9 @@ export class PromptQueue {
 		return this.created;
 	}
 
-	get active(): PromptRecord | undefined {
-		return this.running;
+	/** The running prompts (one per lane). */
+	get active(): PromptRecord[] {
+		return [...this.running.values()];
 	}
 
 	get queued(): readonly PromptRecord[] {
@@ -372,20 +383,20 @@ export class PromptQueue {
 	}
 
 	/**
-	 * Why a prompt can't be accepted right now, or undefined when it can. Code-mode prompts take turns on the worktree:
-	 * one at a time, and none while a deploy proposal waits for its decision ("code-busy").
+	 * Why a prompt can't be accepted right now, or undefined when it can. Code-mode prompts take turns on their lane's
+	 * worktree: one at a time, and none while a deploy proposal there waits for its decision ("code-busy").
 	 */
-	refusal(mode: PromptMode = "live"): "queue-full" | "max-prompts" | "stopped" | "code-busy" | undefined {
+	refusal(mode: PromptMode = "live", userId?: number): "queue-full" | "max-prompts" | "stopped" | "code-busy" | undefined {
 		if (this.stopped) return "stopped";
 		if (this.created >= this.options.maxPrompts) return "max-prompts";
 		if (this.waiting.length >= this.options.maxQueued) return "queue-full";
-		if (mode === "code" && this.codeHolder()) return "code-busy";
+		if (mode === "code" && this.codeHolder(this.lane(userId ?? 0))) return "code-busy";
 		return undefined;
 	}
 
-	/** A proposal is pending or deploying: runs keep the worktree at its commit. */
-	worktreeHeld(): boolean {
-		const holder = this.codeHolder();
+	/** A proposal is pending or deploying in this user's lane: runs there keep the worktree at its commit. */
+	worktreeHeld(userId: number): boolean {
+		const holder = this.codeHolder(this.lane(userId));
 		return holder?.proposal !== undefined;
 	}
 
@@ -406,7 +417,7 @@ export class PromptQueue {
 		extra: CreateOptions = {},
 	): PromptRecord | "queue-full" | "max-prompts" | "stopped" | "code-busy" {
 		const mode = extra.mode ?? "live";
-		const refused = this.refusal(mode);
+		const refused = this.refusal(mode, userId);
 		if (refused) return refused;
 		this.created += 1;
 		const record: PromptRecord = {
@@ -565,12 +576,10 @@ export class PromptQueue {
 	async stop(): Promise<void> {
 		this.stopped = true;
 		for (const record of [...this.waiting]) this.cancel(record.id, "shutdown");
-		const running = this.running;
-		if (running) {
-			this.cancel(running.id, "shutdown");
-			const deadline = Date.now() + 10_000;
-			while (this.running === running && Date.now() < deadline) await sleep(50);
-		}
+		const running = [...this.running.values()];
+		for (const record of running) this.cancel(record.id, "shutdown");
+		const deadline = Date.now() + 10_000;
+		while (running.some((record) => [...this.running.values()].includes(record)) && Date.now() < deadline) await sleep(50);
 		for (const record of this.records.values()) {
 			if (record.proposal?.status === "pending") await this.discardProposal(record, "discarded", "shutdown");
 			else if (record.proposal?.status === "deploying" || record.proposal?.status === "awaiting_approval") record.abort.abort();
@@ -733,11 +742,18 @@ export class PromptQueue {
 		(proposal.timer as { unref?: () => void }).unref?.();
 	}
 
-	private async pump(): Promise<void> {
-		if (this.running) return;
-		const record = this.waiting.shift();
-		if (!record) return;
-		this.running = record;
+	/** Starts the first waiting prompt of every free lane. */
+	private pump(): void {
+		for (const record of [...this.waiting]) {
+			const lane = this.lane(record.userId);
+			if (this.running.has(lane)) continue;
+			this.waiting.splice(this.waiting.indexOf(record), 1);
+			this.running.set(lane, record);
+			void this.runRecord(record, lane);
+		}
+	}
+
+	private async runRecord(record: PromptRecord, lane: string): Promise<void> {
 		record.state = "running";
 		record.startedAt = now();
 		this.pushEvent(record, { kind: "status", text: "running", state: "running" });
@@ -761,7 +777,7 @@ export class PromptQueue {
 			resume: record.conversation?.claudeSessionId,
 			mcp: tools?.mcp,
 			logFiles,
-			holdWorktree: this.worktreeHeld(),
+			holdWorktree: this.worktreeHeld(record.userId),
 			log: (line) => this.pushLog(record, line),
 			setState: (state, fields) => {
 				if (record.abort.signal.aborted) return;
@@ -808,8 +824,8 @@ export class PromptQueue {
 			tools?.dispose();
 			releaseAttachments(record.attachments);
 			if (logFiles) rmSync(logFiles.dir, { recursive: true, force: true });
-			this.running = undefined;
-			queueMicrotask(() => void this.pump());
+			this.running.delete(lane);
+			queueMicrotask(() => this.pump());
 		}
 	}
 }

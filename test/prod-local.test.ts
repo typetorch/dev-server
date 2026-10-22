@@ -30,6 +30,12 @@ test("a local session on a prod-channel branch works on remote-claude/<branch>",
 		expect(session.branch).toBe("prod");
 		expect(session.worktree.workBranch).toBe("remote-claude/main");
 		expect(lines.some((line) => line.includes("local only, edits on remote-claude/main, no deploys"))).toBe(true);
+		// Each allowed dev gets their own worktree, made at start.
+		for (let i = 0; i < 300 && !lines.some((line) => line.includes("roblox:1: worktree")); i++) await Bun.sleep(10);
+		const made = lines.find((line) => line.includes("roblox:1: worktree"));
+		expect(made).toContain("game-remote-claude-1");
+		expect(made).toContain("on remote-claude/main-1");
+		expect(git("branch", "--list", "remote-claude/main-1").stdout.toString()).toContain("remote-claude/main-1");
 	} finally {
 		await session.close();
 	}

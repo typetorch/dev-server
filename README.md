@@ -229,7 +229,8 @@ In Studio `game.JobId` is `""`: send `job: ""`. Roblox may drop an empty header,
     Claude runs `claude -p --resume <its session>` in the same worktree and keeps the context. It must be the caller's
     own conversation (`404` otherwise) with no prompt still running or waiting for a deploy decision (`409`). If Claude
     Code lost that session, the run starts fresh and says so in a `status` event.
-  - A code prompt while another code prompt is queued or running, or a proposal is undecided: `423`.
+  - A code prompt while another code prompt is queued or running, or a proposal is undecided: `423`. In a session with
+    a worktree per user (a local session) this is per dev: another dev's run or proposal never blocks yours.
   - `attachments`: ids from `POST /v1/attachments[/capture|/asset]`, made by the caller and not used by another
     prompt (`400` otherwise). When the run starts they move into its temp folder and Claude gets their paths
     (`Attached screenshot: <temp>/tt-rc-logs-*/screenshot-<id8>.png (WxH)`, readable through `--add-dir`); they are
@@ -354,6 +355,19 @@ Every run gets an MCP server named `typetorch-game` (`--mcp-config`, a per-run b
 that came through the tunnel are refused). Its tools act only on the game server that sent the prompt (the JWT's
 `job`) and only for the user who sent it. In code mode `run_luau` is neither listed nor served.
 
+A local session (Studio through `typetorch serve`) gives every allowed dev their own worktree
+(`<repo>-remote-claude-<user id>` on `remote-claude/<branch>-<user id>`, made at start), so several devs use Claude at
+the same time: each dev's prompts still run one at a time, but never wait for another dev's. Apply puts one change at a
+time into the checkout Rojo serves; a change to lines another dev already applied there is refused, and the checkout is
+left as it was. Each dev's worktree is brought up to the session branch before every run, so applied changes reach the
+others' runs once they are committed.
+
+A prompt from Studio (job `""`: the TypeTorch plugin through `typetorch serve`) gets the Studio set in either mode:
+`run_luau`, `game_logs`, `inspect`, `find` and `game_status`, answered by the plugin on the place open in that dev's
+Studio (no screenshot). The plugin runs each `run_luau` snippet at once (no approval card: the dev chose that) as one
+undo step, and the chat shows the code; the
+system prompt keeps code changes in files (Rojo syncs them) and uses `run_luau` for the place's own instances.
+
 | Tool | What it does |
 |---|---|
 | `run_luau {code, description?, timeoutSeconds?}` | Live mode only. Luau on the server (`player` = the requester). `game:GetService` refuses MessagingService, DataStoreService, MemoryStoreService and HttpService, and the TypeTorch kernel isn't in scope (defense in depth, not a sandbox). The dev approves each snippet in the chat (or "Always in this chat"); every run leaves a durable audit record in the game (who, when, description, SHA-256 of the code, outcome; never the code), and the terminal logs the same SHA-256 prefix; needs `ServerScriptService.LoadStringEnabled` |
@@ -370,7 +384,7 @@ Delivery: the game server's long-poll (`GET /v1/game/poll?since=<cursor>`, JWT, 
 prompt events and its tool requests; results go to `POST /v1/game/tool-result {id, ...}`. When no poll is open the dev
 server publishes `{"v":1,"s":<session>,"j":<JobId>,"x":<request id>,"u":<user id>}` on topic `TypeTorch/tool` (never
 the code), and the game server fetches the request:
-- `GET /v1/game/pending` (JWT) → `{"requests": [{"id", "tool"}]}`: this user's requests for this job;
+- `GET /v1/game/pending` (JWT) → `{"requests": [{"id", "tool", "promptId"}]}`: this user's requests for this job;
 - `GET /v1/game/requests/:id` (JWT) → `{"id", "tool", "args", "description", "timeoutSeconds", "conversationId", "promptId"}`;
   `404` unless the token's user AND job match the request, `410` once it expired or was answered;
 - `POST /v1/game/requests/:id/result` (JWT, nonce, timestamp) `{"ok", "output"?: string[], "returned"?, "error"?, "data"?, "ms"?, "denied"?}`
@@ -388,7 +402,7 @@ Claude gets the result capped at 64 KB inside `<untrusted-game-data>`; with no a
 | `404` | Unknown prompt, conversation (or someone else's), proposal, image (or someone else's) or route; no capture file for `POST /v1/attachments/capture` | Capture: use the asset fallback |
 | `409` | Nonce already used; cancel of a finished prompt; a deploy decision on a settled proposal; a follow-up while the conversation's last prompt runs or waits for a deploy decision | |
 | `413` / `431` | Body over 480 KB (3 MB for attachments, 2 MB for logs) / headers over 2 KB | |
-| `423` | A code prompt while another code run or an undecided proposal holds the worktree | Wait for it, or decide the proposal |
+| `423` | A code prompt while another code run or an undecided proposal holds the worktree (yours, in a session with a worktree per user) | Wait for it, or decide the proposal |
 | `429` | This user locked on this job (5 wrong codes), token rate limit, queue full (5), `--max-prompts` reached, 8 unsent or 40 attachments, a pickup running or 10 pickups/downloads this minute, 6 log uploads this minute | Back off |
 | `422` / `502` | A capture or asset that isn't a readable image / the asset download failed | |
 | `503` | Session shutting down; `POST /v1/attachments/asset` without an Open Cloud key; `POST /v1/logs` without a logs folder | |

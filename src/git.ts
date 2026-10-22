@@ -85,21 +85,24 @@ export interface Worktree {
 	workBranch: string;
 }
 
-export function worktreePathFor(repo: string): string {
-	return resolve(repo, "..", `${basename(repo)}-remote-claude`);
+export function worktreePathFor(repo: string, lane?: string): string {
+	return resolve(repo, "..", `${basename(repo)}-remote-claude${lane ? `-${lane}` : ""}`);
 }
 
 /** Creates the dedicated worktree, or reuses it. */
-/** `separate`: always work on remote-claude/<branch>, never on the branch itself (a prod-channel branch). */
-export async function ensureWorktree(repo: string, branch: string, options: { separate?: boolean } = {}): Promise<Worktree> {
-	const path = worktreePathFor(repo);
+/**
+ * `separate`: always work on remote-claude/<branch>, never on the branch itself (a prod-channel branch). `lane`: one
+ * dev's own worktree (<repo>-remote-claude-<lane>) on remote-claude/<branch>-<lane>, always separate.
+ */
+export async function ensureWorktree(repo: string, branch: string, options: { separate?: boolean; lane?: string } = {}): Promise<Worktree> {
+	const path = worktreePathFor(repo, options.lane);
 	let list = await worktrees(repo);
 	if (list.some((w) => samePath(w.path, path) && (w.prunable || !existsSync(path)))) {
 		await git(repo, ["worktree", "prune"]);
 		list = await worktrees(repo);
 	}
 	const inUse = list.some((w) => w.branch === `refs/heads/${branch}` && !samePath(w.path, path));
-	const workBranch = inUse || options.separate ? `remote-claude/${branch}` : branch;
+	const workBranch = options.lane ? `remote-claude/${branch}-${options.lane}` : inUse || options.separate ? `remote-claude/${branch}` : branch;
 	if (workBranch !== branch && !(await branchExists(repo, workBranch))) await git(repo, ["branch", workBranch, branch]);
 
 	const existing = list.find((w) => samePath(w.path, path));
@@ -202,7 +205,21 @@ export async function commitStaged(wt: Worktree, subject: string, trailer: strin
  * dev reviews and commits them there. All or nothing: a change that doesn't apply (the dev edited the same lines)
  * leaves the checkout as it was.
  */
-export async function applyToCheckout(wt: Worktree, base: string, commit: string): Promise<{ ok: boolean; error?: string }> {
+/** Applies to one checkout run one at a time (devs in their own lanes may Apply at the same moment). */
+const applying = new Map<string, Promise<unknown>>();
+
+export function applyToCheckout(wt: Worktree, base: string, commit: string): Promise<{ ok: boolean; error?: string }> {
+	const before = applying.get(wt.repo) ?? Promise.resolve();
+	const next = before.then(() => applyNow(wt, base, commit));
+	const settled = next.catch(() => undefined);
+	applying.set(wt.repo, settled);
+	void settled.then(() => {
+		if (applying.get(wt.repo) === settled) applying.delete(wt.repo);
+	});
+	return next;
+}
+
+async function applyNow(wt: Worktree, base: string, commit: string): Promise<{ ok: boolean; error?: string }> {
 	const diff = await run(["git", "-c", "core.quotepath=off", "diff", "--binary", base, commit], { cwd: wt.path, env: childEnv() });
 	if (diff.code !== 0) return { ok: false, error: `git diff failed: ${diff.stderr.trim()}` };
 	if (!diff.stdout.trim()) return { ok: true };

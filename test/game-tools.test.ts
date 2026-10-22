@@ -69,15 +69,15 @@ const postHeaders = (jwt: string, job = JOB) => ({
 });
 const get = (jwt: string, path: string, job = JOB) => fetch(`${srv.localUrl}${path}`, { headers: { authorization: `Bearer ${jwt}`, "x-tt-job": job } });
 
-async function prompt(jwt: string, calls: unknown[], mode?: "live" | "code"): Promise<string> {
-	const res = await fetch(`${srv.localUrl}/v1/prompts`, { method: "POST", headers: postHeaders(jwt), body: JSON.stringify({ prompt: JSON.stringify(calls), mode }) });
+async function prompt(jwt: string, calls: unknown[], mode?: "live" | "code", job = JOB): Promise<string> {
+	const res = await fetch(`${srv.localUrl}/v1/prompts`, { method: "POST", headers: postHeaders(jwt, job), body: JSON.stringify({ prompt: JSON.stringify(calls), mode }) });
 	expect(res.status).toBe(200);
 	return ((await res.json()) as { id: string }).id;
 }
 
-async function waitDone(jwt: string, id: string) {
+async function waitDone(jwt: string, id: string, job = JOB) {
 	for (let i = 0; i < 400; i++) {
-		const view = (await (await get(jwt, `/v1/prompts/${id}`)).json()) as { finishedAt?: number; state: string };
+		const view = (await (await get(jwt, `/v1/prompts/${id}`, job)).json()) as { finishedAt?: number; state: string };
 		if (view.finishedAt) return view;
 		await Bun.sleep(25);
 	}
@@ -86,14 +86,14 @@ async function waitDone(jwt: string, id: string) {
 
 /** The fake game server: polls pending, fetches each request, answers with `answer(request)`. */
 async function fakeGame(jwt: string, answer: (request: { id: string; tool: string; args: Record<string, unknown> }) => unknown, rounds = 200, job = JOB) {
-	const handled: { id: string; tool: string; args: Record<string, unknown>; description: string }[] = [];
+	const handled: { id: string; tool: string; args: Record<string, unknown>; description: string; listedPrompt?: string }[] = [];
 	for (let i = 0; i < rounds; i++) {
-		const pending = (await (await get(jwt, "/v1/game/pending", job)).json()) as { requests: { id: string; tool: string }[] };
-		for (const { id } of pending.requests) {
+		const pending = (await (await get(jwt, "/v1/game/pending", job)).json()) as { requests: { id: string; tool: string; promptId: string }[] };
+		for (const { id, promptId } of pending.requests) {
 			const res = await get(jwt, `/v1/game/requests/${id}`, job);
 			if (res.status !== 200) continue;
 			const request = (await res.json()) as { id: string; tool: string; args: Record<string, unknown>; description: string };
-			handled.push(request);
+			handled.push({ ...request, listedPrompt: promptId });
 			const result = await fetch(`${srv.localUrl}/v1/game/requests/${id}/result`, { method: "POST", headers: postHeaders(jwt, job), body: JSON.stringify(answer(request)) });
 			expect(result.status).toBe(200);
 		}
@@ -165,6 +165,22 @@ describe("game tools over MCP", () => {
 		expect(refused.content[0].text).toContain("only available in Live mode");
 		expect(handled.map((h) => h.tool)).toEqual(["game_status"]); // run_luau never reached the game server
 		expect(toolText(replies[3]).isError).toBe(false);
+	});
+
+	test("a prompt from Studio (job \"\"): run_luau in code mode too, no screenshot, Studio wording; only Studio answers", async () => {
+		const jwt = await pair(USERS[6], "");
+		const id = await prompt(jwt, [{ name: "run_luau", arguments: { code: "workspace.Baseplate.Color = Color3.new(1, 0, 0)" } }, { name: "screenshot" }], "code", "");
+		const handled = await fakeGame(jwt, () => ({ ok: true, output: [], ms: 2 }), 200, "");
+		await waitDone(jwt, id, "");
+		const replies = seen.get(id)!;
+		const tools = (replies[1] as { result: { tools: { name: string; description: string }[] } }).result.tools;
+		expect(tools.map((t) => t.name)).toEqual(["run_luau", "game_logs", "inspect", "find", "game_status"]);
+		expect(tools[0].description).toContain("Studio");
+		expect(tools[0].description).not.toContain("live dev game server");
+		expect(toolText(replies[2])).toMatchObject({ isError: false });
+		expect(toolText(replies[3]).content[0].text).toBe("screenshot is not available in Studio.");
+		expect(handled.map((h) => h.tool)).toEqual(["run_luau"]);
+		expect(handled[0].listedPrompt).toBe(id); // the plugin answers only its own prompts' requests
 	});
 
 	test("read tools: arguments validated and forwarded; game data can't close its untrusted block", async () => {
@@ -314,6 +330,10 @@ describe("helpers", () => {
 		expect(value(code, "--allowedTools").split(",").filter((rule) => rule.startsWith("Bash"))).toEqual(["Bash(bun run build)"]);
 		expect(value(code, "--allowedTools")).not.toContain("run_luau");
 		expect(value(code, "--allowedTools")).toContain("mcp__typetorch-game__inspect");
+		// A prompt from Studio: run_luau in code mode too, and no screenshot.
+		const studio = value(claudeArgs({}, "sys", { mode: "code", studio: true, mcpConfigFile: "C:/tmp/mcp.json" }), "--allowedTools");
+		expect(studio).toContain("mcp__typetorch-game__run_luau");
+		expect(studio).not.toContain("screenshot");
 		expect(toolTarget("mcp__typetorch-game__run_luau", { code: "print(1)", description: "Say one" }, "C:/w")).toBe("Say one");
 		expect(toolTarget("mcp__typetorch-game__inspect", { path: "Workspace.Map", realm: "client" }, "C:/w")).toBe("client Workspace.Map");
 		expect(summarizeToolResult("mcp__typetorch-game__run_luau", { content: [{ type: "text", text: "ok (4 ms)\n<untrusted-game-data>..." }] })).toBe("ok (4 ms)");
