@@ -138,6 +138,18 @@ describe("modes", () => {
 		for (const prompt of [live, code]) expect(prompt).toContain("ask one short question");
 	}, 30_000);
 
+	test("a prompt from Studio: the tools reach the open place, run_luau in code mode too, code changes stay in files", () => {
+		for (const mode of ["live", "code"] as const) {
+			const studio = systemPrompt("dev", "dev", "dev", mode, false, true);
+			expect(studio).toContain("the place open in their Studio");
+			expect(studio).toContain("never run_luau");
+			expect(studio).not.toContain("live Roblox dev");
+			expect(studio).not.toContain("nothing it does is saved");
+			expect(studio).not.toContain("needs Live mode");
+			expect(studio).not.toContain("no run_luau");
+		}
+	});
+
 	test("the only allowed shell command resolves on Claude's PATH", () => {
 		const env = childEnv({ forClaude: true });
 		const path = Object.entries(env).find(([key]) => key.toUpperCase() === "PATH")?.[1];
