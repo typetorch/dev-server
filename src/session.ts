@@ -29,7 +29,10 @@ export interface RemoteClaudeOptions {
 	users: number[];
 	/** The game repo (default: cwd). */
 	repo?: string;
-	/** Git branch (default: the repo's current branch). Must map to a dev-channel TypeTorch branch. */
+	/**
+	 * Git branch (default: the repo's current branch). Must map to a dev-channel TypeTorch branch, except in a local
+	 * session (tunnel and announce off): there a prod-channel branch works on remote-claude/<branch>, without deploys.
+	 */
 	branch?: string;
 	port?: number;
 	maxPrompts?: number;
@@ -99,9 +102,14 @@ export async function startRemoteClaude(options: RemoteClaudeOptions): Promise<R
 	if (!(await branchExists(repo, gitBranch))) throw new Error(`git branch "${gitBranch}" does not exist in ${repo}`);
 	const branch = branchFromGit(gitBranch, config.branches);
 	const channel = branchChannel(config, branch);
-	if (channel !== "dev") {
-		throw new Error(`branch "${branch}" (git "${gitBranch}") is on the ${channel} channel; remote-claude only runs on dev-channel branches (no override)`);
+	// A prod-channel branch only for a local session (no tunnel, no announcement: Studio through `typetorch serve
+	// --claude`): Claude then never commits to the branch itself (worktree on remote-claude/<branch>) and never deploys.
+	const localOnly = options.tunnel === false && options.announce === false;
+	const prodLocal = channel !== "dev" && localOnly;
+	if (channel !== "dev" && !localOnly) {
+		throw new Error(`branch "${branch}" (git "${gitBranch}") is on the ${channel} channel; remote-claude only runs on dev-channel branches here (a local session, --no-tunnel --no-announce as \`typetorch serve --claude\` runs it, may use it without deploys)`);
 	}
+	if (prodLocal) logger.info(`branch "${branch}" is on the ${channel} channel: local only, edits on remote-claude/${gitBranch}, no deploys`);
 
 	// 2. Settings (the API key is never printed).
 	// The CLI's sources (CLI 0.9): the environment, then the game repo's .env (--env-file / TYPETORCH_ENV_FILE replace it).
@@ -157,7 +165,7 @@ export async function startRemoteClaude(options: RemoteClaudeOptions): Promise<R
 	const cloudflared = options.tunnel === false ? undefined : await findCloudflared(logger, options.installCloudflared !== false);
 
 	// 4. Worktree.
-	const worktree = await ensureWorktree(repo, gitBranch);
+	const worktree = await ensureWorktree(repo, gitBranch, { separate: prodLocal });
 	logger.info(`worktree ${worktree.path} on ${worktree.workBranch}`);
 	// Text relayed to game servers names files relative to the worktree, and never the repo, home folder or username.
 	setEventPaths({ worktree: worktree.path, repo });
@@ -221,7 +229,7 @@ export async function startRemoteClaude(options: RemoteClaudeOptions): Promise<R
 
 	// 6. Runner + HTTP server.
 	const cli = resolveCli(options.cli);
-	const deploy = options.deploy !== false;
+	const deploy = options.deploy !== false && !prodLocal;
 	if (deploy && !cli) logger.warn("TypeTorch CLI not found; prompts will stop at \"committed\" (pass --cli <path>)");
 	// toolbox_add writes toolbox.lock.toml (the server); the runner accepts exactly that write in a commit.
 	const toolboxLock = new ToolboxLock(worktree.path);

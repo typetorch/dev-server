@@ -90,7 +90,8 @@ export function worktreePathFor(repo: string): string {
 }
 
 /** Creates the dedicated worktree, or reuses it. */
-export async function ensureWorktree(repo: string, branch: string): Promise<Worktree> {
+/** `separate`: always work on remote-claude/<branch>, never on the branch itself (a prod-channel branch). */
+export async function ensureWorktree(repo: string, branch: string, options: { separate?: boolean } = {}): Promise<Worktree> {
 	const path = worktreePathFor(repo);
 	let list = await worktrees(repo);
 	if (list.some((w) => samePath(w.path, path) && (w.prunable || !existsSync(path)))) {
@@ -98,7 +99,7 @@ export async function ensureWorktree(repo: string, branch: string): Promise<Work
 		list = await worktrees(repo);
 	}
 	const inUse = list.some((w) => w.branch === `refs/heads/${branch}` && !samePath(w.path, path));
-	const workBranch = inUse ? `remote-claude/${branch}` : branch;
+	const workBranch = inUse || options.separate ? `remote-claude/${branch}` : branch;
 	if (workBranch !== branch && !(await branchExists(repo, workBranch))) await git(repo, ["branch", workBranch, branch]);
 
 	const existing = list.find((w) => samePath(w.path, path));
