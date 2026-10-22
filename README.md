@@ -375,7 +375,7 @@ Delivery: the game server's long-poll (`GET /v1/game/poll?since=<cursor>`, JWT, 
 prompt events and its tool requests; results go to `POST /v1/game/tool-result {id, ...}`. When no poll is open the dev
 server publishes `{"v":1,"s":<session>,"j":<JobId>,"x":<request id>,"u":<user id>}` on topic `TypeTorch/tool` (never
 the code), and the game server fetches the request:
-- `GET /v1/game/pending` (JWT) → `{"requests": [{"id", "tool"}]}`: this user's requests for this job;
+- `GET /v1/game/pending` (JWT) → `{"requests": [{"id", "tool", "promptId"}]}`: this user's requests for this job;
 - `GET /v1/game/requests/:id` (JWT) → `{"id", "tool", "args", "description", "timeoutSeconds", "conversationId", "promptId"}`;
   `404` unless the token's user AND job match the request, `410` once it expired or was answered;
 - `POST /v1/game/requests/:id/result` (JWT, nonce, timestamp) `{"ok", "output"?: string[], "returned"?, "error"?, "data"?, "ms"?, "denied"?}`

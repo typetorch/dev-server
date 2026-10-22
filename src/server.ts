@@ -847,7 +847,8 @@ async function startServer(options: RemoteClaudeServerOptions): Promise<RemoteCl
 		}
 
 		if (route.kind === "gamePending") {
-			const pending = gameRequests.pendingFor(userId, claims.job).map((r) => ({ id: r.id, tool: r.tool }));
+			// promptId: a Studio plugin answers only the requests of prompts it sent (a playtest on the same PC is job "" too).
+			const pending = gameRequests.pendingFor(userId, claims.job).map((r) => ({ id: r.id, tool: r.tool, promptId: r.promptId }));
 			return json({ requests: pending });
 		}
 

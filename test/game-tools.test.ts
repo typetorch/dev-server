@@ -86,14 +86,14 @@ async function waitDone(jwt: string, id: string, job = JOB) {
 
 /** The fake game server: polls pending, fetches each request, answers with `answer(request)`. */
 async function fakeGame(jwt: string, answer: (request: { id: string; tool: string; args: Record<string, unknown> }) => unknown, rounds = 200, job = JOB) {
-	const handled: { id: string; tool: string; args: Record<string, unknown>; description: string }[] = [];
+	const handled: { id: string; tool: string; args: Record<string, unknown>; description: string; listedPrompt?: string }[] = [];
 	for (let i = 0; i < rounds; i++) {
-		const pending = (await (await get(jwt, "/v1/game/pending", job)).json()) as { requests: { id: string; tool: string }[] };
-		for (const { id } of pending.requests) {
+		const pending = (await (await get(jwt, "/v1/game/pending", job)).json()) as { requests: { id: string; tool: string; promptId: string }[] };
+		for (const { id, promptId } of pending.requests) {
 			const res = await get(jwt, `/v1/game/requests/${id}`, job);
 			if (res.status !== 200) continue;
 			const request = (await res.json()) as { id: string; tool: string; args: Record<string, unknown>; description: string };
-			handled.push(request);
+			handled.push({ ...request, listedPrompt: promptId });
 			const result = await fetch(`${srv.localUrl}/v1/game/requests/${id}/result`, { method: "POST", headers: postHeaders(jwt, job), body: JSON.stringify(answer(request)) });
 			expect(result.status).toBe(200);
 		}
@@ -180,6 +180,7 @@ describe("game tools over MCP", () => {
 		expect(toolText(replies[2])).toMatchObject({ isError: false });
 		expect(toolText(replies[3]).content[0].text).toBe("screenshot is not available in Studio.");
 		expect(handled.map((h) => h.tool)).toEqual(["run_luau"]);
+		expect(handled[0].listedPrompt).toBe(id); // the plugin answers only its own prompts' requests
 	});
 
 	test("read tools: arguments validated and forwarded; game data can't close its untrusted block", async () => {
