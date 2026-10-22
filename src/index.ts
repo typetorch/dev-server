@@ -32,6 +32,9 @@ Options:
                          and reused when omitted; with nothing remembered, the owners in typetorch.json "members"
   --repo <dir>           the game repo (default: current directory)
   --branch <name>        git branch (default: the current branch); must map to a dev-channel branch
+  --deploy-branch <b>    where Deploy goes (a dev-channel TypeTorch branch; default: the session's branch). With
+                         --no-tunnel --no-announce (Studio through typetorch serve) a change can also be applied
+                         to this checkout, uncommitted, for Rojo to sync
   --port <n>             local port (default: a random free port; always bound to 127.0.0.1)
   --max-prompts <n>      prompts accepted per session (default 50)
   --no-deploy            stop after the commit
@@ -58,7 +61,7 @@ interface Parsed {
 	flags: Map<string, string | true>;
 }
 
-const VALUE_FLAGS = new Set(["users", "repo", "branch", "port", "max-prompts", "cli", "env-file", "model", "max-budget-usd", "protect", "code-ttl"]);
+const VALUE_FLAGS = new Set(["users", "repo", "branch", "deploy-branch", "port", "max-prompts", "cli", "env-file", "model", "max-budget-usd", "protect", "code-ttl"]);
 
 function parseArgs(argv: string[]): Parsed {
 	const flags = new Map<string, string | true>();
@@ -148,6 +151,7 @@ async function main(argv: string[]): Promise<number> {
 		users,
 		repo: flags.get("repo") as string | undefined,
 		branch: flags.get("branch") as string | undefined,
+		deployBranch: flags.get("deploy-branch") as string | undefined,
 		port,
 		maxPrompts: positive(flags, "max-prompts"),
 		deploy: !flags.has("no-deploy"),

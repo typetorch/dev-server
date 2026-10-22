@@ -44,7 +44,7 @@ import { CLAUDE_SESSION_PATTERN } from "./conversations.ts";
 import { childEnv } from "./env.ts";
 import { GAME_MCP_SERVER, GAME_TOOL_PREFIX, GAME_TOOLS, READ_ONLY_GAME_TOOLS, fullToolName } from "./game-tools.ts";
 import { IMAGES_PER_PROMPT, markdownImages } from "./images.ts";
-import { changedFiles, commitStaged, diffStat, resetWorktree, resetWorktreeTo, syncWorktree, worktreeHead, type Worktree } from "./git.ts";
+import { applyToCheckout, changedFiles, commitStaged, diffStat, resetWorktree, resetWorktreeTo, syncWorktree, worktreeHead, type Worktree } from "./git.ts";
 import { oneLine } from "./log.ts";
 import type { DeployContext, DeployOutcome, LogFile, PromptMode, RunContext, RunOutcome, Runner } from "./prompts.ts";
 import { Glob } from "./glob.ts";
@@ -451,9 +451,13 @@ export function resolveCli(flag?: string): CliCommand | undefined {
 
 export interface ClaudeRunnerOptions {
 	worktree: Worktree;
-	/** The TypeTorch branch (deploy target). */
+	/** The session's TypeTorch branch. */
 	ttBranch: string;
+	/** Where Deploy goes (default ttBranch); a dev-channel branch. */
+	deployBranch?: string;
 	deploy: boolean;
+	/** A local session: a proposal may also be applied to the main checkout (uncommitted, for Rojo to sync). */
+	apply?: boolean;
 	cli?: CliCommand;
 	/** Extra env for the deploy only (the Open Cloud API key, under the variable name it was found as). */
 	deployEnv?: Record<string, string>;
@@ -698,7 +702,8 @@ export function createClaudeRunner(options: ClaudeRunnerOptions): Runner {
 	 */
 	const runDeploy = async (ctx: DeployContext, cli: CliCommand, summary?: string): Promise<DeployOutcome> => {
 		const { signal } = ctx;
-		ctx.log(`deploying: typetorch deploy --branch ${options.ttBranch}`);
+		const target = options.deployBranch ?? options.ttBranch;
+		ctx.log(`deploying: typetorch deploy --branch ${target}`);
 		// --json: stdout carries one JSON document (deployment.artifactId, or proposal.id); human lines go to stderr.
 		// --message: Claude's SUMMARY line, the first "what changed" line of the artifact (an argv element, no shell).
 		// --proposed-by: the dev approves every deploy on their PC (`typetorch approve`); the dev-server only prepares it
@@ -706,7 +711,7 @@ export function createClaudeRunner(options: ClaudeRunnerOptions): Runner {
 		const message = summary ? ["--message", oneLine(summary.replace(/[\u0000-\u001f\u007f]+/g, " "), 200)] : [];
 		const stateDir = options.stateDir ?? join(wt.repo, ".typetorch");
 		const env = childEnv({ extra: { ...options.deployEnv, TYPETORCH_STATE_DIR: stateDir } });
-		const deploy = spawnChild([...cli.cmd, "deploy", "--branch", options.ttBranch, "--json", "--proposed-by", "dev-server/claude", ...message], {
+		const deploy = spawnChild([...cli.cmd, "deploy", "--branch", target, "--json", "--proposed-by", "dev-server/claude", ...message], {
 			cwd: wt.path,
 			// The main repo's state dir, passed explicitly: one deployments.jsonl and one seq for every checkout.
 			env,
@@ -813,17 +818,14 @@ export function createClaudeRunner(options: ClaudeRunnerOptions): Runner {
 			ctx.log(`not deploying: protected files changed (${protectedFiles.slice(0, 3).join(", ")}); review and deploy by hand`);
 			return { state: "committed", commit, summary };
 		}
-		if (!options.deploy) {
-			ctx.log("--no-deploy: stopping after the commit");
-			return { state: "committed", commit, summary };
-		}
-		const cli = options.cli;
-		if (!cli) {
-			ctx.log("TypeTorch CLI not found (--cli); deploy by hand");
+		const cli = options.deploy ? options.cli : undefined;
+		if (options.deploy && !cli) ctx.log("TypeTorch CLI not found (--cli); deploy by hand");
+		if (!cli && !options.apply) {
+			if (!options.deploy) ctx.log("--no-deploy: stopping after the commit");
 			return { state: "committed", commit, summary };
 		}
 
-		// 4. Propose the deploy: the requesting dev deploys or discards it in the chat (prompts.ts runs the decision).
+		// 4. Propose it: the requesting dev deploys, applies (a local session) or discards it in the chat (prompts.ts).
 		const head = async () => (await worktreeHead(wt)).trim();
 		return {
 			state: "proposed",
@@ -832,10 +834,18 @@ export function createClaudeRunner(options: ClaudeRunnerOptions): Runner {
 			proposal: {
 				base,
 				files: await diffStat(wt, base, commit),
-				deploy: async (deployCtx) => {
-					if ((await head()) !== commit) return { ok: false, error: "the worktree moved since this proposal; deploy by hand" };
-					return runDeploy(deployCtx, cli, summary);
-				},
+				deploy: cli
+					? async (deployCtx) => {
+							if ((await head()) !== commit) return { ok: false, error: "the worktree moved since this proposal; deploy by hand" };
+							return runDeploy(deployCtx, cli, summary);
+						}
+					: undefined,
+				apply: options.apply
+					? async () => {
+							if ((await head()) !== commit) return { ok: false, error: "the worktree moved since this proposal" };
+							return applyToCheckout(wt, base, commit);
+						}
+					: undefined,
 				discard: async () => {
 					if ((await head()) !== commit) return { ok: false, error: "the worktree moved since this proposal; reset it by hand" };
 					await resetWorktreeTo(wt, base);

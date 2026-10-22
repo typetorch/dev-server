@@ -117,7 +117,9 @@ new code, and every game server must pair again (see "Tunnel binding" below).
   the owners in `typetorch.json` (`members` with the role `"owner"`).
 - `--branch`: the git branch (default: the repo's current branch), mapped to a TypeTorch branch by `typetorch.json`
   (`branches`). It must be on the **dev** channel (`channels`; `defaultBranch` is prod). Prod branches are refused,
-  with no override.
+  with no override, except in a local session with `--no-tunnel --no-announce` (how `typetorch serve --claude` runs
+  it for Studio): there Claude works on `remote-claude/<branch>`, never commits to the prod branch itself, and never
+  deploys.
 - `--no-deploy` stops code runs after the commit (no proposal). `--cli` points at the TypeTorch CLI used for `deploy`
   (default: a CLI next to this package: `../cli` from a checkout, which is also where npm puts `@typetorch/cli` beside
   this package (Bun runs `src/index.ts`, Node `dist/index.js`); then `typetorch` on PATH; without one, code runs stop
