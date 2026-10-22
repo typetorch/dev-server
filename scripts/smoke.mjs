@@ -168,8 +168,11 @@ if (process.argv.includes("--pack")) {
 			const bad = files.filter((p) => !allowed(p) || /(^|\/)(test|tests|fixtures?|test-fixture|\.typetorch|node_modules)(\/|$)|\.env|\.key$|CHANGELOG/i.test(p));
 			check("packed files: dist + README + LICENSE + package.json only", bad.length === 0, bad.join(", "));
 			const escape = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+			const user = userInfo().username;
+			// A generic account (CI's "runner", a container's "root") is an ordinary word in the sources, not a leak.
+			const genericUser = /^(root|runner|user|admin|ubuntu|node)$/i.test(user);
 			const hard = [
-				{ what: "this machine's user name", re: new RegExp(`(^|[^a-z0-9])${escape(userInfo().username)}([^a-z0-9]|$)`, "i") },
+				...(genericUser ? [] : [{ what: "this machine's user name", re: new RegExp(`(^|[^a-z0-9])${escape(user)}([^a-z0-9]|$)`, "i") }]),
 				{ what: "the home folder", re: new RegExp(escape(homedir()).replace(/\\\\/g, "[\\\\/]+"), "i") },
 				{ what: "a Windows user folder", re: /[A-Za-z]:[\\/]+Users[\\/]+(?!<|\{|\$|%|\*|\.\.\.)[\w.-]+/ },
 				{ what: "a macOS/Linux user folder", re: /(?<![\w.])\/(?:Users|home)\/(?!<|\{|\$|\*|\.\.\.)[a-z][\w.-]+/ },
