@@ -390,8 +390,8 @@ export type ToolboxGameCall = (run: ToolboxRun, args: Record<string, unknown>, d
 export interface ToolboxServiceOptions {
 	client: ToolboxClient;
 	memory?: ToolboxMemory;
-	/** The worktree's lock (code mode's toolbox_add). */
-	lock?: ToolboxLock;
+	/** The worktree's lock (code mode's toolbox_add), or each user's (a session with a worktree per user). */
+	lock?: ToolboxLock | ((userId: number) => ToolboxLock | undefined);
 	gameCall?: ToolboxGameCall;
 	logger: Logger;
 }
@@ -490,10 +490,11 @@ export class ToolboxService {
 	private add(run: ToolboxRun, conversation: string, call: Extract<ParsedToolboxCall, { tool: "toolbox_add" }>): ToolboxCallResult {
 		const asset = this.memory.get(conversation, call.id);
 		if (!asset) return fail(`Asset ${call.id} is not in this conversation's toolbox_search results. Search first; only ids from toolbox_search can be added.`);
-		if (!this.options.lock) return fail("toolbox_add is not available on this dev server.");
+		const lock = typeof this.options.lock === "function" ? this.options.lock(run.userId) : this.options.lock;
+		if (!lock) return fail("toolbox_add is not available on this dev server.");
 		const entry = lockEntryFor(asset, call.path, `roblox:${run.userId}`);
 		if (typeof entry === "string") return fail(entry);
-		const written = this.options.lock.add(entry);
+		const written = lock.add(entry);
 		if (typeof written === "string") return fail(written);
 		this.options.logger.info(`toolbox_add ${asset.id} -> ${entry.path} (${entry.kind} ${entry.assetId})${written.replaced ? " replaced" : ""} for roblox:${run.userId}`);
 		const reply: Record<string, unknown> = { ok: true, path: entry.path, kind: entry.kind, storeId: entry.storeId, assetId: entry.assetId, file: TOOLBOX_LOCK_FILE };
