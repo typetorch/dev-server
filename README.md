@@ -18,6 +18,9 @@ runs in one of two modes:
   `typetorch deploy` and the server hot-swaps to the result; **Discard** undoes the commit. Unanswered proposals are
   discarded after 15 minutes.
 
+The TypeTorch Studio plugin's Claude window talks to a local session that `typetorch serve --claude` runs (Code mode
+only; there a change can also be **applied** to the checkout Rojo syncs to Studio, 0.4.0). See "Studio plugin" below.
+
 The Claude tab is a chat: follow-ups continue the same Claude Code session (also across a mode switch), replies stream
 in, and you can attach screenshots (cropped and marked up if you like), your client's log history, another player's
 client log history and the server's log history. Claude can show you images from the worktree (`![caption](path)` in
@@ -93,9 +96,14 @@ its owner must be 13+ and ID-verified. Without them the chat shows one dim line 
 
 ## Usage
 ```sh
-typetorch-dev-server remote-claude --users 1,2,56 [--repo <dir>] [--branch <name>] [--port <n>]
+typetorch-dev-server remote-claude --users 1,2,56 [--repo <dir>] [--branch <name>] [--deploy-branch <b>] [--port <n>]
                                    [--max-prompts 50] [--no-deploy] [--cli <typetorch cli entry>] [--env-file <path>]
 ```
+
+`typetorch-dev-server --help` prints every option. 0.4.0 (the version on `main`, not on npm yet; npm has 0.3.3) adds
+`--deploy-branch`, Apply and the per-dev worktrees of a local session, and the Studio game tools; each is marked
+below.
+
 Once the tunnel is up it prints one line:
 ```
 pairing code: ABCD-EFGH-JKLM-NPQR-STUV-7QX2  (valid until 18:02, paste it into DEV > Claude in game)
@@ -118,8 +126,10 @@ new code, and every game server must pair again (see "Tunnel binding" below).
 - `--branch`: the git branch (default: the repo's current branch), mapped to a TypeTorch branch by `typetorch.json`
   (`branches`). It must be on the **dev** channel (`channels`; `defaultBranch` is prod). Prod branches are refused,
   with no override, except in a local session with `--no-tunnel --no-announce` (how `typetorch serve --claude` runs
-  it for Studio): there Claude works on `remote-claude/<branch>`, never commits to the prod branch itself, and never
-  deploys.
+  it for Studio; 0.4.0): there Claude works on `remote-claude/<branch>`, never commits to the prod branch itself, and
+  deploys only to `--deploy-branch` (no deploys without it).
+- `--deploy-branch <b>` (0.4.0): where Deploy goes, a dev-channel TypeTorch branch (default: the session's branch).
+  `typetorch serve --claude` passes its own dev branch (`dev`, or `serve --dev-branch`).
 - `--no-deploy` stops code runs after the commit (no proposal). `--cli` points at the TypeTorch CLI used for `deploy`
   (default: a CLI next to this package: `../cli` from a checkout, which is also where npm puts `@typetorch/cli` beside
   this package (Bun runs `src/index.ts`, Node `dist/index.js`); then `typetorch` on PATH; without one, code runs stop
@@ -129,24 +139,32 @@ new code, and every game server must pair again (see "Tunnel binding" below).
 - `--protect <globs>`: extra files Claude may not edit (for example files your build script runs); a change to one is
   committed but never proposed for deploy.
 - `--code-ttl <minutes>`: lifetime of each pairing code (default 180). Refresh tokens never outlive it (12 h at most).
-- Also: `--model <name>`, `--max-budget-usd <n>` (a per-run cap on Claude Code's own cost estimate; runs are always
-  billed to your subscription), `--no-announce` (local testing), `--no-clipboard`, `--no-install`.
+- Also: `--repo <dir>` (default: the current directory), `--port <n>` (default: a random free port, always on
+  127.0.0.1), `--max-prompts <n>` (default 50), `--model <name>`, `--max-budget-usd <n>` (a per-run cap on Claude
+  Code's own cost estimate; runs are always billed to your subscription), `--no-announce` (local testing),
+  `--no-clipboard`, `--no-install` (no `bun install` in a fresh worktree).
 - `--no-tunnel`: no Cloudflare tunnel, for a local client only. See "Studio plugin (typetorch serve --claude)" below.
 
 ### Studio plugin (`typetorch serve --claude`)
 The Studio plugin's Claude tab talks to remote-claude through the TypeTorch CLI's `serve`, never directly.
-`typetorch serve --claude` (CLI 0.12) starts this package as `remote-claude --no-tunnel --no-announce --no-clipboard`,
-adding `--users <ids>` when `--claude-users` is given (otherwise the remembered list, else the owners in
-`typetorch.json`, as above). A remote-claude you start yourself in the same repo works too.
+`typetorch serve --claude` starts this package as
+`remote-claude --no-tunnel --no-announce --no-clipboard --deploy-branch <serve's dev branch>` (CLI 0.12.2+; 0.11.0
+to 0.12.1 passed no `--deploy-branch`), adding `--users <ids>` when `--claude-users` is given (otherwise the remembered list, else the
+owners in `typetorch.json`, as above). A remote-claude you start yourself in the same repo works too. 0.3.3 and older
+don't know `--deploy-branch` and exit with `unexpected argument`, so a CLI 0.12.2+ serve needs 0.4.0; until 0.4.0 is on
+npm, set `TYPETORCH_DEV_SERVER` to a checkout's `src/index.ts`.
 
 - `serve` reads `<repo>/.typetorch/remote-claude.session.json` (`{v, sid, branch, port, url, pid}`; `url` is `null`
   without a tunnel; no secret; rewritten whenever a code goes out, deleted when the session ends) and the code file,
   redeems the code on the Studio user's behalf with `job: ""` (see "Studio" under the HTTP contract) and keeps the
   tokens, so the plugin never sees a code or a token.
-- The plugin's prompts go out in Code mode by default; a proposal shows **Deploy** / **Discard** in the tab, which
-  `serve` sends as `POST /v1/prompts/:id/deploy`. Besides prompts, cancel and deploy decisions, `serve` passes through
-  only `GET /v1/conversations[/:id]`, `POST /v1/attachments[/capture|/asset]`, `GET /v1/images/:id` and
-  `POST /v1/logs`, never `/v1/token` or `/v1/game/*`.
+- The plugin's prompts always go out in Code mode (its Live pill only says Live works in game). A proposal shows
+  **Apply** (0.4.0), **Deploy to dev** and **Discard** in the tab, which `serve` sends as
+  `POST /v1/prompts/:id/deploy` with `decision` `apply`, `deploy` or `discard`. Apply puts the change into the
+  checkout `serve`'s Rojo syncs to Studio, uncommitted; Deploy goes to `--deploy-branch`.
+- Besides prompts, cancel and these decisions, `serve` (CLI 0.18.1) passes through only
+  `GET /v1/conversations[/:id]`, `POST /v1/attachments[/capture|/asset]`, `GET /v1/images/:id` and `POST /v1/logs`,
+  never `/v1/token` or `/v1/game/*`. So the Studio game tools below don't reach the plugin yet (**planned**).
 - `typetorch serve --remote` (CLI 0.12) opens a tunnel of its own for a Studio on another machine; that tunnel and its
   pairing link belong to `serve`, not to this package, which still runs with `--no-tunnel` there.
 
@@ -196,10 +214,10 @@ The Quick Tunnel URL is public, so the server authenticates everything itself:
 | Replay | Every POST (create, cancel, deploy, attachments) needs a unique `X-TT-Nonce` and an `X-TT-Timestamp` within ±300 s |
 | Limits | Headers ≤ 2 KB (Cloudflare's own `cf-*`/`x-forwarded-*` excluded; ≤ 8 KB in all), prompt body ≤ 480 KB (room for three ~64 KB log attachments; token body ≤ 1 KB, attachment body ≤ 3 MB, capture and asset requests ≤ 160 KB with their marks), strict JSON schemas (unknown fields rejected), ≤ 6 tokens per user per minute (checked before a refresh token rotates, so a `429` never strands the game with a dead token), one Claude run at a time, a queue of 5, one code run or pending proposal at a time, `--max-prompts` |
 | Responses | `Cache-Control: no-store`; errors are bare status codes with no body. The terminal logs `sub`, the first 8 characters of `jti` and the decision, never a token, code or key |
-| Modes | **Live** runs get `--tools Read,Glob,Grep` and every game tool; **code** runs get `Read,Edit,Write,Glob,Grep` plus exactly `Bash(bun run build)`, and the read-only game tools. The MCP server enforces it too: in code mode it doesn't list `run_luau` and refuses it. A live run never commits; if files change anyway they are dropped |
+| Modes | **Live** runs get `--tools Read,Glob,Grep` and every game tool; **code** runs get `Read,Edit,Write,Glob,Grep` plus exactly `Bash(bun run build)`, and the read-only game tools. The MCP server enforces it too: in code mode it doesn't list `run_luau` and refuses it (a prompt from Studio gets the Studio set instead, see "Game tools"). A live run never commits; if files change anyway they are dropped |
 | Toolbox | The Creator Store tools exist only for a prompt sent with the "Toolbox" chip (`toolbox: true`, kept immutable on the record): without it all three are in `--disallowedTools`, MCP `tools/list` doesn't list them and every `tools/call` is refused; with it, live runs get `toolbox_search` + `toolbox_insert`, code runs `toolbox_search` + `toolbox_add`, and the other one stays denied. Search runs here, unauthenticated, free assets only, 1 request/s, 10-minute cache, back-off after 429; store text is cleaned (hidden/bidi characters, length caps) and reaches Claude only inside `<untrusted-toolbox-data>`. Insert and add take only ids from this conversation's searches; the game gets the dev server's snapshot, not Claude's text. The game re-checks (the prompt was sent with the chip there, the id came through its own relayed results, dev channel) and asks the dev on a per-insert card (Insert / Deny, no "always"). `toolbox.lock.toml` is protected; only the dev server's own write (byte for byte) is accepted in a deploy proposal. Limits per message: 10 searches, 3 inserts, 5 adds |
 | Claude | `claude -p --restricted` in a dedicated worktree; `WebFetch`/`WebSearch` denied; anything else denied without asking (Claude Code still auto-allows its read-only commands such as `git status` inside the worktree). File tools can't leave the worktree (plus the run's log folder, below). `bun` is put first on Claude's PATH so `bun run build` always resolves. Edits to build/tool configuration (package.json, lockfiles, tsconfig, `*.project.json`, `typetorch.json`, scripts, hooks, `.github`, `.claude`, `.typetorch`, `.env`, plus `--protect`) are denied, and if one changes anyway the commit is kept but **no deploy is offered** |
-| Deploy approval | A code run that changed files is committed by the dev server (`remote-claude: <summary>` + `Requested-By: roblox:<userId>`, hooks disabled) and proposed, never deployed on its own. Only the requesting dev can deploy or discard it; Discard (or 15 minutes without an answer, or the session ending) resets the worktree to the commit before the run (the dropped commit stays in the reflog). Deploy and Discard refuse when the worktree moved since the proposal. Nothing is ever pushed |
+| Deploy approval | A code run that changed files is committed by the dev server (`remote-claude: <summary>` + `Requested-By: roblox:<userId>`, hooks disabled) and proposed, never deployed on its own. Only the requesting dev can deploy, apply (a local session) or discard it; Discard (or 15 minutes without an answer, or the session ending) resets the worktree to the commit before the run (the dropped commit stays in the reflog). Deploy and Discard refuse when the worktree moved since the proposal. Nothing is ever pushed |
 | Untrusted context | The game's `context` (paths, error lines, artifact id; players can influence it) is JSON-escaped inside `<untrusted-game-context>` and the system prompt tells Claude it is data, never instructions |
 | Attached logs | "My logs", "Server logs" and "Player logs" (another player's client log history, fetched by the game from that player's client) may hold other players' names and chat. They are kept in memory only until the run starts, then written to `<temp>/tt-rc-logs-*/{client,server,player}-logs.txt` (outside the worktree, owner-only, with a header saying they are untrusted), given to Claude by path with `--add-dir`, and the folder is deleted when the run ends. They are never logged, relayed or kept with the prompt (the terminal says only "client + player logs attached"). A player name must be a Roblox username (letters, digits, `_`) |
 | Secrets in children | Env-file (`--env-file` / `TYPETORCH_ENV_FILE`) and `.env` values stay in a private map, and values Bun auto-loads from `.env` files are stripped: Claude, git and builds never inherit the API key or other local secrets (the deploy gets the API key only) |
@@ -271,22 +289,29 @@ In Studio `game.JobId` is `""`: send `job: ""`. Roblox may drop an empty header,
   | `assistant_text` | a chunk of Claude's reply (Markdown) | `block`: consecutive chunks with the same block form one text block |
   | `tool_use` | `Edit src/server/x.ts`, `Bash bun run build`, `Grep foo in src` | `tool`, `target` (path relative to the worktree, command or pattern), `ref` (the tool_use id), `detail` (game tools: the input) |
   | `tool_result` | one line: `120 lines`, `3 files`, `done`, `error: ...` (never file contents) | `tool`, `ref` (pairs it with its `tool_use`, even when Claude runs several tools at once), `detail` (game tools: the full result, capped) |
-  | `deploy_proposal` | the SUMMARY line | `commit`, `files` (≤ 50, `added`/`removed` line counts, -1 for binary), `expiresAt` |
+  | `deploy_proposal` | the SUMMARY line | `commit`, `files` (≤ 50, `added`/`removed` line counts, -1 for binary), `expiresAt`, `actions` (0.4.0: the decisions offered, `apply` only in a local session, `deploy` when deploys are on, always `discard`) |
   | `image` | the caption (or the file's path) | `image`: `{"id", "width", "height", "bytes", "chunks"}`, fetched with `GET /v1/images/:id?chunk=n`; it comes before the final status |
   | `toolbox_results` | `<query> (<type>): <count>` | `tiles` (≤ 10): `[{"id", "type", "name", "creator", "verified", "scripts"?, "upPercent"?, "voteCount"?, "triangles"?, "seconds"?}]`, the Creator Store results Claude got (strangers' text, cleaned; the game re-checks every field) |
   | `status` | the new state (`queued`, `running`, `committed abc1234`, `proposed`, `building`, `deployed`, `discarded`, `answered`, ...) or a note | `state` when it is a state change |
   | `error` | why the run failed (e.g. `api_billing_refused`, `claude timed out`, `deploy failed (exit 1)`) | |
 - `state`: `queued` → `running` → `answered` (no file changes: a question, an explanation, a live action; `summary` is
   the first line or the SUMMARY line) | `failed` | `cancelled`; code mode with changes: `running` → `committed` →
-  `proposed` → `building` → `deployed` (or `failed`), or `proposed` → `discarded`. A prompt is finished when
-  `finishedAt` is set; `proposed` and `building` are not finished. `committed` is final with `--no-deploy`, without a
-  CLI, or when protected files changed. Terminal states: `deployed | discarded | committed | answered | failed | cancelled`.
+  `proposed` → `building` → `deployed` (or `failed`), `proposed` → `applied` (0.4.0, a local session), or
+  `proposed` → `discarded`. A prompt is finished when `finishedAt` is set; `proposed` and `building` are not finished.
+  `committed` is final with `--no-deploy`, without a CLI (outside a local session), or when protected files changed.
+  Terminal states: `deployed | applied | discarded | committed | answered | failed | cancelled`.
 
 ### `POST /v1/prompts/:id/deploy`
-- Headers like every POST (JWT, `X-TT-Job`, nonce, timestamp, JSON); body `{"decision": "deploy" | "discard"}`.
-- Only the requester (`403` otherwise), only while the proposal is `pending` (`409` otherwise; `404` without one).
+- Headers like every POST (JWT, `X-TT-Job`, nonce, timestamp, JSON); body
+  `{"decision": "apply" | "deploy" | "discard"}` (`apply`: 0.4.0).
+- Only the requester (`403` otherwise), only while the proposal is `pending` (`409` otherwise, or when the proposal
+  doesn't offer that decision; `404` without one).
 - `deploy` → `200 {"ok": true, "state": "building"}` at once; progress arrives as events (`building`, then `deployed`
   with `artifactId`, or `failed`). `discard` → `200 {"ok": true, "state": "discarded"}` after the worktree reset.
+- `apply` (a local session only) → `200 {"ok": true, "state": "applied"}`: the commit's diff is applied to the main
+  checkout (the one Rojo serves) as uncommitted changes, one Apply per checkout at a time. When it doesn't apply (the
+  same lines changed there), the checkout is left as it was, the answer is `500 {"ok": false, "error": "failed"}`
+  with an `error` event, and the proposal keeps waiting (try again, Deploy or Discard).
 
 ### `POST /v1/prompts/:id/cancel`
 - `Authorization: Bearer <JWT>`, `X-TT-Job`, `X-TT-Nonce`, `X-TT-Timestamp` (like every POST); no body or Content-Type
@@ -369,24 +394,26 @@ In Studio `game.JobId` is `""`: send `job: ""`. Roblox may drop an empty header,
 ### Game tools (MCP, for Claude)
 Every run gets an MCP server named `typetorch-game` (`--mcp-config`, a per-run bearer token, loopback only: requests
 that came through the tunnel are refused). Its tools act only on the game server that sent the prompt (the JWT's
-`job`) and only for the user who sent it. In code mode `run_luau` is neither listed nor served.
+`job`) and only for the user who sent it. In code mode `run_luau` is neither listed nor served (except to a prompt
+from Studio, below).
 
-A local session (Studio through `typetorch serve`) gives every allowed dev their own worktree
+A local session (Studio through `typetorch serve`; 0.4.0) gives every allowed dev their own worktree
 (`<repo>-remote-claude-<user id>` on `remote-claude/<branch>-<user id>`, made at start), so several devs use Claude at
 the same time: each dev's prompts still run one at a time, but never wait for another dev's. Apply puts one change at a
 time into the checkout Rojo serves; a change to lines another dev already applied there is refused, and the checkout is
 left as it was. Each dev's worktree is brought up to the session branch before every run, so applied changes reach the
 others' runs once they are committed.
 
-A prompt from Studio (job `""`: the TypeTorch plugin through `typetorch serve`) gets the Studio set in either mode:
-`run_luau`, `game_logs`, `inspect`, `find` and `game_status`, answered by the plugin on the place open in that dev's
-Studio (no screenshot). The plugin runs each `run_luau` snippet at once (no approval card: the dev chose that) as one
-undo step, and the chat shows the code; the
-system prompt keeps code changes in files (Rojo syncs them) and uses `run_luau` for the place's own instances.
+A prompt from Studio (job `""`: the TypeTorch plugin through `typetorch serve`; 0.4.0) gets the Studio set in either
+mode, answered on the place open in that dev's Studio (no screenshot): `game_logs`, `inspect`, `find` and
+`game_status`, read-only, from plugin 0.7.1 (Edit only, and only for prompts sent from that Studio's chat).
+`STUDIO_GAME_TOOLS` still lists `run_luau`, but the plugin never runs code it receives (0.7.1 removed it): it answers
+`run_luau` with "not available in Studio", and Claude changes the place through files that Rojo syncs. The requests
+reach the plugin only through `serve`'s passthrough, which doesn't carry `/v1/game/*` yet (above).
 
 | Tool | What it does |
 |---|---|
-| `run_luau {code, description?, timeoutSeconds?}` | Live mode only. Luau on the server (`player` = the requester). `game:GetService` refuses MessagingService, DataStoreService, MemoryStoreService and HttpService, and the TypeTorch kernel isn't in scope (defense in depth, not a sandbox). The dev approves each snippet in the chat (or "Always in this chat"); every run leaves a durable audit record in the game (who, when, description, SHA-256 of the code, outcome; never the code), and the terminal logs the same SHA-256 prefix; needs `ServerScriptService.LoadStringEnabled` |
+| `run_luau {code, description?, timeoutSeconds?}` | Live mode only (and a prompt from Studio, which the plugin refuses, above). Luau on the server (`player` = the requester). `game:GetService` refuses MessagingService, DataStoreService, MemoryStoreService and HttpService, and the TypeTorch kernel isn't in scope (defense in depth, not a sandbox). The dev approves each snippet in the chat (or "Always in this chat"); every run leaves a durable audit record in the game (who, when, description, SHA-256 of the code, outcome; never the code), and the terminal logs the same SHA-256 prefix; needs `ServerScriptService.LoadStringEnabled` |
 | `game_logs {realm?, since?, filter?, limit?}` | Server logs, or the requester's client logs (`realm: "client"`) |
 | `inspect {realm?, path, depth?, properties?}` | Class, properties, attributes, tags, children |
 | `find {realm?, query, under?, limit?}` | Instances whose Name or ClassName contains the query |
@@ -437,6 +464,10 @@ so when the session branch is checked out elsewhere (the usual case) the worktre
 fast-forwarded (or merged) to the branch head before every run, commits land there, and you bring them home with
 `git merge remote-claude/<branch>`. Leftovers of a failed or cancelled run are reset before the next one. While a deploy
 proposal waits, runs only clean the worktree (no merge), so it stays exactly at the proposed commit.
+
+A local session (0.4.0, `--no-tunnel --no-announce`) gives each dev a worktree of their own instead:
+`<repo>/../<repo-name>-remote-claude-<user id>` on `remote-claude/<branch>-<user id>` (see "Game tools" above). A
+prod-channel session branch always gets the separate `remote-claude/...` work branch, so nothing commits to it.
 
 Attachments (screenshots) are never in the worktree: they live in `<temp>/tt-rc-att-<session>` and, while their prompt
 runs, in that run's temp folder (see the security model). An old `.typetorch/attachments` folder in the worktree is
